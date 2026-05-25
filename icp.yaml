@@ -1,0 +1,30 @@
+canisters:
+  - name: edge
+    build:
+      steps:
+        - type: script
+          commands:
+            - scripts/build_facilitator_canister.sh "$ICP_WASM_OUTPUT_PATH"
+            - candid-extractor "$ICP_WASM_OUTPUT_PATH" > dist/facilitator.did
+            - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata "candid:service" -f dist/facilitator.did -v public --keep-name-section
+  - name: evm_rpc
+    build:
+      steps:
+        - type: pre-built
+          url: https://github.com/internet-computer-protocol/evm-rpc-canister/releases/latest/download/evm_rpc.wasm.gz
+    init_args: "(record {})"
+
+environments:
+  - name: local
+    network: local
+    canisters:
+      - edge
+      - evm_rpc
+  - name: ic
+    network: ic
+    canisters:
+      - edge
+    settings:
+      edge:
+        environment_variables:
+          PUBLIC_CANISTER_ID:evm_rpc: "7hfb6-caaaa-aaaar-qadga-cai"

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.icp/cache/
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+.wrangler/
+wrangler.jsonc
+*.log
