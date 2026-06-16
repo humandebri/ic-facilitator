@@ -19,7 +19,7 @@ const paymentRequired: PaymentRequired = {
     asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
     payTo: "0x1000000000000000000000000000000000000402",
     maxTimeoutSeconds: 60,
-    extra: { assetTransferMethod: "permit2" }
+    extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" }
   }]
 };
 
@@ -44,11 +44,34 @@ function fetchWithSettlement(settlement: SettleResponse | null): typeof fetch {
   };
 }
 
+function fetchWithPaidSettlements(first: SettleResponse, retry: SettleResponse | null): typeof fetch {
+  let callCount = 0;
+  return async () => {
+    callCount += 1;
+    if (callCount === 1) {
+      return new Response(JSON.stringify({ error: "payment_required" }), {
+        status: 402,
+        headers: { "payment-required": encodePaymentRequiredHeader(paymentRequired) }
+      });
+    }
+    const settlement = callCount === 2 ? first : retry;
+    return new Response(JSON.stringify({
+      asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      network: "eip155:137",
+      report: "paid JPYC access granted"
+    }), {
+      status: 200,
+      headers: settlement ? { "payment-response": encodePaymentResponseHeader(settlement) } : {}
+    });
+  };
+}
+
 describe("payJpyc settlement validation", () => {
   it("rejects missing settlement responses", async () => {
     await expect(payJpyc({
       expectedAmount: "1000000000000000000",
       expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
       expectedPayTo: "0x1000000000000000000000000000000000000402",
       fetchFn: fetchWithSettlement(null),
       privateKey,
@@ -60,6 +83,7 @@ describe("payJpyc settlement validation", () => {
     await expect(payJpyc({
       expectedAmount: "1000000000000000000",
       expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
       expectedPayTo: "0x1000000000000000000000000000000000000402",
       fetchFn: fetchWithSettlement({
         success: true,
@@ -76,6 +100,7 @@ describe("payJpyc settlement validation", () => {
     await expect(payJpyc({
       expectedAmount: "1000000000000000000",
       expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
       expectedPayTo: "0x1000000000000000000000000000000000000402",
       fetchFn: fetchWithSettlement({
         success: true,
@@ -93,6 +118,7 @@ describe("payJpyc settlement validation", () => {
     await expect(payJpyc({
       expectedAmount: "1000000000000000000",
       expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
       expectedPayTo: "0x1000000000000000000000000000000000000402",
       fetchFn: fetchWithSettlement({
         success: true,
@@ -104,5 +130,76 @@ describe("payJpyc settlement validation", () => {
       privateKey,
       targetUrl
     })).rejects.toThrow("successful settlement must not include error fields");
+  });
+
+  it("rejects failed retry settlements", async () => {
+    await expect(payJpyc({
+      expectedAmount: "1000000000000000000",
+      expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
+      expectedPayTo: "0x1000000000000000000000000000000000000402",
+      fetchFn: fetchWithPaidSettlements({
+        success: true,
+        transaction: "0x0000000000000000000000000000000000000000000000000000000000000402",
+        network: "eip155:137",
+        payer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993"
+      }, {
+        success: false,
+        transaction: "0x0000000000000000000000000000000000000000000000000000000000000500",
+        network: "eip155:137",
+        payer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993",
+        errorReason: "settlement_failed"
+      }),
+      privateKey,
+      targetUrl,
+      withPaidRetry: true
+    })).rejects.toThrow("payment did not settle successfully");
+  });
+
+  it("rejects retry settlements from unexpected payers", async () => {
+    await expect(payJpyc({
+      expectedAmount: "1000000000000000000",
+      expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
+      expectedPayTo: "0x1000000000000000000000000000000000000402",
+      fetchFn: fetchWithPaidSettlements({
+        success: true,
+        transaction: "0x0000000000000000000000000000000000000000000000000000000000000402",
+        network: "eip155:137",
+        payer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993"
+      }, {
+        success: true,
+        transaction: "0x0000000000000000000000000000000000000000000000000000000000000500",
+        network: "eip155:137",
+        payer: "0x0000000000000000000000000000000000000001"
+      }),
+      privateKey,
+      targetUrl,
+      withPaidRetry: true
+    })).rejects.toThrow("unexpected settlement payer");
+  });
+
+  it("rejects retry settlements with unexpected amounts", async () => {
+    await expect(payJpyc({
+      expectedAmount: "1000000000000000000",
+      expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
+      expectedPayTo: "0x1000000000000000000000000000000000000402",
+      fetchFn: fetchWithPaidSettlements({
+        success: true,
+        transaction: "0x0000000000000000000000000000000000000000000000000000000000000402",
+        network: "eip155:137",
+        payer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993"
+      }, {
+        success: true,
+        transaction: "0x0000000000000000000000000000000000000000000000000000000000000500",
+        network: "eip155:137",
+        payer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993",
+        amount: "1"
+      }),
+      privateKey,
+      targetUrl,
+      withPaidRetry: true
+    })).rejects.toThrow("unexpected settlement amount");
   });
 });

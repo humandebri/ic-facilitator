@@ -1,8 +1,7 @@
-// scripts/jpyc_wallet.ts: buyer wallet の JPYC 残高と Permit2 allowance を確認し、必要なら approve を送信する。
+// scripts/jpyc_wallet.ts: buyer wallet の JPYC 残高を確認し、EIP-3009 決済前提を集約する。
 import { pathToFileURL } from "node:url";
 
-import { createPermit2ApprovalTx, PERMIT2_ADDRESS } from "@x402/evm";
-import { createPublicClient, createWalletClient, formatEther, formatUnits, http, maxUint256, parseAbi } from "viem";
+import { createPublicClient, formatEther, formatUnits, http, parseAbi } from "viem";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
@@ -14,7 +13,6 @@ const DEFAULT_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB
 const DEFAULT_JPYC_PRICE = "1";
 const JPYC_DECIMALS = 18;
 const ERC20_ABI = parseAbi([
-  "function allowance(address owner, address spender) view returns (uint256)",
   "function balanceOf(address owner) view returns (uint256)",
   "function decimals() view returns (uint8)"
 ]);
@@ -63,72 +61,40 @@ export function hasRequiredAmount(value: bigint, requiredAmount: bigint): boolea
   return value >= requiredAmount;
 }
 
-export function walletRequirementFailure(hasRequiredBalance: boolean, hasPermit2Allowance: boolean): string | null {
-  if (hasRequiredBalance && hasPermit2Allowance) { return null; }
-  const missing = [
-    ...(hasRequiredBalance ? [] : ["JPYC balance"]),
-    ...(hasPermit2Allowance ? [] : ["Permit2 allowance"])
-  ];
-  return `buyer wallet is missing required ${missing.join(" and ")}`;
-}
-
-export function approveRequirementFailure(hasPermit2Allowance: boolean, hasNativeGasBalance: boolean): string | null {
-  return !hasPermit2Allowance && !hasNativeGasBalance ? "buyer wallet needs native Polygon gas to approve Permit2 allowance" : null;
-}
-
-export function approveRequirementWarning(hasRequiredBalance: boolean, hasPermit2Allowance: boolean): string | null {
-  return !hasRequiredBalance && !hasPermit2Allowance ? "Permit2 approve does not add JPYC balance" : null;
-}
-
-export function shouldSendPermit2Approve(hasPermit2Allowance: boolean): boolean {
-  return !hasPermit2Allowance;
+export function walletRequirementFailure(hasRequiredBalance: boolean): string | null {
+  return hasRequiredBalance ? null : "buyer wallet is missing required JPYC balance";
 }
 
 export function fundingNextActions(
   buyer: Address,
   hasRequiredBalance: boolean,
-  hasPermit2Allowance: boolean,
-  hasNativeGasBalance: boolean,
   requiredAmountHuman: string
 ): readonly string[] {
-  return [
-    ...(hasRequiredBalance ? [] : [`send at least ${requiredAmountHuman} JPYC on Polygon to ${buyer}`]),
-    ...(hasNativeGasBalance ? [] : [`send Polygon native gas to ${buyer}`]),
-    ...(hasPermit2Allowance ? [] : ["run JPYC_APPROVE=1 npm run wallet:jpyc after gas is funded"])
-  ];
+  return hasRequiredBalance ? [] : [`send at least ${requiredAmountHuman} JPYC on Polygon to ${buyer}`];
 }
 
-export function walletRequirementSummary(balance: bigint, allowance: bigint, nativeBalance: bigint, requiredAmount: bigint): {
-  readonly approveFailure: string | null;
-  readonly approveWarning: string | null;
-  readonly hasPermit2Allowance: boolean;
+export function walletRequirementSummary(balance: bigint, nativeBalance: bigint, requiredAmount: bigint): {
   readonly hasNativeGasBalance: boolean;
   readonly hasRequiredBalance: boolean;
+  readonly nativeGasRequired: false;
   readonly requirementFailure: string | null;
 } {
   const hasRequiredBalance = hasRequiredAmount(balance, requiredAmount);
-  const hasPermit2Allowance = hasRequiredAmount(allowance, requiredAmount);
-  const hasNativeGasBalance = nativeBalance > 0n;
   return {
-    approveFailure: approveRequirementFailure(hasPermit2Allowance, hasNativeGasBalance),
-    approveWarning: approveRequirementWarning(hasRequiredBalance, hasPermit2Allowance),
-    hasPermit2Allowance,
-    hasNativeGasBalance,
+    hasNativeGasBalance: nativeBalance > 0n,
     hasRequiredBalance,
-    requirementFailure: walletRequirementFailure(hasRequiredBalance, hasPermit2Allowance)
+    nativeGasRequired: false,
+    requirementFailure: walletRequirementFailure(hasRequiredBalance)
   };
 }
 
 type WalletState = {
   readonly account: ReturnType<typeof privateKeyToAccount>;
-  readonly allowance: bigint;
   readonly balance: bigint;
   readonly decimals: number;
   readonly jpyc: Address;
   readonly nativeBalance: bigint;
-  readonly publicClient: ReturnType<typeof createPublicClient>;
   readonly requiredAmount: bigint;
-  readonly rpcUrl: string;
 };
 
 async function loadWalletState(privateKey: Hex): Promise<WalletState> {
@@ -154,128 +120,60 @@ async function loadWalletState(privateKey: Hex): Promise<WalletState> {
     functionName: "balanceOf",
     args: [account.address]
   });
-  const allowance = await publicClient.readContract({
-    address: jpyc,
-    abi: ERC20_ABI,
-    functionName: "allowance",
-    args: [account.address, PERMIT2_ADDRESS]
-  });
   const nativeBalance = await publicClient.getBalance({ address: account.address });
-  return { account, allowance, balance, decimals, jpyc, nativeBalance, publicClient, requiredAmount, rpcUrl };
+  return { account, balance, decimals, jpyc, nativeBalance, requiredAmount };
 }
 
 export async function checkWallet(privateKey: Hex = requirePrivateKey()): Promise<Record<string, unknown>> {
-  const { account, allowance, balance, decimals, jpyc, nativeBalance, requiredAmount } = await loadWalletState(privateKey);
-  const requirement = walletRequirementSummary(balance, allowance, nativeBalance, requiredAmount);
+  const { account, balance, decimals, jpyc, nativeBalance, requiredAmount } = await loadWalletState(privateKey);
+  const requirement = walletRequirementSummary(balance, nativeBalance, requiredAmount);
   const requiredAmountHuman = formatUnits(requiredAmount, JPYC_DECIMALS);
-  const failure = requirement.requirementFailure
-    ? [
+  if (requirement.requirementFailure) {
+    throw new Error(
+      [
         requirement.requirementFailure,
-        ...(requirement.approveFailure ? [requirement.approveFailure] : []),
-        `nextActions: ${fundingNextActions(account.address, requirement.hasRequiredBalance, requirement.hasPermit2Allowance, requirement.hasNativeGasBalance, requiredAmountHuman).join("; ")}`
+        `nextActions: ${fundingNextActions(account.address, requirement.hasRequiredBalance, requiredAmountHuman).join("; ")}`
       ].join("; ")
-    : null;
-  if (failure) {
-    throw new Error(failure);
+    );
   }
   return {
     address: account.address,
-    allowance: allowance.toString(),
-    allowanceHuman: formatUnits(allowance, JPYC_DECIMALS),
     balance: balance.toString(),
     balanceHuman: formatUnits(balance, JPYC_DECIMALS),
     decimals,
     jpyc,
     nativeBalance: nativeBalance.toString(),
     nativeBalanceHuman: formatEther(nativeBalance),
-    permit2: PERMIT2_ADDRESS,
+    nativeGasRequired: false,
     requiredAmount: requiredAmount.toString(),
     requiredAmountHuman
   };
 }
 
 async function main(): Promise<void> {
-  const { account, allowance, balance, decimals, jpyc, nativeBalance, publicClient, requiredAmount, rpcUrl } = await loadWalletState(requirePrivateKey());
-  const approveTx = createPermit2ApprovalTx(jpyc);
-  const requirement = walletRequirementSummary(balance, allowance, nativeBalance, requiredAmount);
+  const { account, balance, decimals, jpyc, nativeBalance, requiredAmount } = await loadWalletState(requirePrivateKey());
+  const requirement = walletRequirementSummary(balance, nativeBalance, requiredAmount);
   const requiredAmountHuman = formatUnits(requiredAmount, JPYC_DECIMALS);
   const result = {
     buyer: account.address,
     jpyc,
     decimals,
-    permit2: PERMIT2_ADDRESS,
     requiredAmount: requiredAmount.toString(),
     requiredAmountHuman,
     balance: balance.toString(),
     balanceHuman: formatUnits(balance, JPYC_DECIMALS),
-    allowance: allowance.toString(),
-    allowanceHuman: formatUnits(allowance, JPYC_DECIMALS),
     nativeBalance: nativeBalance.toString(),
     nativeBalanceHuman: formatEther(nativeBalance),
+    nativeGasRequired: false,
     hasRequiredBalance: requirement.hasRequiredBalance,
-    hasPermit2Allowance: requirement.hasPermit2Allowance,
     requirementFailure: requirement.requirementFailure,
     hasNativeGasBalance: requirement.hasNativeGasBalance,
-    approveFailure: requirement.approveFailure,
-    approveWarning: requirement.approveWarning,
-    nextActions: fundingNextActions(account.address, requirement.hasRequiredBalance, requirement.hasPermit2Allowance, requirement.hasNativeGasBalance, requiredAmountHuman),
-    approveTx
+    nextActions: fundingNextActions(account.address, requirement.hasRequiredBalance, requiredAmountHuman)
   };
 
-  if (readEnv("JPYC_APPROVE") !== "1") {
-    console.log(JSON.stringify(result, null, 2));
-    if (result.requirementFailure) {
-      process.exitCode = 1;
-    }
-    return;
-  }
+  console.log(JSON.stringify(result, null, 2));
 
-  if (!shouldSendPermit2Approve(result.hasPermit2Allowance)) {
-    console.log(JSON.stringify({ ...result, approveSkipped: true }, null, 2));
-    if (result.requirementFailure) { process.exitCode = 1; }
-    return;
-  }
-
-  if (nativeBalance === 0n) {
-    throw new Error("buyer wallet needs native Polygon gas to send JPYC approve");
-  }
-
-  const walletClient = createWalletClient({
-    account,
-    chain: polygon,
-    transport: http(rpcUrl)
-  });
-  const hash = await walletClient.writeContract({
-    address: jpyc,
-    abi: parseAbi(["function approve(address spender, uint256 amount) returns (bool)"]),
-    functionName: "approve",
-    args: [PERMIT2_ADDRESS, maxUint256]
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  const postApproveAllowance = await publicClient.readContract({
-    address: jpyc,
-    abi: ERC20_ABI,
-    functionName: "allowance",
-    args: [account.address, PERMIT2_ADDRESS]
-  });
-  const hasPostApprovePermit2Allowance = hasRequiredAmount(postApproveAllowance, requiredAmount);
-
-  console.log(
-    JSON.stringify(
-      {
-        ...result,
-        approveHash: hash,
-        approveStatus: receipt.status,
-        postApproveAllowance: postApproveAllowance.toString(),
-        postApproveAllowanceHuman: formatUnits(postApproveAllowance, JPYC_DECIMALS),
-        hasPostApprovePermit2Allowance
-      },
-      null,
-      2
-    )
-  );
-
-  if (receipt.status !== "success" || !hasPostApprovePermit2Allowance) {
+  if (result.requirementFailure) {
     process.exitCode = 1;
   }
 }

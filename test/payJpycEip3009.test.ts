@@ -1,4 +1,4 @@
-// test/payJpycPermit2.test.ts: JPYC exact 支払いで生成される Permit2 payload の重要フィールドを固定する。
+// test/payJpycEip3009.test.ts: JPYC exact 支払いで生成される EIP-3009 payload の重要フィールドを固定する。
 import { describe, expect, it } from "vitest";
 import {
   decodePaymentSignatureHeader,
@@ -6,7 +6,6 @@ import {
   encodePaymentResponseHeader
 } from "@x402/core/http";
 import type { PaymentRequired, SettleResponse } from "@x402/core/types";
-import { x402ExactPermit2ProxyAddress } from "@x402/evm";
 import type { Hex } from "viem";
 
 import { payJpyc } from "../scripts/pay_jpyc";
@@ -17,6 +16,7 @@ const targetUrl = "https://example.test/jpyc/report";
 const jpycAsset = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const sellerAddress = "0x1000000000000000000000000000000000000402";
 const atomicAmount = "1000000000000000000";
+const eip712Version = "1";
 
 const paymentRequired: PaymentRequired = {
   x402Version: 2,
@@ -35,7 +35,9 @@ const paymentRequired: PaymentRequired = {
       payTo: sellerAddress,
       maxTimeoutSeconds: 60,
       extra: {
-        assetTransferMethod: "permit2"
+        assetTransferMethod: "eip3009",
+        name: "JPY Coin",
+        version: eip712Version
       }
     }
   ]
@@ -66,8 +68,8 @@ function lower(value: unknown, label: string): string {
   return requireString(value, label).toLowerCase();
 }
 
-describe("payJpyc Permit2 payload", () => {
-  it("pins exact Polygon JPYC Permit2 authorization fields", async () => {
+describe("payJpyc EIP-3009 payload", () => {
+  it("pins exact Polygon JPYC EIP-3009 authorization fields", async () => {
     let paymentSignature = "";
     let callCount = 0;
     const fetchFn: typeof fetch = async (input, init) => {
@@ -101,6 +103,7 @@ describe("payJpyc Permit2 payload", () => {
     await payJpyc({
       expectedAmount: atomicAmount,
       expectedAsset: jpycAsset,
+      expectedEip712Version: eip712Version,
       expectedPayTo: sellerAddress,
       fetchFn,
       privateKey: buyerPrivateKey,
@@ -108,19 +111,17 @@ describe("payJpyc Permit2 payload", () => {
     });
 
     const decoded = decodePaymentSignatureHeader(paymentSignature);
-    const permit2Authorization = property(decoded.payload, "permit2Authorization");
-    const permitted = property(permit2Authorization, "permitted");
-    const witness = property(permit2Authorization, "witness");
+    const authorization = property(decoded.payload, "authorization");
 
     expect(callCount).toBe(2);
     expect(decoded.accepted).toEqual(paymentRequired.accepts[0]);
-    expect(lower(property(permit2Authorization, "from"), "from")).toBe(buyerAddress.toLowerCase());
-    expect(lower(property(permitted, "token"), "permitted.token")).toBe(jpycAsset.toLowerCase());
-    expect(requireString(property(permitted, "amount"), "permitted.amount")).toBe(atomicAmount);
-    expect(lower(property(permit2Authorization, "spender"), "spender")).toBe(x402ExactPermit2ProxyAddress.toLowerCase());
-    expect(lower(property(witness, "to"), "witness.to")).toBe(sellerAddress.toLowerCase());
-    expect(requireString(property(permit2Authorization, "nonce"), "nonce")).toMatch(/^\d+$/);
-    expect(requireString(property(permit2Authorization, "deadline"), "deadline")).toMatch(/^\d+$/);
+    expect(property(decoded.payload, "permit2Authorization")).toBeUndefined();
+    expect(lower(property(authorization, "from"), "authorization.from")).toBe(buyerAddress.toLowerCase());
+    expect(lower(property(authorization, "to"), "authorization.to")).toBe(sellerAddress.toLowerCase());
+    expect(requireString(property(authorization, "value"), "authorization.value")).toBe(atomicAmount);
+    expect(requireString(property(authorization, "validAfter"), "authorization.validAfter")).toMatch(/^\d+$/);
+    expect(requireString(property(authorization, "validBefore"), "authorization.validBefore")).toMatch(/^\d+$/);
+    expect(requireString(property(authorization, "nonce"), "authorization.nonce")).toMatch(/^0x[0-9a-fA-F]{64}$/);
     expect(requireString(property(decoded.payload, "signature"), "signature")).toMatch(/^0x[0-9a-fA-F]+$/);
   });
 });

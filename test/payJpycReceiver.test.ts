@@ -21,7 +21,7 @@ const paymentRequired: PaymentRequired = {
       asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
       payTo: "0x0000000000000000000000000000000000000402",
       maxTimeoutSeconds: 60,
-      extra: { assetTransferMethod: "permit2" }
+      extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" }
     }
   ]
 };

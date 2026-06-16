@@ -10,36 +10,46 @@ import { privateKeyToAccount } from "viem/accounts";
 
 import { positiveDecimalToAtomicUnits } from "../src/amount";
 import { loadDotenv } from "./env_file";
-import { validateExactPermit2PaymentPayload } from "./permit2_payload";
+import { JPYC_EIP712_NAME, validateExactEip3009PaymentPayload } from "./eip3009_payload";
 
 const DEFAULT_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const DEFAULT_JPYC_PRICE = "1";
 const JPYC_DECIMALS = 18;
 const POLYGON_NETWORK: Network = "eip155:137";
 const REQUIRED_SCHEME = "exact";
-const REQUIRED_TRANSFER_METHOD = "permit2";
+const REQUIRED_TRANSFER_METHOD = "eip3009";
 const SAMPLE_SELLER_ADDRESS = "0x0000000000000000000000000000000000000402";
 
 export type PayJpycOptions = {
   readonly expectedAmount?: string;
   readonly expectedAsset?: string;
+  readonly expectedEip712Version?: string;
   readonly expectedMaxTimeoutSeconds?: number;
   readonly expectedPayTo?: string;
   readonly expectedResourceUrl?: string;
   readonly fetchFn?: typeof fetch;
   readonly privateKey: Hex;
   readonly targetUrl: string;
+  readonly withPaidRetry?: boolean;
 };
 
 export type PayJpycResult = {
   readonly body: unknown;
   readonly buyer: `0x${string}`;
   readonly paidStatus: number;
+  readonly paidRetryStatus?: number;
+  readonly retrySettlement?: SettleResponse;
   readonly settlement: SettleResponse | null;
   readonly settlementTxExport: string;
   readonly targetUrl: string;
   readonly unpaidStatus: number;
   readonly verifyCommand: string;
+};
+
+type ValidatedPaidResponse = {
+  readonly body: unknown;
+  readonly settlement: SettleResponse;
+  readonly status: number;
 };
 
 const PAID_REPORT = "paid JPYC access granted";
@@ -87,6 +97,14 @@ function readExpectedAsset(options: PayJpycOptions): string {
   );
 }
 
+function readExpectedEip712Version(options: PayJpycOptions): string {
+  const value = options.expectedEip712Version ?? readEnv("JPYC_EIP712_VERSION");
+  if (!value || value.trim() === "") {
+    throw new Error("missing required env: JPYC_EIP712_VERSION");
+  }
+  return value;
+}
+
 function readExpectedPayTo(options: PayJpycOptions): string {
   const payTo = options.expectedPayTo
     ? requireNonZeroEvmAddress("expectedPayTo", options.expectedPayTo)
@@ -115,6 +133,10 @@ function readExpectedResourceUrl(options: PayJpycOptions): string {
   const value = configured ?? options.targetUrl;
   if (!isHttpsUrl(value)) { throw new Error("X402_RESOURCE_URL must be an https URL"); }
   return value;
+}
+
+function shouldRetryPaidRequest(options: PayJpycOptions): boolean {
+  return options.withPaidRetry === true || readEnv("X402_PAID_RETRY") === "1";
 }
 
 function requirePrivateKey(): Hex {
@@ -171,6 +193,29 @@ function validateSettlement(settlement: SettleResponse | null, expectedPayer: st
   return settlement;
 }
 
+async function validatePaidResponse(
+  response: Response,
+  client: x402HTTPClient,
+  expectedPayer: string,
+  options: PayJpycOptions,
+  label: string
+): Promise<ValidatedPaidResponse> {
+  const body = parseBody(await response.text());
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`expected ${label} response 2xx, got ${response.status}`);
+  }
+  if (!hasExpectedPaidJpycReportBody(body, readExpectedAsset(options))) {
+    throw new Error(`unexpected ${label} response body`);
+  }
+  const paymentResponse = response.headers.get("payment-response");
+  const settlement = validateSettlement(
+    paymentResponse ? client.getPaymentSettleResponse(getHeader(response)) : null,
+    expectedPayer,
+    readExpectedAmount(options)
+  );
+  return { body, settlement, status: response.status };
+}
+
 export function hasPaidJpycReportBody(value: unknown): boolean {
   return hasExpectedPaidJpycReportBody(value, DEFAULT_JPYC_POLYGON_ADDRESS);
 }
@@ -213,6 +258,9 @@ function validateRequirement(requirement: PaymentRequirements, options: PayJpycO
   if (requirement.extra?.assetTransferMethod !== REQUIRED_TRANSFER_METHOD) {
     throw new Error("unexpected payment transfer method");
   }
+  if (requirement.extra?.name !== JPYC_EIP712_NAME || requirement.extra?.version !== readExpectedEip712Version(options)) {
+    throw new Error("unexpected payment EIP-712 domain");
+  }
 }
 
 export function validateJpycPaymentRequired(paymentRequired: PaymentRequired, options: PayJpycOptions): void {
@@ -252,29 +300,32 @@ export async function payJpyc(options: PayJpycOptions): Promise<PayJpycResult> {
   const paymentRequired = client.getPaymentRequiredResponse(getHeader(unpaidResponse));
   validateJpycPaymentRequired(paymentRequired, options);
   const paymentPayload = await client.createPaymentPayload(paymentRequired);
-  validateExactPermit2PaymentPayload(paymentPayload, { amount: readExpectedAmount(options), asset: readExpectedAsset(options), buyer: account.address, maxTimeoutSeconds: readExpectedMaxTimeoutSeconds(options), payTo: readExpectedPayTo(options), resourceUrl: readExpectedResourceUrl(options) });
+  validateExactEip3009PaymentPayload(paymentPayload, { amount: readExpectedAmount(options), asset: readExpectedAsset(options), buyer: account.address, eip712Version: readExpectedEip712Version(options), maxTimeoutSeconds: readExpectedMaxTimeoutSeconds(options), payTo: readExpectedPayTo(options), resourceUrl: readExpectedResourceUrl(options) });
+  const paymentSignatureHeaders = client.encodePaymentSignatureHeader(paymentPayload);
   const paidResponse = await fetchFn(options.targetUrl, {
     headers: {
       Accept: "application/json",
-      ...client.encodePaymentSignatureHeader(paymentPayload)
+      ...paymentSignatureHeaders
     }
   });
-  const paidBodyText = await paidResponse.text();
-  const body = parseBody(paidBodyText);
-  if (paidResponse.status < 200 || paidResponse.status >= 300) {
-    throw new Error(`expected paid response 2xx, got ${paidResponse.status}`);
+  const paid = await validatePaidResponse(paidResponse, client, account.address, options, "paid");
+  const baseResult: PayJpycResult = { buyer: account.address, targetUrl: options.targetUrl, unpaidStatus: unpaidResponse.status, paidStatus: paid.status, body: paid.body, settlement: paid.settlement, settlementTxExport: `export SETTLEMENT_TX=${paid.settlement.transaction}`, verifyCommand: `SETTLEMENT_TX=${paid.settlement.transaction} npm run verify:jpyc` };
+  if (!shouldRetryPaidRequest(options)) {
+    return baseResult;
   }
-  if (!hasExpectedPaidJpycReportBody(body, readExpectedAsset(options))) {
-    throw new Error("unexpected paid response body");
-  }
-  const paymentResponse = paidResponse.headers.get("payment-response");
-  const settlement = validateSettlement(
-    paymentResponse ? client.getPaymentSettleResponse(getHeader(paidResponse)) : null,
-    account.address,
-    readExpectedAmount(options)
-  );
 
-  return { buyer: account.address, targetUrl: options.targetUrl, unpaidStatus: unpaidResponse.status, paidStatus: paidResponse.status, body, settlement, settlementTxExport: `export SETTLEMENT_TX=${settlement.transaction}`, verifyCommand: `SETTLEMENT_TX=${settlement.transaction} npm run verify:jpyc` };
+  const paidRetryResponse = await fetchFn(options.targetUrl, {
+    headers: {
+      Accept: "application/json",
+      ...paymentSignatureHeaders
+    }
+  });
+  const paidRetry = await validatePaidResponse(paidRetryResponse, client, account.address, options, "paid retry");
+  return {
+    ...baseResult,
+    paidRetryStatus: paidRetry.status,
+    retrySettlement: paidRetry.settlement
+  };
 }
 
 async function main(): Promise<void> {

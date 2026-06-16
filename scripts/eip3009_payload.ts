@@ -1,11 +1,13 @@
-// scripts/permit2_payload.ts: buyer が生成した exact Permit2 payment payload の重要フィールドを検証する。
+// scripts/eip3009_payload.ts: buyer が生成した exact EIP-3009 payment payload の重要フィールドを検証する。
 import type { PaymentPayload } from "@x402/core/types";
-import { x402ExactPermit2ProxyAddress } from "@x402/evm";
 
-export type ExpectedPermit2Payload = {
+export const JPYC_EIP712_NAME = "JPY Coin";
+
+export type ExpectedEip3009Payload = {
   readonly amount: string;
   readonly asset: string;
   readonly buyer: string;
+  readonly eip712Version: string;
   readonly maxTimeoutSeconds: number;
   readonly payTo: string;
   readonly resourceUrl: string;
@@ -45,12 +47,21 @@ function requireDigits(value: unknown, label: string): string {
   return digits;
 }
 
-export function validateExactPermit2PaymentPayload(payload: PaymentPayload, expected: ExpectedPermit2Payload): void {
-  const permit2Authorization = property(payload.payload, "permit2Authorization");
-  const permitted = property(permit2Authorization, "permitted");
-  const witness = property(permit2Authorization, "witness");
+function requireBytes32(value: unknown, label: string): string {
+  const bytes = requireString(value, label);
+  if (!/^0x[0-9a-fA-F]{64}$/.test(bytes)) {
+    throw new Error(`invalid payment payload bytes32: ${label}`);
+  }
+  return bytes;
+}
+
+export function validateExactEip3009PaymentPayload(payload: PaymentPayload, expected: ExpectedEip3009Payload): void {
+  const authorization = property(payload.payload, "authorization");
   const signature = requireString(property(payload.payload, "signature"), "signature");
 
+  if (property(payload.payload, "permit2Authorization") !== undefined) {
+    throw new Error("unexpected Permit2 payment payload");
+  }
   if (payload.x402Version !== 2) {
     throw new Error("unexpected payment payload x402 version");
   }
@@ -69,27 +80,25 @@ export function validateExactPermit2PaymentPayload(payload: PaymentPayload, expe
   if (payload.accepted.maxTimeoutSeconds !== expected.maxTimeoutSeconds) {
     throw new Error("unexpected payment payload accepted timeout");
   }
-  if (payload.accepted.extra?.assetTransferMethod !== "permit2") {
+  if (payload.accepted.extra?.assetTransferMethod !== "eip3009") {
     throw new Error("unexpected payment payload accepted transfer method");
+  }
+  if (payload.accepted.extra?.name !== JPYC_EIP712_NAME || payload.accepted.extra?.version !== expected.eip712Version) {
+    throw new Error("unexpected payment payload EIP-712 domain");
   }
   if (!/^0x[0-9a-fA-F]+$/.test(signature)) {
     throw new Error("invalid payment payload signature");
   }
-  if (!equalsAddress(requireAddress(property(permit2Authorization, "from"), "from"), expected.buyer)) {
+  if (!equalsAddress(requireAddress(property(authorization, "from"), "authorization.from"), expected.buyer)) {
     throw new Error("unexpected payment payload buyer");
   }
-  if (!equalsAddress(requireAddress(property(permitted, "token"), "permitted.token"), expected.asset)) {
-    throw new Error("unexpected payment payload token");
-  }
-  if (requireDigits(property(permitted, "amount"), "permitted.amount") !== expected.amount) {
-    throw new Error("unexpected payment payload amount");
-  }
-  if (!equalsAddress(requireAddress(property(permit2Authorization, "spender"), "spender"), x402ExactPermit2ProxyAddress)) {
-    throw new Error("unexpected payment payload spender");
-  }
-  if (!equalsAddress(requireAddress(property(witness, "to"), "witness.to"), expected.payTo)) {
+  if (!equalsAddress(requireAddress(property(authorization, "to"), "authorization.to"), expected.payTo)) {
     throw new Error("unexpected payment payload receiver");
   }
-  requireDigits(property(permit2Authorization, "nonce"), "nonce");
-  requireDigits(property(permit2Authorization, "deadline"), "deadline");
+  if (requireDigits(property(authorization, "value"), "authorization.value") !== expected.amount) {
+    throw new Error("unexpected payment payload amount");
+  }
+  requireDigits(property(authorization, "validAfter"), "authorization.validAfter");
+  requireDigits(property(authorization, "validBefore"), "authorization.validBefore");
+  requireBytes32(property(authorization, "nonce"), "authorization.nonce");
 }

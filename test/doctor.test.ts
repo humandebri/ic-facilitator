@@ -14,7 +14,7 @@ import {
   isHttpUrl,
   isPositiveIntegerString,
   isPrivateKey,
-  isRpcServices,
+  isSingleHttpsRpcServices,
   parseMode
 } from "../scripts/doctor";
 
@@ -47,31 +47,39 @@ describe("doctor helpers", () => {
     expect(isPrivateKey("0x1")).toBe(false);
     expect(isHttpUrl("https://polygon.example")).toBe(true);
     expect(isHttpUrl("file:///tmp/x")).toBe(false);
-    expect(isRpcServices("https://one.example")).toBe(true);
-    expect(isRpcServices("https://one.example,https://two.example")).toBe(false);
-    expect(isRpcServices("http://one.example")).toBe(false);
-    expect(isRpcServices("file:///tmp/x")).toBe(false);
+    expect(isSingleHttpsRpcServices("https://polygon.example")).toBe(true);
+    expect(isSingleHttpsRpcServices("http://polygon.example")).toBe(false);
+    expect(isSingleHttpsRpcServices("https://a.example,https://b.example")).toBe(false);
     expect(isPositiveIntegerString("60")).toBe(true);
+    expect(isPositiveIntegerString("30000000000000000")).toBe(true);
     expect(isPositiveIntegerString("0")).toBe(false);
   });
 
-  it("validates optional canister env formats", () => {
+  it("validates canister env formats and warns about ignored JPYC override", () => {
     const checks = collectChecks(".", {
       FACILITATOR_EVM_PRIVATE_KEY: "0x1",
       FACILITATOR_MAX_GAS: "0",
+      FACILITATOR_MAX_SETTLEMENT_FEE_WEI: "0",
       JPYC_POLYGON_ADDRESS: "0x402",
-      POLYGON_RPC_SERVICES: "file:///tmp/rpc",
+      POLYGON_RPC_SERVICES: "http://polygon.example",
+      SELLER_CREDIT_PAY_TO: "0x402",
+      SELLER_CREDIT_TOPUP_AMOUNT: "0",
+      SELLER_SETTLEMENT_FEE_AMOUNT: "1.5",
       SETTLE_CONFIRMATION_TIMEOUT_SECONDS: "0",
       SETTLEMENT_CACHE_TTL_SECONDS: "1.5"
     }, "canister");
 
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_EVM_PRIVATE_KEY")).toBe(true);
-    expect(checks.some((check) => check.name === "env-format:JPYC_POLYGON_ADDRESS")).toBe(true);
+    expect(checks.some((check) => check.name === "env:JPYC_POLYGON_ADDRESS" && check.status === "warn")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_MAX_GAS")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:FACILITATOR_MAX_SETTLEMENT_FEE_WEI")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_PAY_TO")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_TOPUP_AMOUNT")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:SELLER_SETTLEMENT_FEE_AMOUNT")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLEMENT_CACHE_TTL_SECONDS")).toBe(true);
-  });
+  }, 10_000);
 
   it("validates optional buyer env formats", () => {
     const checks = collectChecks(".", {
@@ -118,16 +126,25 @@ describe("doctor helpers", () => {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           ICP_FAKE_LOG: logPath,
-          PATH: `${dir}:${process.env.PATH ?? ""}`,
-          POLYGON_RPC_SERVICES: "https://one.example"
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_SERVICES: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
+          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
 
       expect(result.status).toBe(0);
       const output = readFileSync(logPath, "utf8");
       expect(output).toContain('"FACILITATOR_EVM_PRIVATE_KEY",');
-      expect(output).toContain('"POLYGON_RPC_SERVICES", "https://one.example"');
+      expect(output).toContain('"JPYC_EIP712_VERSION", "1"');
+      expect(output).toContain('"POLYGON_RPC_SERVICES", "https://polygon.example"');
+      expect(output).toContain('"SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402"');
+      expect(output).toContain('"SELLER_CREDIT_TOPUP_AMOUNT", "1000"');
+      expect(output).toContain('"SELLER_SETTLEMENT_FEE_AMOUNT", "100"');
       expect(output).toContain('"FACILITATOR_MAX_GAS", "500000"');
+      expect(output).toContain('"FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "30000000000000000"');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }

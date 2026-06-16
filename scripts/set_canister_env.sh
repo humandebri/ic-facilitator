@@ -5,9 +5,8 @@ set -euo pipefail
 readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ENVIRONMENT="${1:-local}"
 readonly CANISTER="${2:-edge}"
-readonly DEFAULT_JPYC_POLYGON_ADDRESS="0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB"
-readonly DEFAULT_POLYGON_RPC_SERVICES="https://polygon-bor-rpc.publicnode.com"
 readonly DEFAULT_FACILITATOR_MAX_GAS="500000"
+readonly DEFAULT_FACILITATOR_MAX_SETTLEMENT_FEE_WEI="30000000000000000"
 readonly DEFAULT_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="60"
 readonly DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS="86400"
 readonly ENV_FILE="${DOTENV_PATH:-$ROOT/.env}"
@@ -68,27 +67,6 @@ require_nonzero_evm_address() {
   fi
 }
 
-require_rpc_services() {
-  local name="$1"
-  local value="$2"
-  RPC_SERVICES_TO_CHECK="$value" node -e '
-const raw = process.env.RPC_SERVICES_TO_CHECK ?? "";
-const urls = raw.split(",").map((item) => item.trim()).filter(Boolean);
-if (urls.length !== 1) { process.exit(1); }
-for (const item of urls) {
-  try {
-    const url = new URL(item);
-    if (url.protocol !== "https:") { process.exit(1); }
-  } catch {
-    process.exit(1);
-  }
-}
-' || {
-    echo "$name must be a single https URL" >&2
-    exit 1
-  }
-}
-
 require_positive_integer() {
   local name="$1"
   local value="$2"
@@ -103,6 +81,19 @@ require_private_key() {
   local value="$2"
   if [[ ! "$value" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
     echo "$name must be a 0x-prefixed 32-byte private key" >&2
+    exit 1
+  fi
+}
+
+require_single_https_rpc_url() {
+  local name="$1"
+  local value="$2"
+  if [[ "$value" == *","* ]]; then
+    echo "$name must contain exactly one HTTPS RPC URL" >&2
+    exit 1
+  fi
+  if [[ ! "$value" =~ ^https://[^[:space:]]+$ ]]; then
+    echo "$name must be an HTTPS RPC URL" >&2
     exit 1
   fi
 }
@@ -129,21 +120,32 @@ cd "$ROOT"
 load_dotenv
 
 required_env FACILITATOR_EVM_PRIVATE_KEY
+required_env JPYC_EIP712_VERSION
+required_env POLYGON_RPC_SERVICES
+required_env SELLER_CREDIT_PAY_TO
+required_env SELLER_CREDIT_TOPUP_AMOUNT
+required_env SELLER_SETTLEMENT_FEE_AMOUNT
 require_private_key FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
-readonly RESOLVED_JPYC_POLYGON_ADDRESS="${JPYC_POLYGON_ADDRESS:-$DEFAULT_JPYC_POLYGON_ADDRESS}"
-readonly RESOLVED_POLYGON_RPC_SERVICES="${POLYGON_RPC_SERVICES:-$DEFAULT_POLYGON_RPC_SERVICES}"
+require_single_https_rpc_url POLYGON_RPC_SERVICES "$POLYGON_RPC_SERVICES"
+require_nonzero_evm_address SELLER_CREDIT_PAY_TO "$SELLER_CREDIT_PAY_TO"
+require_positive_integer SELLER_CREDIT_TOPUP_AMOUNT "$SELLER_CREDIT_TOPUP_AMOUNT"
+require_positive_integer SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT"
 readonly RESOLVED_FACILITATOR_MAX_GAS="${FACILITATOR_MAX_GAS:-$DEFAULT_FACILITATOR_MAX_GAS}"
+readonly RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI="${FACILITATOR_MAX_SETTLEMENT_FEE_WEI:-$DEFAULT_FACILITATOR_MAX_SETTLEMENT_FEE_WEI}"
 readonly RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="${SETTLE_CONFIRMATION_TIMEOUT_SECONDS:-$DEFAULT_SETTLE_CONFIRMATION_TIMEOUT_SECONDS}"
 readonly RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS="${SETTLEMENT_CACHE_TTL_SECONDS:-$DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS}"
-require_nonzero_evm_address JPYC_POLYGON_ADDRESS "$RESOLVED_JPYC_POLYGON_ADDRESS"
-require_rpc_services POLYGON_RPC_SERVICES "$RESOLVED_POLYGON_RPC_SERVICES"
 require_positive_integer FACILITATOR_MAX_GAS "$RESOLVED_FACILITATOR_MAX_GAS"
+require_positive_integer FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI"
 require_positive_integer SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
 require_positive_integer SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"
 
 set_env FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
-set_env JPYC_POLYGON_ADDRESS "$RESOLVED_JPYC_POLYGON_ADDRESS"
-set_env POLYGON_RPC_SERVICES "$RESOLVED_POLYGON_RPC_SERVICES"
+set_env JPYC_EIP712_VERSION "$JPYC_EIP712_VERSION"
+set_env POLYGON_RPC_SERVICES "$POLYGON_RPC_SERVICES"
+set_env SELLER_CREDIT_PAY_TO "$SELLER_CREDIT_PAY_TO"
+set_env SELLER_CREDIT_TOPUP_AMOUNT "$SELLER_CREDIT_TOPUP_AMOUNT"
+set_env SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT"
 set_env FACILITATOR_MAX_GAS "$RESOLVED_FACILITATOR_MAX_GAS"
+set_env FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI"
 set_env SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
 set_env SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"

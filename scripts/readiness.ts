@@ -1,8 +1,6 @@
 // scripts/readiness.ts: canister facilitator 実決済までの未充足条件を秘密値なしで集約する。
 import { pathToFileURL } from "node:url";
 
-import { x402ExactPermit2ProxyAddress } from "@x402/evm";
-
 import { collectChecks } from "./doctor";
 import type { DoctorCheck, DoctorStatus } from "./doctor";
 import { checkWallet, requirePrivateKey } from "./jpyc_wallet";
@@ -15,6 +13,7 @@ import type { ReceiptReader } from "./settlement_receipt";
 
 type StageName = "buyer" | "canister" | "canister-env" | "canister-http" | "paid-negative-http" | "settlement-receipt" | "wallet";
 const DEPLOY_ONLY_FAILURES = ["disk-space", "node_modules", "rust-target"];
+const DEFAULT_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 
 export type ReadinessStage = {
   readonly failures: readonly string[];
@@ -114,7 +113,7 @@ function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv)
     commands.push("npm run smoke:canister:paid-negative");
   }
   if (stages.some((item) => item.name === "wallet" && item.status === "fail")) {
-    commands.push("complete buyer JPYC balance/gas/Permit2 allowance, then run JPYC_APPROVE=1 npm run wallet:jpyc");
+    commands.push("complete buyer JPYC balance, then run npm run wallet:jpyc");
   }
   if (settlementFailures.length > 0) {
     if (settlementFailures.some((failure) => failure.includes("missing required env: SETTLEMENT_TX"))) {
@@ -182,7 +181,7 @@ async function settlementReceiptStage(env: NodeJS.ProcessEnv, reader?: ReceiptRe
       hash: parseTxHash(tx),
       ...(env.POLYGON_RPC_URL ? { rpcUrl: env.POLYGON_RPC_URL } : {}),
       ...(reader ? { reader } : {}),
-      expectedTo: x402ExactPermit2ProxyAddress,
+      expectedTo: env.JPYC_POLYGON_ADDRESS ?? DEFAULT_JPYC_POLYGON_ADDRESS,
       expectedTransfer: expectedTransferFromEnv(env)
     });
     return { failures: [], name: "settlement-receipt", status: "ok", warnings: [] };

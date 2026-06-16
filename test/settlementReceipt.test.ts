@@ -1,6 +1,5 @@
 // test/settlementReceipt.test.ts: settlement tx receipt の成功判定と hash validation を確認する。
 import { describe, expect, it } from "vitest";
-import { x402ExactPermit2ProxyAddress } from "@x402/evm";
 import type { Hex, TransactionReceipt } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -23,7 +22,7 @@ const receipt: TransactionReceipt = {
   logs: [],
   logsBloom: "0x",
   status: "success",
-  to: x402ExactPermit2ProxyAddress,
+  to: jpyc,
   transactionHash: hash,
   transactionIndex: 0,
   type: "eip1559"
@@ -74,19 +73,19 @@ describe("settlement receipt", () => {
     });
   });
 
-  it("verifies the expected x402 settlement contract", async () => {
+  it("verifies the expected JPYC settlement contract", async () => {
     await expect(verifySettlementReceipt({
-      expectedTo: x402ExactPermit2ProxyAddress,
+      expectedTo: jpyc,
       hash,
       reader: {
         async getTransactionReceipt() {
           return receipt;
         }
       }
-    })).resolves.toMatchObject({ to: x402ExactPermit2ProxyAddress });
+    })).resolves.toMatchObject({ to: jpyc });
 
     await expect(verifySettlementReceipt({
-      expectedTo: x402ExactPermit2ProxyAddress,
+      expectedTo: jpyc,
       hash,
       reader: {
         async getTransactionReceipt() {
@@ -122,7 +121,7 @@ describe("settlement receipt", () => {
       gasUsed: "21000",
       hash,
       status: "success",
-      to: x402ExactPermit2ProxyAddress
+      to: jpyc
     });
   });
 

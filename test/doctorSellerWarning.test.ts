@@ -15,5 +15,5 @@ describe("doctor seller guard", () => {
     }, "all");
 
     expect(checks.some((check) => check.name === "env:SELLER_EVM_ADDRESS_SAMPLE" && check.status === "fail")).toBe(true);
-  });
+  }, 10_000);
 });

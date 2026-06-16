@@ -2,8 +2,7 @@
 use sha3::{Digest, Keccak256};
 
 pub const JPYC_POLYGON_ADDRESS: &str = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
-pub const PERMIT2_ADDRESS: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
-pub const X402_EXACT_PERMIT2_PROXY: &str = "0x402085c248EeA27D92E8b30b2C58ed07f9E20001";
+pub const JPYC_EIP712_NAME: &str = "JPY Coin";
 pub const NETWORK: &str = "eip155:137";
 
 pub fn strip_0x(value: &str) -> &str {
@@ -58,15 +57,6 @@ pub fn parse_u256_decimal(value: &str, label: &str) -> Result<[u8; 32], String> 
     Ok(out)
 }
 
-pub fn parse_u64_decimal(value: &str, label: &str) -> Result<u64, String> {
-    if value.is_empty() || !value.bytes().all(|ch| ch.is_ascii_digit()) {
-        return Err(format!("{label}: invalid decimal integer"));
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| format!("{label}: integer too large"))
-}
-
 pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(bytes);
@@ -104,7 +94,8 @@ pub fn parse_u256_hex(value: &str, label: &str) -> Result<[u8; 32], String> {
     Ok(left_pad_32(&bytes))
 }
 
-pub fn u256_gte(left: &[u8; 32], right: &[u8; 32]) -> bool {
+#[cfg(test)]
+fn u256_gte(left: &[u8; 32], right: &[u8; 32]) -> bool {
     left >= right
 }
 

@@ -32,39 +32,27 @@ pub struct PaymentPayload {
     #[serde(default)]
     pub resource: Option<ResourceInfo>,
     pub accepted: PaymentRequirements,
-    pub payload: Permit2Payload,
+    pub payload: Eip3009Payload,
     #[serde(default)]
     pub extensions: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Permit2Payload {
+pub struct Eip3009Payload {
     pub signature: String,
-    pub permit2_authorization: Permit2Authorization,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Permit2Authorization {
-    pub from: String,
-    pub permitted: Permit2Permitted,
-    pub spender: String,
-    pub nonce: String,
-    pub deadline: String,
-    pub witness: Permit2Witness,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Permit2Permitted {
-    pub token: String,
-    pub amount: String,
+    pub authorization: Eip3009Authorization,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Permit2Witness {
+pub struct Eip3009Authorization {
+    pub from: String,
     pub to: String,
+    pub value: String,
     pub valid_after: String,
+    pub valid_before: String,
+    pub nonce: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,14 +65,11 @@ pub struct FacilitatorRequest {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VerifyResponse {
-    pub is_valid: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub invalid_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub invalid_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payer: Option<String>,
+pub struct PaymentRequiredResponse {
+    pub x402_version: u64,
+    pub error: String,
+    pub resource: ResourceInfo,
+    pub accepts: Vec<PaymentRequirements>,
 }
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]

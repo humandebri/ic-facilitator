@@ -29,7 +29,9 @@ const paymentRequired: PaymentRequired = {
       payTo: "0x1000000000000000000000000000000000000402",
       maxTimeoutSeconds: 60,
       extra: {
-        assetTransferMethod: "permit2"
+        assetTransferMethod: "eip3009",
+        name: "JPY Coin",
+        version: "1"
       }
     }
   ]
@@ -82,7 +84,8 @@ describe("payJpyc", () => {
 
       const payload = decodePaymentSignatureHeader(paymentSignature);
       expect(payload.accepted).toEqual(paymentRequired.accepts[0]);
-      expect(payload.payload).toHaveProperty("permit2Authorization");
+      expect(payload.payload).toHaveProperty("authorization");
+      expect(payload.payload).not.toHaveProperty("permit2Authorization");
 
       return new Response(JSON.stringify({
         asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
@@ -100,6 +103,7 @@ describe("payJpyc", () => {
     const result = await payJpyc({
       expectedAmount: "1000000000000000000",
       expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
       expectedPayTo: "0x1000000000000000000000000000000000000402",
       fetchFn,
       privateKey: buyerPrivateKey,
@@ -121,6 +125,110 @@ describe("payJpyc", () => {
       settlementTxExport: `export SETTLEMENT_TX=${settlement.transaction}`,
       verifyCommand: `SETTLEMENT_TX=${settlement.transaction} npm run verify:jpyc`
     });
+  });
+
+  it("can retry a paid request with the same payment signature", async () => {
+    let callCount = 0;
+    let firstPaymentSignature = "";
+    const retrySettlement: SettleResponse = {
+      ...settlement,
+      amount: "1000000000000000000",
+      transaction: "0x0000000000000000000000000000000000000000000000000000000000000500"
+    };
+    const fetchFn: typeof fetch = async (input, init) => {
+      callCount += 1;
+      expect(String(input)).toBe(targetUrl);
+
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ error: "payment_required" }), {
+          status: 402,
+          headers: {
+            "content-type": "application/json",
+            "payment-required": encodePaymentRequiredHeader(paymentRequired)
+          }
+        });
+      }
+
+      const paymentSignature = new Headers(init?.headers).get("payment-signature");
+      expect(paymentSignature).toBeTruthy();
+      if (!paymentSignature) {
+        throw new Error("missing payment-signature");
+      }
+      if (callCount === 2) {
+        firstPaymentSignature = paymentSignature;
+      } else {
+        expect(paymentSignature).toBe(firstPaymentSignature);
+      }
+
+      return new Response(JSON.stringify({
+        asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        network: "eip155:137",
+        report: "paid JPYC access granted"
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "payment-response": encodePaymentResponseHeader(callCount === 2 ? settlement : retrySettlement)
+        }
+      });
+    };
+
+    const result = await payJpyc({
+      expectedAmount: "1000000000000000000",
+      expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
+      expectedPayTo: "0x1000000000000000000000000000000000000402",
+      fetchFn,
+      privateKey: buyerPrivateKey,
+      targetUrl,
+      withPaidRetry: true
+    });
+
+    expect(callCount).toBe(3);
+    expect(result.paidStatus).toBe(200);
+    expect(result.paidRetryStatus).toBe(200);
+    expect(result.retrySettlement).toEqual(retrySettlement);
+  });
+
+  it("can enable paid retry from the environment", async () => {
+    vi.stubEnv("X402_PAID_RETRY", "1");
+    let callCount = 0;
+    const fetchFn: typeof fetch = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ error: "payment_required" }), {
+          status: 402,
+          headers: {
+            "content-type": "application/json",
+            "payment-required": encodePaymentRequiredHeader(paymentRequired)
+          }
+        });
+      }
+      return new Response(JSON.stringify({
+        asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        network: "eip155:137",
+        report: "paid JPYC access granted"
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "payment-response": encodePaymentResponseHeader(settlement)
+        }
+      });
+    };
+
+    const result = await payJpyc({
+      expectedAmount: "1000000000000000000",
+      expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+      expectedEip712Version: "1",
+      expectedPayTo: "0x1000000000000000000000000000000000000402",
+      fetchFn,
+      privateKey: buyerPrivateKey,
+      targetUrl
+    });
+
+    expect(callCount).toBe(3);
+    expect(result.paidRetryStatus).toBe(200);
   });
 
   it("rejects unexpected payment requirements before signing", async () => {
@@ -153,6 +261,7 @@ describe("payJpyc", () => {
       payJpyc({
         expectedAmount: "1000000000000000000",
         expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        expectedEip712Version: "1",
         expectedPayTo: "0x1000000000000000000000000000000000000402",
         fetchFn,
         privateKey: buyerPrivateKey,
@@ -183,6 +292,7 @@ describe("payJpyc", () => {
       payJpyc({
         expectedAmount: "1000000000000000000",
         expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        expectedEip712Version: "1",
         expectedMaxTimeoutSeconds: 60,
         expectedPayTo: "0x1000000000000000000000000000000000000402",
         fetchFn,
@@ -214,6 +324,7 @@ describe("payJpyc", () => {
       payJpyc({
         expectedAmount: "1000000000000000000",
         expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        expectedEip712Version: "1",
         expectedMaxTimeoutSeconds: 60,
         expectedPayTo: "0x1000000000000000000000000000000000000402",
         fetchFn,
@@ -223,7 +334,7 @@ describe("payJpyc", () => {
     ).rejects.toThrow("unexpected payment timeout");
   });
 
-  it("rejects missing Permit2 transfer methods before signing", async () => {
+  it("rejects missing EIP-3009 transfer methods before signing", async () => {
     vi.stubEnv("SELLER_EVM_ADDRESS", "0x1000000000000000000000000000000000000402");
     const baseRequirement = paymentRequired.accepts[0];
     if (!baseRequirement) {
@@ -245,6 +356,7 @@ describe("payJpyc", () => {
       payJpyc({
         expectedAmount: "1000000000000000000",
         expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        expectedEip712Version: "1",
         expectedMaxTimeoutSeconds: 60,
         expectedPayTo: "0x1000000000000000000000000000000000000402",
         fetchFn,
@@ -280,6 +392,7 @@ describe("payJpyc", () => {
       payJpyc({
         expectedAmount: "1000000000000000000",
         expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
+        expectedEip712Version: "1",
         expectedPayTo: "0x1000000000000000000000000000000000000402",
         fetchFn,
         privateKey: buyerPrivateKey,
