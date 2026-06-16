@@ -12,6 +12,25 @@ import { hasExpectedPaidJpycReportBody, hasPaidJpycReportBody, payJpyc } from ".
 
 const buyerPrivateKey: Hex = "0x59c6995e998f97a5a0044966f094538db1f78e001b7e6f2480d4ef9f4a3a9a8e";
 const targetUrl = "https://example.test/jpyc/report";
+const sellerAddress = "0x1000000000000000000000000000000000000402";
+const buyerAddress = "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993";
+const atomicAmount = "1000000000000000000";
+const jpycAsset = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
+const sellerAuthorization = {
+  version: 1,
+  scheme: "eip191",
+  seller: sellerAddress,
+  payer: buyerAddress,
+  amount: atomicAmount,
+  asset: jpycAsset,
+  network: "eip155:137",
+  resource: targetUrl,
+  validAfter: "0",
+  validBefore: "9999999999",
+  authorizationNonce: `0x${"22".repeat(32)}`,
+  expiresAt: "9999999999",
+  signature: `0x${"11".repeat(65)}`
+};
 const paymentRequired: PaymentRequired = {
   x402Version: 2,
   error: "Payment required",
@@ -24,14 +43,15 @@ const paymentRequired: PaymentRequired = {
     {
       scheme: "exact",
       network: "eip155:137",
-      amount: "1000000000000000000",
-      asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
-      payTo: "0x1000000000000000000000000000000000000402",
+      amount: atomicAmount,
+      asset: jpycAsset,
+      payTo: sellerAddress,
       maxTimeoutSeconds: 60,
       extra: {
         assetTransferMethod: "eip3009",
         name: "JPY Coin",
-        version: "1"
+        version: "1",
+        sellerAuthorization
       }
     }
   ]
@@ -40,7 +60,7 @@ const settlement: SettleResponse = {
   success: true,
   transaction: "0x0000000000000000000000000000000000000000000000000000000000000402",
   network: "eip155:137",
-  payer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993"
+  payer: buyerAddress
 };
 
 describe("payJpyc", () => {
@@ -84,6 +104,7 @@ describe("payJpyc", () => {
 
       const payload = decodePaymentSignatureHeader(paymentSignature);
       expect(payload.accepted).toEqual(paymentRequired.accepts[0]);
+      expect(payload.accepted.extra?.sellerAuthorization).toEqual(sellerAuthorization);
       expect(payload.payload).toHaveProperty("authorization");
       expect(payload.payload).not.toHaveProperty("permit2Authorization");
 

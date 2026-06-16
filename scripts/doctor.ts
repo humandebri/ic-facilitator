@@ -31,6 +31,7 @@ const BUYER_SIGNER_ENV = envName(["BUYER", "EVM", "PRIVATE", "KEY"]);
 const REQUIRED_COMMANDS = ["icp", "ic-wasm", "candid-extractor", "cargo", "rustup"];
 const CANISTER_ENVS = [
   FACILITATOR_SIGNER_ENV,
+  "FACILITATOR_PUBLIC_ORIGIN",
   "JPYC_EIP712_VERSION",
   "POLYGON_RPC_SERVICES",
   "SELLER_CREDIT_PAY_TO",
@@ -130,11 +131,13 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   const privateKey = env[FACILITATOR_SIGNER_ENV];
   const maxGas = env.FACILITATOR_MAX_GAS;
   const maxSettlementFeeWei = env.FACILITATOR_MAX_SETTLEMENT_FEE_WEI;
+  const publicOrigin = env.FACILITATOR_PUBLIC_ORIGIN;
   const rpcServices = env.POLYGON_RPC_SERVICES;
   const sellerCreditPayTo = env.SELLER_CREDIT_PAY_TO;
   const sellerCreditTopupAmount = env.SELLER_CREDIT_TOPUP_AMOUNT;
   const sellerSettlementFeeAmount = env.SELLER_SETTLEMENT_FEE_AMOUNT;
   const settleTimeout = env.SETTLE_CONFIRMATION_TIMEOUT_SECONDS;
+  const settleMinConfirmations = env.SETTLE_MIN_CONFIRMATIONS;
   const settlementCacheTtl = env.SETTLEMENT_CACHE_TTL_SECONDS;
 
   if (privateKey && !isPrivateKey(privateKey)) {
@@ -148,6 +151,9 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   }
   if (maxSettlementFeeWei && !isPositiveIntegerString(maxSettlementFeeWei)) {
     checks.push(fail("env-format:FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "正の integer string ではない"));
+  }
+  if (publicOrigin && !isHttpsUrl(publicOrigin)) {
+    checks.push(fail("env-format:FACILITATOR_PUBLIC_ORIGIN", "HTTPS origin ではない"));
   }
   if (rpcServices && !isSingleHttpsRpcServices(rpcServices)) {
     checks.push(fail("env-format:POLYGON_RPC_SERVICES", "単一 HTTPS RPC URL ではない"));
@@ -163,6 +169,9 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   }
   if (settleTimeout && !isPositiveIntegerString(settleTimeout)) {
     checks.push(fail("env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "正の integer string ではない"));
+  }
+  if (settleMinConfirmations && !isPositiveIntegerString(settleMinConfirmations)) {
+    checks.push(fail("env-format:SETTLE_MIN_CONFIRMATIONS", "正の integer string ではない"));
   }
   if (settlementCacheTtl && !isPositiveIntegerString(settlementCacheTtl)) {
     checks.push(fail("env-format:SETTLEMENT_CACHE_TTL_SECONDS", "正の integer string ではない"));

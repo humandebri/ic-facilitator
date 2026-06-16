@@ -28,6 +28,7 @@ describe("set_canister_env facilitator validation", () => {
         env: {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: "0x1",
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
           POLYGON_RPC_SERVICES: "https://polygon.example",
@@ -55,6 +56,7 @@ describe("set_canister_env facilitator validation", () => {
         env: {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
           PATH: `${dir}:${process.env.PATH ?? ""}`
@@ -78,6 +80,7 @@ describe("set_canister_env facilitator validation", () => {
         env: {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
           POLYGON_RPC_SERVICES: "http://polygon.example",
@@ -105,6 +108,7 @@ describe("set_canister_env facilitator validation", () => {
         env: {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
           POLYGON_RPC_SERVICES: "https://polygon.example",
@@ -120,6 +124,7 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
       expect(log).toContain('set_env ("JPYC_EIP712_VERSION", "1")');
       expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon.example")');
+      expect(log).toContain('set_env ("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test")');
       expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
       expect(log).toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT", "1000")');
       expect(log).toContain('set_env ("SELLER_SETTLEMENT_FEE_AMOUNT", "100")');
@@ -127,6 +132,7 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).toContain('set_env ("FACILITATOR_MAX_GAS", "500000")');
       expect(log).toContain('set_env ("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "30000000000000000")');
       expect(log).toContain('set_env ("SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "60")');
+      expect(log).toContain('set_env ("SETTLE_MIN_CONFIRMATIONS", "3")');
       expect(log).toContain('set_env ("SETTLEMENT_CACHE_TTL_SECONDS", "86400")');
     } finally {
       rmSync(dir, { force: true, recursive: true });
@@ -141,6 +147,7 @@ describe("set_canister_env facilitator validation", () => {
         `FACILITATOR_EVM_PRIVATE_KEY=${privateKey}`,
         "JPYC_EIP712_VERSION=1",
         "POLYGON_RPC_SERVICES=https://polygon.example",
+        "FACILITATOR_PUBLIC_ORIGIN=https://canister.example.test",
         "SELLER_CREDIT_PAY_TO=0x2000000000000000000000000000000000000402",
         "SELLER_CREDIT_TOPUP_AMOUNT=1000",
         "SELLER_SETTLEMENT_FEE_AMOUNT=100",
@@ -163,6 +170,7 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
       expect(log).toContain('set_env ("JPYC_EIP712_VERSION", "1")');
       expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon.example")');
+      expect(log).toContain('set_env ("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test")');
       expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
       expect(log).toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT", "1000")');
       expect(log).toContain('set_env ("SELLER_SETTLEMENT_FEE_AMOUNT", "100")');
@@ -181,6 +189,7 @@ describe("set_canister_env facilitator validation", () => {
         "FACILITATOR_EVM_PRIVATE_KEY=0x2222222222222222222222222222222222222222222222222222222222222222",
         "JPYC_EIP712_VERSION=2",
         "POLYGON_RPC_SERVICES=https://dotenv.example",
+        "FACILITATOR_PUBLIC_ORIGIN=https://dotenv.example",
         "SELLER_CREDIT_PAY_TO=0x3000000000000000000000000000000000000402",
         "SELLER_CREDIT_TOPUP_AMOUNT=3000",
         "SELLER_SETTLEMENT_FEE_AMOUNT=300",
@@ -194,6 +203,7 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           DOTENV_PATH: dotenvPath,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           FACILITATOR_MAX_SETTLEMENT_FEE_WEI: "50000000000000000",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
