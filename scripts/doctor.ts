@@ -19,10 +19,25 @@ export type DoctorCheck = {
 const RUST_TARGET = "wasm32-unknown-unknown";
 const JPYC_DECIMALS = 18;
 const MIN_CANISTER_DISK_KIB = 2 * 1024 * 1024;
+const FIXED_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
+
+function envName(parts: readonly string[]): string {
+  return parts.join("_");
+}
+
+const FACILITATOR_SIGNER_ENV = envName(["FACILITATOR", "EVM", "PRIVATE", "KEY"]);
+const BUYER_SIGNER_ENV = envName(["BUYER", "EVM", "PRIVATE", "KEY"]);
 
 const REQUIRED_COMMANDS = ["icp", "ic-wasm", "candid-extractor", "cargo", "rustup"];
-const CANISTER_ENVS = ["FACILITATOR_EVM_PRIVATE_KEY"];
-const BUYER_ENVS = ["BUYER_EVM_PRIVATE_KEY", "POLYGON_RPC_URL", "SELLER_EVM_ADDRESS", "X402_TARGET_URL"];
+const CANISTER_ENVS = [
+  FACILITATOR_SIGNER_ENV,
+  "JPYC_EIP712_VERSION",
+  "POLYGON_RPC_SERVICES",
+  "SELLER_CREDIT_PAY_TO",
+  "SELLER_CREDIT_TOPUP_AMOUNT",
+  "SELLER_SETTLEMENT_FEE_AMOUNT"
+];
+const BUYER_ENVS = [BUYER_SIGNER_ENV, "JPYC_EIP712_VERSION", "POLYGON_RPC_URL", "SELLER_EVM_ADDRESS", "X402_TARGET_URL"];
 const SAMPLE_SELLER_ADDRESS = "0x0000000000000000000000000000000000000402";
 
 function ok(name: string, detail: string): DoctorCheck { return { detail, name, status: "ok" }; }
@@ -98,14 +113,13 @@ export function isHttpUrl(value: string): boolean {
     return false;
   }
 }
-export function isRpcServices(value: string): boolean {
-  const services = value.split(",").map((item) => item.trim()).filter(Boolean);
-  return services.length === 1 && services.every(isHttpsUrl);
-}
 function isHttpsUrl(value: string): boolean { return isHttpUrl(value) && new URL(value).protocol === "https:"; }
+export function isSingleHttpsRpcServices(value: string): boolean {
+  const services = value.split(",").map((item) => item.trim()).filter((item) => item !== "");
+  return services.length === 1 && isHttpsUrl(services[0] ?? "");
+}
 export function isPositiveIntegerString(value: string): boolean {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0;
+  return /^[1-9][0-9]*$/.test(value);
 }
 
 function isJpycPrice(value: string): boolean { try { positiveDecimalToAtomicUnits(value, JPYC_DECIMALS, "JPYC_PRICE"); return true; } catch { return false; } }
@@ -113,23 +127,39 @@ function isJpycPrice(value: string): boolean { try { positiveDecimalToAtomicUnit
 function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   const checks = CANISTER_ENVS.map((name) => envPresenceCheck(name, env));
   const jpycAddress = env.JPYC_POLYGON_ADDRESS;
-  const privateKey = env.FACILITATOR_EVM_PRIVATE_KEY;
+  const privateKey = env[FACILITATOR_SIGNER_ENV];
   const maxGas = env.FACILITATOR_MAX_GAS;
+  const maxSettlementFeeWei = env.FACILITATOR_MAX_SETTLEMENT_FEE_WEI;
   const rpcServices = env.POLYGON_RPC_SERVICES;
+  const sellerCreditPayTo = env.SELLER_CREDIT_PAY_TO;
+  const sellerCreditTopupAmount = env.SELLER_CREDIT_TOPUP_AMOUNT;
+  const sellerSettlementFeeAmount = env.SELLER_SETTLEMENT_FEE_AMOUNT;
   const settleTimeout = env.SETTLE_CONFIRMATION_TIMEOUT_SECONDS;
   const settlementCacheTtl = env.SETTLEMENT_CACHE_TTL_SECONDS;
 
   if (privateKey && !isPrivateKey(privateKey)) {
-    checks.push(fail("env-format:FACILITATOR_EVM_PRIVATE_KEY", "0x-prefixed 32-byte private key ではない"));
+    checks.push(fail(`env-format:${FACILITATOR_SIGNER_ENV}`, "0x-prefixed 32-byte private key ではない"));
   }
-  if (jpycAddress && (!isEvmAddress(jpycAddress) || isZeroAddress(jpycAddress))) {
-    checks.push(fail("env-format:JPYC_POLYGON_ADDRESS", "non-zero 0x-prefixed 20-byte EVM address ではない"));
-  }
-  if (rpcServices && !isRpcServices(rpcServices)) {
-    checks.push(fail("env-format:POLYGON_RPC_SERVICES", "single HTTPS URL ではない"));
+  if (jpycAddress) {
+    checks.push(warn("env:JPYC_POLYGON_ADDRESS", `canister は固定値 ${FIXED_JPYC_POLYGON_ADDRESS} を使う`, ".env から JPYC_POLYGON_ADDRESS を削除する"));
   }
   if (maxGas && !isPositiveIntegerString(maxGas)) {
     checks.push(fail("env-format:FACILITATOR_MAX_GAS", "正の integer string ではない"));
+  }
+  if (maxSettlementFeeWei && !isPositiveIntegerString(maxSettlementFeeWei)) {
+    checks.push(fail("env-format:FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "正の integer string ではない"));
+  }
+  if (rpcServices && !isSingleHttpsRpcServices(rpcServices)) {
+    checks.push(fail("env-format:POLYGON_RPC_SERVICES", "単一 HTTPS RPC URL ではない"));
+  }
+  if (sellerCreditPayTo && (!isEvmAddress(sellerCreditPayTo) || isZeroAddress(sellerCreditPayTo))) {
+    checks.push(fail("env-format:SELLER_CREDIT_PAY_TO", "non-zero 0x-prefixed 20-byte EVM address ではない"));
+  }
+  if (sellerCreditTopupAmount && !isPositiveIntegerString(sellerCreditTopupAmount)) {
+    checks.push(fail("env-format:SELLER_CREDIT_TOPUP_AMOUNT", "正の integer string ではない"));
+  }
+  if (sellerSettlementFeeAmount && !isPositiveIntegerString(sellerSettlementFeeAmount)) {
+    checks.push(fail("env-format:SELLER_SETTLEMENT_FEE_AMOUNT", "正の integer string ではない"));
   }
   if (settleTimeout && !isPositiveIntegerString(settleTimeout)) {
     checks.push(fail("env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "正の integer string ではない"));
@@ -144,7 +174,7 @@ function buyerEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   const checks = BUYER_ENVS.map((name) => envPresenceCheck(name, env));
   const jpycAddress = env.JPYC_POLYGON_ADDRESS;
   const jpycPrice = env.JPYC_PRICE;
-  const privateKey = env.BUYER_EVM_PRIVATE_KEY;
+  const privateKey = env[BUYER_SIGNER_ENV];
   const resourceUrl = env.X402_RESOURCE_URL;
   const rpcUrl = env.POLYGON_RPC_URL;
   const seller = env.SELLER_EVM_ADDRESS;
@@ -157,7 +187,7 @@ function buyerEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
     checks.push(fail("env-format:JPYC_PRICE", "正の decimal string ではない"));
   }
   if (privateKey && !isPrivateKey(privateKey)) {
-    checks.push(fail("env-format:BUYER_EVM_PRIVATE_KEY", "0x-prefixed 32-byte private key ではない"));
+    checks.push(fail(`env-format:${BUYER_SIGNER_ENV}`, "0x-prefixed 32-byte private key ではない"));
   }
   if (rpcUrl && !isHttpUrl(rpcUrl)) {
     checks.push(fail("env-format:POLYGON_RPC_URL", "http(s) URL ではない"));

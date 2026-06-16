@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 
 const privateKey = `0x${"1".repeat(64)}`;
+const sellerCreditPayTo = "0x2000000000000000000000000000000000000402";
 
 function fakeIcpDir(): { readonly dir: string; readonly logPath: string } {
   const dir = mkdtempSync(join(tmpdir(), "ic-facilitator-env-"));
@@ -28,6 +29,11 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: "0x1",
           ICP_FAKE_LOG: logPath,
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_SERVICES: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
+          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
@@ -40,7 +46,7 @@ describe("set_canister_env facilitator validation", () => {
     }
   });
 
-  it("rejects malformed Polygon RPC services before calling icp", () => {
+  it("rejects missing Polygon RPC services before calling icp", () => {
     const { dir, logPath } = fakeIcpDir();
     try {
       const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
@@ -50,13 +56,40 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           ICP_FAKE_LOG: logPath,
-          PATH: `${dir}:${process.env.PATH ?? ""}`,
-          POLYGON_RPC_SERVICES: "file:///tmp/rpc"
+          JPYC_EIP712_VERSION: "1",
+          PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("POLYGON_RPC_SERVICES must be a single https URL");
+      expect(result.stderr).toContain("missing required env: POLYGON_RPC_SERVICES");
+      expect(() => readFileSync(logPath, "utf8")).toThrow();
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects non-HTTPS Polygon RPC services before calling icp", () => {
+    const { dir, logPath } = fakeIcpDir();
+    try {
+      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          ICP_FAKE_LOG: logPath,
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_SERVICES: "http://polygon.example",
+          SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
+          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          PATH: `${dir}:${process.env.PATH ?? ""}`
+        }
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("POLYGON_RPC_SERVICES must be an HTTPS RPC URL");
       expect(() => readFileSync(logPath, "utf8")).toThrow();
     } finally {
       rmSync(dir, { force: true, recursive: true });
@@ -73,6 +106,11 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           ICP_FAKE_LOG: logPath,
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_SERVICES: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
+          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
@@ -80,9 +118,14 @@ describe("set_canister_env facilitator validation", () => {
       expect(result.status).toBe(0);
       const log = readFileSync(logPath, "utf8");
       expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
-      expect(log).toContain('set_env ("JPYC_POLYGON_ADDRESS", "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB")');
-      expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon-bor-rpc.publicnode.com")');
+      expect(log).toContain('set_env ("JPYC_EIP712_VERSION", "1")');
+      expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon.example")');
+      expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
+      expect(log).toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT", "1000")');
+      expect(log).toContain('set_env ("SELLER_SETTLEMENT_FEE_AMOUNT", "100")');
+      expect(log).not.toContain("JPYC_POLYGON_ADDRESS");
       expect(log).toContain('set_env ("FACILITATOR_MAX_GAS", "500000")');
+      expect(log).toContain('set_env ("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "30000000000000000")');
       expect(log).toContain('set_env ("SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "60")');
       expect(log).toContain('set_env ("SETTLEMENT_CACHE_TTL_SECONDS", "86400")');
     } finally {
@@ -96,8 +139,13 @@ describe("set_canister_env facilitator validation", () => {
     try {
       writeFileSync(dotenvPath, [
         `FACILITATOR_EVM_PRIVATE_KEY=${privateKey}`,
-        "POLYGON_RPC_SERVICES=https://one.example",
-        "FACILITATOR_MAX_GAS=700000"
+        "JPYC_EIP712_VERSION=1",
+        "POLYGON_RPC_SERVICES=https://polygon.example",
+        "SELLER_CREDIT_PAY_TO=0x2000000000000000000000000000000000000402",
+        "SELLER_CREDIT_TOPUP_AMOUNT=1000",
+        "SELLER_SETTLEMENT_FEE_AMOUNT=100",
+        "FACILITATOR_MAX_GAS=700000",
+        "FACILITATOR_MAX_SETTLEMENT_FEE_WEI=40000000000000000"
       ].join("\n"));
       const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
         cwd: process.cwd(),
@@ -113,8 +161,13 @@ describe("set_canister_env facilitator validation", () => {
       expect(result.status).toBe(0);
       const log = readFileSync(logPath, "utf8");
       expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
-      expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://one.example")');
+      expect(log).toContain('set_env ("JPYC_EIP712_VERSION", "1")');
+      expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon.example")');
+      expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
+      expect(log).toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT", "1000")');
+      expect(log).toContain('set_env ("SELLER_SETTLEMENT_FEE_AMOUNT", "100")');
       expect(log).toContain('set_env ("FACILITATOR_MAX_GAS", "700000")');
+      expect(log).toContain('set_env ("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "40000000000000000")');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
@@ -126,7 +179,13 @@ describe("set_canister_env facilitator validation", () => {
     try {
       writeFileSync(dotenvPath, [
         "FACILITATOR_EVM_PRIVATE_KEY=0x2222222222222222222222222222222222222222222222222222222222222222",
-        "FACILITATOR_MAX_GAS=700000"
+        "JPYC_EIP712_VERSION=2",
+        "POLYGON_RPC_SERVICES=https://dotenv.example",
+        "SELLER_CREDIT_PAY_TO=0x3000000000000000000000000000000000000402",
+        "SELLER_CREDIT_TOPUP_AMOUNT=3000",
+        "SELLER_SETTLEMENT_FEE_AMOUNT=300",
+        "FACILITATOR_MAX_GAS=700000",
+        "FACILITATOR_MAX_SETTLEMENT_FEE_WEI=40000000000000000"
       ].join("\n"));
       const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
         cwd: process.cwd(),
@@ -135,13 +194,21 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           DOTENV_PATH: dotenvPath,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_MAX_SETTLEMENT_FEE_WEI: "50000000000000000",
           ICP_FAKE_LOG: logPath,
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_SERVICES: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
+          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
 
       expect(result.status).toBe(0);
-      expect(readFileSync(logPath, "utf8")).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
+      const log = readFileSync(logPath, "utf8");
+      expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
+      expect(log).toContain('set_env ("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "50000000000000000")');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }

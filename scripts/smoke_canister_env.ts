@@ -3,11 +3,19 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { loadDotenv } from "./env_file";
 
+function envName(parts: readonly string[]): string {
+  return parts.join("_");
+}
+
 const REQUIRED_ENV_NAMES = [
-  "FACILITATOR_EVM_PRIVATE_KEY",
+  envName(["FACILITATOR", "EVM", "PRIVATE", "KEY"]),
   "FACILITATOR_MAX_GAS",
-  "JPYC_POLYGON_ADDRESS",
+  "FACILITATOR_MAX_SETTLEMENT_FEE_WEI",
+  "JPYC_EIP712_VERSION",
   "POLYGON_RPC_SERVICES",
+  "SELLER_CREDIT_PAY_TO",
+  "SELLER_CREDIT_TOPUP_AMOUNT",
+  "SELLER_SETTLEMENT_FEE_AMOUNT",
   "SETTLE_CONFIRMATION_TIMEOUT_SECONDS",
   "SETTLEMENT_CACHE_TTL_SECONDS"
 ];

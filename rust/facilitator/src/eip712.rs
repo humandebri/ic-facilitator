@@ -1,21 +1,20 @@
-// rust/facilitator/src/eip712.rs: JPYC exact Permit2 の EIP-712 digest と署名復元を実装する。
+// rust/facilitator/src/eip712.rs: JPYC exact EIP-3009 の EIP-712 digest と署名復元を実装する。
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
 use crate::hexutil::{
-    address_hex, address_word, keccak256, parse_address, parse_hex, parse_u256_decimal,
-    parse_u64_decimal, u256_word, PERMIT2_ADDRESS,
+    address_hex, address_word, keccak256, parse_address, parse_hex, parse_u256_decimal, u256_word,
+    JPYC_POLYGON_ADDRESS,
 };
-use crate::types::{PaymentPayload, Permit2Authorization};
+use crate::types::{Eip3009Authorization, PaymentPayload};
 
-const DOMAIN_TYPE: &str = "EIP712Domain(string name,uint256 chainId,address verifyingContract)";
-const PERMIT_TYPE: &str = "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)TokenPermissions(address token,uint256 amount)Witness(address to,uint256 validAfter)";
-const TOKEN_TYPE: &str = "TokenPermissions(address token,uint256 amount)";
-const WITNESS_TYPE: &str = "Witness(address to,uint256 validAfter)";
+const DOMAIN_TYPE: &str =
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+const TRANSFER_TYPE: &str = "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
 
-pub fn permit2_digest(payload: &PaymentPayload) -> Result<[u8; 32], String> {
-    let auth = &payload.payload.permit2_authorization;
-    let domain = domain_separator()?;
-    let message = permit_hash(auth)?;
+pub fn eip3009_digest(payload: &PaymentPayload) -> Result<[u8; 32], String> {
+    let auth = &payload.payload.authorization;
+    let domain = domain_separator(&payload.accepted)?;
+    let message = transfer_hash(auth)?;
     let mut bytes = Vec::with_capacity(66);
     bytes.extend_from_slice(b"\x19\x01");
     bytes.extend_from_slice(&domain);
@@ -23,16 +22,16 @@ pub fn permit2_digest(payload: &PaymentPayload) -> Result<[u8; 32], String> {
     Ok(keccak256(&bytes))
 }
 
-pub fn recover_permit2_signer(payload: &PaymentPayload) -> Result<String, String> {
-    let digest = permit2_digest(payload)?;
+pub fn recover_eip3009_signer(payload: &PaymentPayload) -> Result<String, String> {
+    let digest = eip3009_digest(payload)?;
     let sig = parse_hex(&payload.payload.signature, None)?;
     if sig.len() != 65 {
-        return Err("invalid Permit2 signature length".to_string());
+        return Err("invalid EIP-3009 signature length".to_string());
     }
-    let signature = Signature::try_from(&sig[..64]).map_err(|_| "invalid Permit2 signature")?;
+    let signature = Signature::try_from(&sig[..64]).map_err(|_| "invalid EIP-3009 signature")?;
     let recovery = recovery_id(sig[64])?;
     let key = VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
-        .map_err(|_| "invalid Permit2 signature")?;
+        .map_err(|_| "invalid EIP-3009 signature")?;
     Ok(address_from_key(&key))
 }
 
@@ -53,49 +52,43 @@ fn address_from_key(key: &VerifyingKey) -> String {
     address_hex(&address)
 }
 
-fn domain_separator() -> Result<[u8; 32], String> {
-    let verifying_contract = parse_address(PERMIT2_ADDRESS, "Permit2 verifying contract")?;
-    let mut encoded = Vec::with_capacity(128);
+fn domain_separator(requirements: &crate::types::PaymentRequirements) -> Result<[u8; 32], String> {
+    let name = requirements
+        .extra
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "missing EIP-712 domain name".to_string())?;
+    let version = requirements
+        .extra
+        .get("version")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "missing EIP-712 domain version".to_string())?;
+    let verifying_contract = parse_address(JPYC_POLYGON_ADDRESS, "JPYC verifying contract")?;
+    let mut encoded = Vec::with_capacity(160);
     encoded.extend_from_slice(&keccak256(DOMAIN_TYPE.as_bytes()));
-    encoded.extend_from_slice(&keccak256(b"Permit2"));
+    encoded.extend_from_slice(&keccak256(name.as_bytes()));
+    encoded.extend_from_slice(&keccak256(version.as_bytes()));
     encoded.extend_from_slice(&u256_word(137));
     encoded.extend_from_slice(&address_word(&verifying_contract));
     Ok(keccak256(&encoded))
 }
 
-fn permit_hash(auth: &Permit2Authorization) -> Result<[u8; 32], String> {
-    let token_hash = token_permissions_hash(auth)?;
-    let witness_hash = witness_hash(auth)?;
-    let spender = parse_address(&auth.spender, "permit2.spender")?;
-    let nonce = parse_u256_decimal(&auth.nonce, "permit2.nonce")?;
-    let deadline = parse_u256_decimal(&auth.deadline, "permit2.deadline")?;
-    let mut encoded = Vec::with_capacity(192);
-    encoded.extend_from_slice(&keccak256(PERMIT_TYPE.as_bytes()));
-    encoded.extend_from_slice(&token_hash);
-    encoded.extend_from_slice(&address_word(&spender));
-    encoded.extend_from_slice(&nonce);
-    encoded.extend_from_slice(&deadline);
-    encoded.extend_from_slice(&witness_hash);
-    Ok(keccak256(&encoded))
-}
-
-fn token_permissions_hash(auth: &Permit2Authorization) -> Result<[u8; 32], String> {
-    let token = parse_address(&auth.permitted.token, "permit2.permitted.token")?;
-    let amount = parse_u256_decimal(&auth.permitted.amount, "permit2.permitted.amount")?;
-    let mut encoded = Vec::with_capacity(96);
-    encoded.extend_from_slice(&keccak256(TOKEN_TYPE.as_bytes()));
-    encoded.extend_from_slice(&address_word(&token));
-    encoded.extend_from_slice(&amount);
-    Ok(keccak256(&encoded))
-}
-
-fn witness_hash(auth: &Permit2Authorization) -> Result<[u8; 32], String> {
-    let to = parse_address(&auth.witness.to, "permit2.witness.to")?;
-    let valid_after = parse_u64_decimal(&auth.witness.valid_after, "permit2.witness.validAfter")?;
-    let mut encoded = Vec::with_capacity(96);
-    encoded.extend_from_slice(&keccak256(WITNESS_TYPE.as_bytes()));
+fn transfer_hash(auth: &Eip3009Authorization) -> Result<[u8; 32], String> {
+    let from = parse_address(&auth.from, "authorization.from")?;
+    let to = parse_address(&auth.to, "authorization.to")?;
+    let value = parse_u256_decimal(&auth.value, "authorization.value")?;
+    let valid_after = parse_u256_decimal(&auth.valid_after, "authorization.validAfter")?;
+    let valid_before = parse_u256_decimal(&auth.valid_before, "authorization.validBefore")?;
+    let nonce =
+        parse_hex(&auth.nonce, Some(32)).map_err(|err| format!("authorization.nonce: {err}"))?;
+    let mut encoded = Vec::with_capacity(224);
+    encoded.extend_from_slice(&keccak256(TRANSFER_TYPE.as_bytes()));
+    encoded.extend_from_slice(&address_word(&from));
     encoded.extend_from_slice(&address_word(&to));
-    encoded.extend_from_slice(&u256_word(valid_after as u128));
+    encoded.extend_from_slice(&value);
+    encoded.extend_from_slice(&valid_after);
+    encoded.extend_from_slice(&valid_before);
+    encoded.extend_from_slice(&nonce);
     Ok(keccak256(&encoded))
 }
 
@@ -103,9 +96,11 @@ fn witness_hash(auth: &Permit2Authorization) -> Result<[u8; 32], String> {
 mod tests {
     use super::*;
     use crate::types::*;
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use k256::ecdsa::SigningKey;
     use serde_json::json;
 
-    fn payload() -> PaymentPayload {
+    fn payload(signature: String) -> PaymentPayload {
         PaymentPayload {
             x402_version: 2,
             resource: None,
@@ -116,23 +111,21 @@ mod tests {
                 amount: "1000000000000000000".to_string(),
                 pay_to: "0x1000000000000000000000000000000000000402".to_string(),
                 max_timeout_seconds: 60,
-                extra: json!({"assetTransferMethod":"permit2"}),
+                extra: json!({
+                    "assetTransferMethod":"eip3009",
+                    "name":"JPY Coin",
+                    "version":"1"
+                }),
             },
-            payload: Permit2Payload {
-                signature: format!("0x{}1b", "11".repeat(64)),
-                permit2_authorization: Permit2Authorization {
+            payload: Eip3009Payload {
+                signature,
+                authorization: Eip3009Authorization {
                     from: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993".to_string(),
-                    permitted: Permit2Permitted {
-                        token: crate::hexutil::JPYC_POLYGON_ADDRESS.to_string(),
-                        amount: "1000000000000000000".to_string(),
-                    },
-                    spender: crate::hexutil::X402_EXACT_PERMIT2_PROXY.to_string(),
-                    nonce: "115792089237316195423570985008687907853269984665640564039457584007913129639935".to_string(),
-                    deadline: "9999999999".to_string(),
-                    witness: Permit2Witness {
-                        to: "0x1000000000000000000000000000000000000402".to_string(),
-                        valid_after: "0".to_string(),
-                    },
+                    to: "0x1000000000000000000000000000000000000402".to_string(),
+                    value: "1000000000000000000".to_string(),
+                    valid_after: "0".to_string(),
+                    valid_before: "9999999999".to_string(),
+                    nonce: format!("0x{}", "11".repeat(32)),
                 },
             },
             extensions: None,
@@ -141,6 +134,41 @@ mod tests {
 
     #[test]
     fn builds_digest() {
-        assert_eq!(permit2_digest(&payload()).unwrap().len(), 32);
+        assert_eq!(
+            eip3009_digest(&payload("0x".to_string())).unwrap().len(),
+            32
+        );
+    }
+
+    #[test]
+    fn recovers_authorization_signer_with_standard_and_raw_recovery_id() {
+        let key = SigningKey::from_slice(
+            &crate::hexutil::parse_hex(
+                "0x59c6995e998f97a5a0044966f094538db1f78e001b7e6f2480d4ef9f4a3a9a8e",
+                Some(32),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let digest = eip3009_digest(&payload("0x".to_string())).unwrap();
+        let (signature, recovery): (Signature, RecoveryId) = key.sign_prehash(&digest).unwrap();
+        for recovery_id in [u8::from(recovery), u8::from(recovery) + 27] {
+            let mut bytes = Vec::with_capacity(65);
+            bytes.extend_from_slice(&signature.to_bytes());
+            bytes.push(recovery_id);
+            let recovered =
+                recover_eip3009_signer(&payload(format!("0x{}", hex::encode(bytes)))).unwrap();
+            assert_eq!(
+                recovered.to_lowercase(),
+                "0xb51afb2cba39fb1e3e2b3d1df337579896fba993"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_short_nonce() {
+        let mut item = payload("0x".to_string());
+        item.payload.authorization.nonce = "0x01".to_string();
+        assert!(eip3009_digest(&item).is_err());
     }
 }

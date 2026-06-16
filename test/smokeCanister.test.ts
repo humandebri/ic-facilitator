@@ -11,10 +11,10 @@ function responseFor(supported: unknown = {
     x402Version: 2,
     scheme: "exact",
     network: "eip155:137",
-    extra: { assetTransferMethod: "permit2" }
+    extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" }
   }],
   extensions: [],
-  signers: { "eip155:*": [facilitatorAddress] }
+  signers: { "eip155:137": [facilitatorAddress] }
 }): typeof fetch {
   return async (input) => {
     if (String(input) === `${baseUrl}/health`) {
@@ -62,6 +62,24 @@ describe("canister smoke", () => {
         env: { X402_BASE_URL: baseUrl },
         fetchFn: responseFor({ kinds: [], extensions: [], signers: {} })
       })
-    ).rejects.toThrow("supported lacks x402 v2 exact/eip155:137 permit2");
+    ).rejects.toThrow("supported lacks x402 v2 exact/eip155:137 eip3009");
+  });
+
+  it("rejects wildcard EVM signers", async () => {
+    await expect(
+      checkCanisterSmoke({
+        env: { X402_BASE_URL: baseUrl },
+        fetchFn: responseFor({
+          kinds: [{
+            x402Version: 2,
+            scheme: "exact",
+            network: "eip155:137",
+            extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" }
+          }],
+          extensions: [],
+          signers: { "eip155:*": [facilitatorAddress] }
+        })
+      })
+    ).rejects.toThrow("supported.signers must not use eip155:*");
   });
 });

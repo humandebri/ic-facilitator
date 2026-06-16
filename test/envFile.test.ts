@@ -20,12 +20,12 @@ describe("env file loader", () => {
     const dir = mkdtempSync(join(tmpdir(), "ic-facilitator-env-"));
     const path = join(dir, ".env");
     const env: NodeJS.ProcessEnv = { FACILITATOR_EVM_PRIVATE_KEY: "shell-value" };
-    writeFileSync(path, "FACILITATOR_EVM_PRIVATE_KEY=file-value\nPOLYGON_RPC_SERVICES=https://polygon.example\n", "utf8");
+    writeFileSync(path, "FACILITATOR_EVM_PRIVATE_KEY=file-value\nJPYC_EIP712_VERSION=1\n", "utf8");
 
     const result = loadDotenv(env, path);
 
-    expect(result.loaded).toEqual(["POLYGON_RPC_SERVICES"]);
+    expect(result.loaded).toEqual(["JPYC_EIP712_VERSION"]);
     expect(env.FACILITATOR_EVM_PRIVATE_KEY).toBe("shell-value");
-    expect(env.POLYGON_RPC_SERVICES).toBe("https://polygon.example");
+    expect(env.JPYC_EIP712_VERSION).toBe("1");
   });
 });

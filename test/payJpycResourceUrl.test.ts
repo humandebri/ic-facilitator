@@ -19,7 +19,7 @@ const paymentRequired: PaymentRequired = {
     asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
     payTo: "0x1000000000000000000000000000000000000402",
     maxTimeoutSeconds: 60,
-    extra: { assetTransferMethod: "permit2" }
+    extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" }
   }]
 };
 
@@ -39,6 +39,7 @@ describe("payJpyc resource URL guard", () => {
     const fetchFn = fetchPaymentRequired();
     await expect(payJpyc({
       expectedPayTo: "0x1000000000000000000000000000000000000402",
+      expectedEip712Version: "1",
       fetchFn,
       privateKey,
       targetUrl
@@ -48,6 +49,7 @@ describe("payJpyc resource URL guard", () => {
   it("rejects non-HTTPS expected resource URLs before signing", async () => {
     await expect(payJpyc({
       expectedPayTo: "0x1000000000000000000000000000000000000402",
+      expectedEip712Version: "1",
       expectedResourceUrl: "http://edge.local.localhost:8000/jpyc/report",
       fetchFn: fetchPaymentRequired(),
       privateKey,

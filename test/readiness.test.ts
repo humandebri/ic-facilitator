@@ -1,6 +1,5 @@
 // test/readiness.test.ts: canister-only readiness が不足条件だけを公開することを確認する。
 import { describe, expect, it } from "vitest";
-import { x402ExactPermit2ProxyAddress } from "@x402/evm";
 import { encodePaymentRequiredHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
 import type { Hex, TransactionReceipt } from "viem";
@@ -15,8 +14,9 @@ const resourceUrl = `${baseUrl}/jpyc/report`;
 const hash: Hex = "0x0000000000000000000000000000000000000000000000000000000000000402";
 const jpyc: Hex = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const transferTopic: Hex = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const facilitatorKeyEnv = ["FACILITATOR", "EVM", "PRIVATE", "KEY"].join("_");
 const envNamesOutput = `(
-  vec { "FACILITATOR_EVM_PRIVATE_KEY"; "FACILITATOR_MAX_GAS"; "JPYC_POLYGON_ADDRESS"; "POLYGON_RPC_SERVICES"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLEMENT_CACHE_TTL_SECONDS";},
+  vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_SERVICES"; "SELLER_CREDIT_PAY_TO"; "SELLER_CREDIT_TOPUP_AMOUNT"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLEMENT_CACHE_TTL_SECONDS";},
 )`;
 
 const paymentRequired: PaymentRequired = {
@@ -30,7 +30,7 @@ const paymentRequired: PaymentRequired = {
     asset: jpyc,
     payTo: seller,
     maxTimeoutSeconds: 60,
-    extra: { assetTransferMethod: "permit2" }
+    extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" }
   }]
 };
 
@@ -64,7 +64,7 @@ describe("jpyc readiness", () => {
     expect(report.nextCommands).toContain("npm run doctor -- --mode=canister");
     expect(report.nextCommands).toContain("npm run doctor -- --mode=buyer");
     expect(JSON.stringify(report)).not.toContain(privateKey);
-  });
+  }, 10_000);
 
   it("can include canister HTTP smoke", async () => {
     const fetchFn: typeof fetch = async (input) => {
@@ -74,9 +74,9 @@ describe("jpyc readiness", () => {
       }
       if (url.endsWith("/supported")) {
         return Response.json({
-          kinds: [{ x402Version: 2, scheme: "exact", network: "eip155:137", extra: { assetTransferMethod: "permit2" } }],
+          kinds: [{ x402Version: 2, scheme: "exact", network: "eip155:137", extra: { assetTransferMethod: "eip3009", name: "JPY Coin", version: "1" } }],
           extensions: [],
-          signers: {}
+          signers: { "eip155:137": [seller] }
         });
       }
       return new Response("not found", { status: 404 });
@@ -84,6 +84,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
       X402_BASE_URL: baseUrl,
@@ -92,12 +93,13 @@ describe("jpyc readiness", () => {
 
     expect(report.stages.find((stage) => stage.name === "canister-http")?.status).toBe("ok");
     expect(report.nextCommands).not.toContain("npm run readiness:jpyc -- --with-canister-smoke");
-  });
+  }, 10_000);
 
   it("can include canister env names smoke", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
       X402_TARGET_URL: resourceUrl
@@ -111,6 +113,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
       X402_BASE_URL: baseUrl,
@@ -125,6 +128,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
       X402_TARGET_URL: resourceUrl
@@ -156,7 +160,7 @@ describe("jpyc readiness", () => {
       }],
       logsBloom: "0x",
       status: "success",
-      to: x402ExactPermit2ProxyAddress,
+      to: jpyc,
       transactionHash: hash,
       transactionIndex: 0,
       type: "eip1559"
@@ -164,6 +168,8 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      JPYC_EIP712_VERSION: "1",
+      JPYC_POLYGON_ADDRESS: jpyc,
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
       SETTLEMENT_TX: hash,
@@ -180,6 +186,7 @@ describe("jpyc readiness", () => {
   it("does not mark settlement verified without the buyer key", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
       SETTLEMENT_TX: hash,

@@ -1,7 +1,6 @@
 // scripts/settlement_receipt.ts: x402 settlement tx の Polygon receipt を確認する。
 import { pathToFileURL } from "node:url";
 
-import { x402ExactPermit2ProxyAddress } from "@x402/evm";
 import { createPublicClient, http } from "viem";
 import type { Hex, TransactionReceipt } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -219,7 +218,7 @@ async function main(): Promise<void> {
   const result = await verifySettlementReceipt({
     hash: parseTxHash(tx),
     ...(rpcUrl ? { rpcUrl } : {}),
-    expectedTo: x402ExactPermit2ProxyAddress,
+    expectedTo: readEnv("JPYC_POLYGON_ADDRESS") ?? DEFAULT_JPYC_POLYGON_ADDRESS,
     expectedTransfer
   });
 
