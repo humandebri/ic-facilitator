@@ -1,5 +1,8 @@
 node_modules/
 dist/
+!dist/
+dist/*
+!dist/facilitator.did
 .icp/cache/
 .env
 .env.*

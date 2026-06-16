@@ -99,6 +99,15 @@ require_single_https_rpc_url() {
   fi
 }
 
+require_https_origin() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^https://[^/:@?#[:space:]]+(:[0-9]+)?$ ]]; then
+    echo "$name must be an HTTPS origin" >&2
+    exit 1
+  fi
+}
+
 candid_text() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -129,7 +138,7 @@ required_env SELLER_CREDIT_TOPUP_AMOUNT
 required_env SELLER_SETTLEMENT_FEE_AMOUNT
 require_private_key FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
 require_single_https_rpc_url POLYGON_RPC_SERVICES "$POLYGON_RPC_SERVICES"
-require_single_https_rpc_url FACILITATOR_PUBLIC_ORIGIN "$FACILITATOR_PUBLIC_ORIGIN"
+require_https_origin FACILITATOR_PUBLIC_ORIGIN "$FACILITATOR_PUBLIC_ORIGIN"
 require_nonzero_evm_address SELLER_CREDIT_PAY_TO "$SELLER_CREDIT_PAY_TO"
 require_positive_integer SELLER_CREDIT_TOPUP_AMOUNT "$SELLER_CREDIT_TOPUP_AMOUNT"
 require_positive_integer SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT"

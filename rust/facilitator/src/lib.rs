@@ -1722,14 +1722,28 @@ fn request_url(request: &HttpRequest) -> Result<String, String> {
 
 fn public_origin() -> Result<String, String> {
     let value = env("FACILITATOR_PUBLIC_ORIGIN")?;
-    let origin = value.trim_end_matches('/');
-    let host = origin
+    let host = value
         .strip_prefix("https://")
         .ok_or_else(|| "FACILITATOR_PUBLIC_ORIGIN must be an https origin".to_string())?;
-    if host.is_empty() || host.contains('/') || host.contains('?') || host.contains('#') {
+    if host.is_empty()
+        || host.contains('@')
+        || host.contains('/')
+        || host.contains('?')
+        || host.contains('#')
+        || host.chars().any(char::is_whitespace)
+    {
         return Err("FACILITATOR_PUBLIC_ORIGIN must be an https origin".to_string());
     }
-    Ok(origin.to_string())
+    if let Some((hostname, port)) = host.rsplit_once(':') {
+        if hostname.is_empty()
+            || hostname.contains(':')
+            || port.is_empty()
+            || !port.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Err("FACILITATOR_PUBLIC_ORIGIN must be an https origin".to_string());
+        }
+    }
+    Ok(value)
 }
 
 fn request_path_and_query(url: &str) -> String {
@@ -2382,6 +2396,36 @@ mod tests {
         );
         assert_eq!(value["accepts"][0]["amount"], "1000");
         assert_eq!(value["accepts"][0]["payTo"], CREDIT_PAY_TO.to_lowercase());
+    }
+
+    #[test]
+    fn public_origin_rejects_userinfo_path_query_fragment_and_trailing_slash() {
+        for value in [
+            "https://trusted.example@evil.example",
+            "https://canister.example.test/path",
+            "https://canister.example.test?x=1",
+            "https://canister.example.test#x",
+            "https://canister.example.test/",
+        ] {
+            clear_env_values();
+            set_env_value("FACILITATOR_PUBLIC_ORIGIN", value);
+            assert_eq!(
+                public_origin().unwrap_err(),
+                "FACILITATOR_PUBLIC_ORIGIN must be an https origin"
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_accepts_https_host_and_port() {
+        for value in [
+            "https://canister.example.test",
+            "https://canister.example.test:443",
+        ] {
+            clear_env_values();
+            set_env_value("FACILITATOR_PUBLIC_ORIGIN", value);
+            assert_eq!(public_origin().unwrap(), value);
+        }
     }
 
     #[test]

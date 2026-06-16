@@ -115,6 +115,24 @@ export function isHttpUrl(value: string): boolean {
   }
 }
 function isHttpsUrl(value: string): boolean { return isHttpUrl(value) && new URL(value).protocol === "https:"; }
+export function isHttpsOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const host = value.slice("https://".length);
+    return url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === "" &&
+      value.startsWith("https://") &&
+      value !== `${url.origin}/` &&
+      host !== "" &&
+      /^[^/:@?#\s]+(?::[0-9]+)?$/.test(host);
+  } catch {
+    return false;
+  }
+}
 export function isSingleHttpsRpcServices(value: string): boolean {
   const services = value.split(",").map((item) => item.trim()).filter((item) => item !== "");
   return services.length === 1 && isHttpsUrl(services[0] ?? "");
@@ -152,7 +170,7 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   if (maxSettlementFeeWei && !isPositiveIntegerString(maxSettlementFeeWei)) {
     checks.push(fail("env-format:FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "正の integer string ではない"));
   }
-  if (publicOrigin && !isHttpsUrl(publicOrigin)) {
+  if (publicOrigin && !isHttpsOrigin(publicOrigin)) {
     checks.push(fail("env-format:FACILITATOR_PUBLIC_ORIGIN", "HTTPS origin ではない"));
   }
   if (rpcServices && !isSingleHttpsRpcServices(rpcServices)) {

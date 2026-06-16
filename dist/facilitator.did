@@ -1,0 +1,41 @@
+type HttpRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+  certificate_version : opt nat16;
+};
+type HttpResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  upgrade : opt bool;
+  status_code : nat16;
+};
+type SettleResponse = record {
+  transaction : text;
+  error_reason : opt text;
+  error_message : opt text;
+  network : text;
+  extra : opt vec record { text; text };
+  success : bool;
+  payer : opt text;
+  amount : opt text;
+};
+type SettlementRecord = record {
+  status : text;
+  updated_at : nat64;
+  created_at : nat64;
+  response : SettleResponse;
+  expires_at : nat64;
+  pay_to : opt text;
+};
+service : {
+  active_settlement_count : () -> (nat64) query;
+  env_names : () -> (vec text) query;
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  http_request_update : (HttpRequest) -> (HttpResponse);
+  seller_credit : (text) -> (nat) query;
+  set_env : (text, text) -> ();
+  settlement : (text) -> (opt SettlementRecord) query;
+  settlement_count : () -> (nat64) query;
+}

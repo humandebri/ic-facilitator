@@ -99,6 +99,34 @@ describe("set_canister_env facilitator validation", () => {
     }
   });
 
+  it("rejects userinfo in facilitator public origin before calling icp", () => {
+    const { dir, logPath } = fakeIcpDir();
+    try {
+      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://trusted.example@evil.example",
+          ICP_FAKE_LOG: logPath,
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_SERVICES: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
+          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          PATH: `${dir}:${process.env.PATH ?? ""}`
+        }
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("FACILITATOR_PUBLIC_ORIGIN must be an HTTPS origin");
+      expect(() => readFileSync(logPath, "utf8")).toThrow();
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
   it("sets facilitator env defaults", () => {
     const { dir, logPath } = fakeIcpDir();
     try {
