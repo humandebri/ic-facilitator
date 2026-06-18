@@ -135,7 +135,7 @@ export function isHttpsOrigin(value: string): boolean {
 }
 export function isSingleHttpsRpcServices(value: string): boolean {
   const services = value.split(",").map((item) => item.trim()).filter((item) => item !== "");
-  return services.length === 1 && isHttpsUrl(services[0] ?? "");
+  return services.length === 1 && isHttpsOrigin(services[0] ?? "");
 }
 export function isPositiveIntegerString(value: string): boolean {
   return /^[1-9][0-9]*$/.test(value);

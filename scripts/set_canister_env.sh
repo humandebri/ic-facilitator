@@ -10,6 +10,11 @@ readonly DEFAULT_FACILITATOR_MAX_SETTLEMENT_FEE_WEI="30000000000000000"
 readonly DEFAULT_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="60"
 readonly DEFAULT_SETTLE_MIN_CONFIRMATIONS="3"
 readonly DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS="86400"
+readonly DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS="900"
+readonly MIN_BATCH_WITHDRAW_DELAY_SECONDS="900"
+readonly MAX_BATCH_WITHDRAW_DELAY_SECONDS="2592000"
+readonly CANONICAL_BATCH_SETTLEMENT_CONTRACT="0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003"
+readonly UINT128_MAX="340282366920938463463374607431768211455"
 readonly ENV_FILE="${DOTENV_PATH:-$ROOT/.env}"
 
 load_dotenv() {
@@ -68,11 +73,50 @@ require_nonzero_evm_address() {
   fi
 }
 
+require_official_batch_settlement_contract() {
+  local value="$1"
+  local actual
+  local expected
+  actual="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  expected="$(printf '%s' "$CANONICAL_BATCH_SETTLEMENT_CONTRACT" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "BATCH_SETTLEMENT_CONTRACT must equal official @x402/evm BATCH_SETTLEMENT_ADDRESS $CANONICAL_BATCH_SETTLEMENT_CONTRACT" >&2
+    exit 1
+  fi
+}
+
 require_positive_integer() {
   local name="$1"
   local value="$2"
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "$name must be a positive integer" >&2
+    exit 1
+  fi
+}
+
+require_uint128_integer() {
+  local name="$1"
+  local value="$2"
+  require_positive_integer "$name" "$value"
+  if ! UINT_VALUE="$value" UINT_MAX="$UINT128_MAX" node <<'NODE'
+const value = BigInt(process.env.UINT_VALUE || "0");
+const max = BigInt(process.env.UINT_MAX || "0");
+process.exit(value <= max ? 0 : 1);
+NODE
+  then
+    echo "$name must fit uint128" >&2
+    exit 1
+  fi
+}
+
+require_integer_range() {
+  local name="$1"
+  local value="$2"
+  local min="$3"
+  local max="$4"
+  require_positive_integer "$name" "$value"
+  if (( value < min || value > max )); then
+    echo "$name must be between $min and $max" >&2
     exit 1
   fi
 }
@@ -86,15 +130,41 @@ require_private_key() {
   fi
 }
 
+private_key_address() {
+  local name="$1"
+  local value="$2"
+  PRIVATE_KEY_NAME="$name" PRIVATE_KEY_VALUE="$value" node --input-type=module <<'NODE'
+import { privateKeyToAccount } from "viem/accounts";
+
+try {
+  console.log(privateKeyToAccount(process.env.PRIVATE_KEY_VALUE).address.toLowerCase());
+} catch {
+  console.error(`${process.env.PRIVATE_KEY_NAME} must be a valid secp256k1 private key`);
+  process.exit(1);
+}
+NODE
+}
+
+require_batch_key_separation() {
+  local facilitator
+  local receiver_authorizer
+  facilitator="$(private_key_address FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY")"
+  receiver_authorizer="$(private_key_address BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY "$BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY")"
+  if [[ "$facilitator" == "$receiver_authorizer" ]]; then
+    echo "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY must not derive the FACILITATOR_EVM_PRIVATE_KEY address" >&2
+    exit 1
+  fi
+}
+
 require_single_https_rpc_url() {
   local name="$1"
   local value="$2"
   if [[ "$value" == *","* ]]; then
-    echo "$name must contain exactly one HTTPS RPC URL" >&2
+    echo "$name must contain exactly one HTTPS RPC origin" >&2
     exit 1
   fi
-  if [[ ! "$value" =~ ^https://[^[:space:]]+$ ]]; then
-    echo "$name must be an HTTPS RPC URL" >&2
+  if [[ ! "$value" =~ ^https://[^/:@?#[:space:]]+(:[0-9]+)?$ ]]; then
+    echo "$name must be a single https://host[:port] RPC origin" >&2
     exit 1
   fi
 }
@@ -104,6 +174,107 @@ require_https_origin() {
   local value="$2"
   if [[ ! "$value" =~ ^https://[^/:@?#[:space:]]+(:[0-9]+)?$ ]]; then
     echo "$name must be an HTTPS origin" >&2
+    exit 1
+  fi
+}
+
+require_ic_principal() {
+  local name="$1"
+  local value="$2"
+  if ! PRINCIPAL_VALUE="$value" node <<'NODE'
+const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+
+function group(compact) {
+  const groups = [];
+  for (let index = 0; index < compact.length; index += 5) {
+    groups.push(compact.slice(index, index + 5));
+  }
+  return groups.join("-");
+}
+
+function encode(bytes) {
+  let buffer = 0;
+  let bits = 0;
+  let compact = "";
+  for (const byte of bytes) {
+    buffer = (buffer << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      compact += alphabet.charAt((buffer >> bits) & 0x1f);
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  if (bits > 0) {
+    compact += alphabet.charAt((buffer << (5 - bits)) & 0x1f);
+  }
+  return group(compact);
+}
+
+function decode(value) {
+  if (value !== value.toLowerCase()) {
+    return undefined;
+  }
+  const compact = value.replaceAll("-", "");
+  if (compact.length === 0) {
+    return undefined;
+  }
+  let buffer = 0;
+  let bits = 0;
+  const bytes = [];
+  for (const char of compact) {
+    const index = alphabet.indexOf(char);
+    if (index < 0) {
+      return undefined;
+    }
+    buffer = (buffer << 5) | index;
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  if (bytes.length < 4 || encode(bytes) !== value) {
+    return undefined;
+  }
+  return bytes;
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function valid(value) {
+  const bytes = decode(value);
+  if (!bytes) {
+    return false;
+  }
+  const checksum = crc32(bytes.slice(4));
+  return (
+    bytes[0] === ((checksum >>> 24) & 0xff) &&
+    bytes[1] === ((checksum >>> 16) & 0xff) &&
+    bytes[2] === ((checksum >>> 8) & 0xff) &&
+    bytes[3] === (checksum & 0xff)
+  );
+}
+
+process.exit(valid(process.env.PRINCIPAL_VALUE || "") ? 0 : 1);
+NODE
+  then
+    echo "$name must be an IC principal" >&2
+    exit 1
+  fi
+  if [[ "$value" == "2vxsx-fae" || "$value" == "aaaaa-aa" ]]; then
+    echo "$name must be a non-system IC principal" >&2
     exit 1
   fi
 }
@@ -147,11 +318,24 @@ readonly RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI="${FACILITATOR_MAX_SETTLEME
 readonly RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="${SETTLE_CONFIRMATION_TIMEOUT_SECONDS:-$DEFAULT_SETTLE_CONFIRMATION_TIMEOUT_SECONDS}"
 readonly RESOLVED_SETTLE_MIN_CONFIRMATIONS="${SETTLE_MIN_CONFIRMATIONS:-$DEFAULT_SETTLE_MIN_CONFIRMATIONS}"
 readonly RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS="${SETTLEMENT_CACHE_TTL_SECONDS:-$DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS}"
+readonly RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS="${BATCH_WITHDRAW_DELAY_SECONDS:-$DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS}"
 require_positive_integer FACILITATOR_MAX_GAS "$RESOLVED_FACILITATOR_MAX_GAS"
 require_positive_integer FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI"
 require_positive_integer SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
 require_positive_integer SETTLE_MIN_CONFIRMATIONS "$RESOLVED_SETTLE_MIN_CONFIRMATIONS"
 require_positive_integer SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"
+if [[ -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
+  required_env BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL
+  required_env BATCH_SETTLEMENT_CONTRACT
+  required_env BATCH_SETTLEMENT_FEE_AMOUNT
+  require_ic_principal BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL "$BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
+  require_private_key BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY "$BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
+  require_batch_key_separation
+  require_nonzero_evm_address BATCH_SETTLEMENT_CONTRACT "$BATCH_SETTLEMENT_CONTRACT"
+  require_official_batch_settlement_contract "$BATCH_SETTLEMENT_CONTRACT"
+  require_integer_range BATCH_WITHDRAW_DELAY_SECONDS "$RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS" "$MIN_BATCH_WITHDRAW_DELAY_SECONDS" "$MAX_BATCH_WITHDRAW_DELAY_SECONDS"
+  require_uint128_integer BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT"
+fi
 
 set_env FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
 set_env JPYC_EIP712_VERSION "$JPYC_EIP712_VERSION"
@@ -165,3 +349,16 @@ set_env FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT
 set_env SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
 set_env SETTLE_MIN_CONFIRMATIONS "$RESOLVED_SETTLE_MIN_CONFIRMATIONS"
 set_env SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"
+if [[ -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
+  set_env BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL "$BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
+  set_env BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY "$BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
+  set_env BATCH_SETTLEMENT_CONTRACT "$BATCH_SETTLEMENT_CONTRACT"
+  set_env BATCH_WITHDRAW_DELAY_SECONDS "$RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS"
+  set_env BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT"
+else
+  set_env BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL ""
+  set_env BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY ""
+  set_env BATCH_SETTLEMENT_CONTRACT ""
+  set_env BATCH_WITHDRAW_DELAY_SECONDS ""
+  set_env BATCH_SETTLEMENT_FEE_AMOUNT ""
+fi

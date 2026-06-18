@@ -1,6 +1,8 @@
 // scripts/readiness.ts: canister facilitator 実決済までの未充足条件を秘密値なしで集約する。
 import { pathToFileURL } from "node:url";
 
+import { BATCH_SETTLEMENT_ADDRESS } from "@x402/evm";
+
 import { collectChecks } from "./doctor";
 import type { DoctorCheck, DoctorStatus } from "./doctor";
 import { checkWallet, requirePrivateKey } from "./jpyc_wallet";
@@ -8,12 +10,31 @@ import { checkCanisterEnvSmoke } from "./smoke_canister_env";
 import { checkCanisterSmoke } from "./smoke_canister";
 import { checkPaidNegativeSmoke } from "./smoke_canister_paid_negative";
 import { loadDotenv } from "./env_file";
-import { expectedTransferFromEnv, parseTxHash, verifySettlementReceipt } from "./settlement_receipt";
+import { expectedSettlementSenderFromEnv, expectedTransferFromEnv, parseTxHash, settlementMinConfirmationsFromEnv, verifySettlementReceipt } from "./settlement_receipt";
 import type { ReceiptReader } from "./settlement_receipt";
+import { checkBatchMainnetPreflight } from "./batch_mainnet_preflight";
+import type { BatchMainnetPreflightReader } from "./batch_mainnet_preflight";
+import { batchSettlementReceiptOptionsFromEnv, verifyBatchSettlementReceipt } from "./batch_settlement_receipt";
+import type { BatchSettlementReceiptReader } from "./batch_settlement_receipt";
 
-type StageName = "buyer" | "canister" | "canister-env" | "canister-http" | "paid-negative-http" | "settlement-receipt" | "wallet";
+type StageName = "batch-mainnet-preflight" | "batch-settlement-receipt" | "buyer" | "canister" | "canister-env" | "canister-http" | "paid-negative-http" | "settlement-receipt" | "wallet";
 const DEPLOY_ONLY_FAILURES = ["disk-space", "node_modules", "rust-target"];
 const DEFAULT_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
+const BATCH_RECEIPT_ENV_NEXT_COMMANDS: Readonly<Record<string, string>> = {
+  BATCH_CHANNEL_ID: "set BATCH_CHANNEL_ID to the batch channel id",
+  BATCH_DEPOSIT_AMOUNT: "set BATCH_DEPOSIT_AMOUNT to the deposited amount",
+  BATCH_EXPECTED_MIN_BALANCE: "set BATCH_EXPECTED_MIN_BALANCE to the expected post-deposit channel balance",
+  BATCH_EXPECTED_MIN_REFUND_NONCE: "set BATCH_EXPECTED_MIN_REFUND_NONCE to the expected post-refund nonce floor",
+  BATCH_EXPECTED_TOTAL_CLAIMED: "set BATCH_EXPECTED_TOTAL_CLAIMED to the expected post-claim totalClaimed",
+  BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: "set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key",
+  BATCH_SETTLE_AMOUNT: "set BATCH_SETTLE_AMOUNT to the positive settled amount from the settle event",
+  BATCH_SETTLE_RECEIVER: "set BATCH_SETTLE_RECEIVER to the expected batch receiver address",
+  BATCH_SETTLEMENT_ACTION: "set BATCH_SETTLEMENT_ACTION to deposit, claim, settle, or refund",
+  BATCH_SETTLEMENT_CONTRACT: `set BATCH_SETTLEMENT_CONTRACT=${BATCH_SETTLEMENT_ADDRESS}`,
+  BATCH_SETTLEMENT_TX: "set BATCH_SETTLEMENT_TX to the batch settlement transaction hash",
+  BATCH_WITHDRAW_DELAY_SECONDS: "set BATCH_WITHDRAW_DELAY_SECONDS to the deployed batch withdraw delay in seconds",
+  FACILITATOR_EVM_PRIVATE_KEY: "set FACILITATOR_EVM_PRIVATE_KEY to the facilitator settlement private key"
+};
 
 export type ReadinessStage = {
   readonly failures: readonly string[];
@@ -30,8 +51,12 @@ export type ReadinessReport = {
 };
 
 export type ReadinessOptions = {
+  readonly batchPreflightReader?: BatchMainnetPreflightReader;
+  readonly batchSettlementReceiptReader?: BatchSettlementReceiptReader;
   readonly canisterEnvNamesOutput?: string;
   readonly fetchFn?: typeof fetch;
+  readonly includeBatchMainnetPreflight?: boolean;
+  readonly includeBatchSettlementReceipt?: boolean;
   readonly includeCanisterEnvSmoke?: boolean;
   readonly includeCanisterSmoke?: boolean;
   readonly includePaidNegativeSmoke?: boolean;
@@ -89,6 +114,7 @@ function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv)
   const commands: string[] = [];
   const settlementFailures = stages.filter((item) => item.name === "settlement-receipt" && item.status === "fail").flatMap((item) => item.failures);
   const canPay = stages.filter((item) => item.name !== "settlement-receipt").every((item) => item.status === "ok");
+  const batchMode = wantsBatchReadiness(stages, env);
 
   if (stages.some((item) => item.name === "canister" && item.status === "fail")) {
     commands.push("npm run doctor -- --mode=canister");
@@ -104,13 +130,27 @@ function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv)
     commands.push("npm run doctor -- --mode=buyer");
   }
   if (stages.some((item) => item.name === "canister-env" && item.status === "fail")) {
-    commands.push("npm run smoke:canister:env");
+    commands.push(batchMode ? "npm run smoke:canister:env -- --with-batch" : "npm run smoke:canister:env");
   }
   if (stages.some((item) => item.name === "canister-http" && item.status === "fail")) {
-    commands.push("npm run smoke:canister");
+    commands.push(batchMode ? "npm run smoke:canister -- --with-batch" : "npm run smoke:canister");
   }
   if (stages.some((item) => item.name === "paid-negative-http" && item.status === "fail")) {
     commands.push("npm run smoke:canister:paid-negative");
+  }
+  for (const item of stages) {
+    if (item.name !== "batch-mainnet-preflight" || item.status !== "fail") {
+      continue;
+    }
+    for (const failure of item.failures) {
+      for (const command of batchPreflightNextCommands(failure)) {
+        commands.push(command);
+      }
+    }
+  }
+  if (stages.some((item) => item.name === "batch-settlement-receipt" && item.status === "fail")) {
+    commands.push(...batchReceiptEnvNextCommands(stages));
+    commands.push("npm run receipt:batch");
   }
   if (stages.some((item) => item.name === "wallet" && item.status === "fail")) {
     commands.push("complete buyer JPYC balance, then run npm run wallet:jpyc");
@@ -135,6 +175,9 @@ function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv)
     if (!stages.some((item) => item.name === "paid-negative-http")) {
       commands.push("npm run readiness:jpyc -- --with-paid-negative-smoke");
     }
+    if (env.BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY && !stages.some((item) => item.name === "batch-mainnet-preflight")) {
+      commands.push("npm run readiness:jpyc -- --with-batch-mainnet-preflight");
+    }
     commands.push("npm run wallet:jpyc", "npm run pay:jpyc");
     if (!stages.some((item) => item.name === "settlement-receipt")) {
       commands.push("npm run readiness:jpyc -- --with-settlement-receipt");
@@ -143,12 +186,62 @@ function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv)
   return commands;
 }
 
+function batchReceiptEnvNextCommands(stages: readonly ReadinessStage[]): readonly string[] {
+  const commands: string[] = [];
+  for (const item of stages) {
+    if (item.name !== "batch-settlement-receipt" || item.status !== "fail") {
+      continue;
+    }
+    for (const failure of item.failures) {
+      const match = /^batch-settlement-receipt:missing required env: ([A-Z0-9_]+)$/.exec(failure);
+      const envName = match?.[1];
+      const command = envName === undefined ? undefined : BATCH_RECEIPT_ENV_NEXT_COMMANDS[envName];
+      if (command !== undefined) {
+        commands.push(command);
+      }
+    }
+  }
+  return Array.from(new Set(commands));
+}
+
+function batchPreflightNextCommands(failure: string): readonly string[] {
+  const name = failure.split(":", 2).join(":");
+  switch (name) {
+    case "env:POLYGON_RPC_URL":
+      return ["set POLYGON_RPC_URL to a Polygon HTTPS RPC URL"];
+    case "env:JPYC_POLYGON_ADDRESS":
+      return ["unset JPYC_POLYGON_ADDRESS or set it to the fixed JPYC Polygon address"];
+    case "env:JPYC_EIP712_VERSION":
+      return ["set JPYC_EIP712_VERSION=1"];
+    case "env:BATCH_SETTLEMENT_CONTRACT":
+      return [`set BATCH_SETTLEMENT_CONTRACT=${BATCH_SETTLEMENT_ADDRESS}`];
+    case "env:BATCH_WITHDRAW_DELAY_SECONDS":
+      return ["set BATCH_WITHDRAW_DELAY_SECONDS to the deployed batch withdraw delay in seconds"];
+    case "env:BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY":
+      return ["set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key"];
+    case "env:BATCH_SETTLEMENT_FEE_AMOUNT":
+      return ["set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
+    case "env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL":
+      return ["set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to the resource server actor principal"];
+    default:
+      return ["npm run preflight:batch"];
+  }
+}
+
 function readyForPreflight(stages: readonly ReadinessStage[]): boolean {
   return stages.filter((item) => item.name !== "settlement-receipt").every((item) => item.status === "ok");
 }
 
 function realSettlementVerified(stages: readonly ReadinessStage[]): boolean {
   return stages.some((item) => item.name === "settlement-receipt" && item.status === "ok");
+}
+
+function hasBatchStage(stages: readonly ReadinessStage[]): boolean {
+  return stages.some((item) => item.name === "batch-mainnet-preflight" || item.name === "batch-settlement-receipt");
+}
+
+function wantsBatchReadiness(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv): boolean {
+  return hasBatchStage(stages) || Boolean(env.BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY || env.BATCH_SETTLEMENT_CONTRACT);
 }
 
 export function buildReadinessReport(cwd: string, env: NodeJS.ProcessEnv): ReadinessReport {
@@ -181,8 +274,10 @@ async function settlementReceiptStage(env: NodeJS.ProcessEnv, reader?: ReceiptRe
       hash: parseTxHash(tx),
       ...(env.POLYGON_RPC_URL ? { rpcUrl: env.POLYGON_RPC_URL } : {}),
       ...(reader ? { reader } : {}),
+      expectedFrom: expectedSettlementSenderFromEnv(env),
       expectedTo: env.JPYC_POLYGON_ADDRESS ?? DEFAULT_JPYC_POLYGON_ADDRESS,
-      expectedTransfer: expectedTransferFromEnv(env)
+      expectedTransfer: expectedTransferFromEnv(env),
+      minConfirmations: settlementMinConfirmationsFromEnv(env)
     });
     return { failures: [], name: "settlement-receipt", status: "ok", warnings: [] };
   } catch (error: unknown) {
@@ -199,6 +294,30 @@ async function walletStage(walletCheck?: () => Promise<void>): Promise<Readiness
   }
 }
 
+async function batchMainnetPreflightStage(env: NodeJS.ProcessEnv, reader?: BatchMainnetPreflightReader): Promise<ReadinessStage> {
+  try {
+    const report = await checkBatchMainnetPreflight({ env, ...(reader ? { reader } : {}) });
+    const failures = report.checks
+      .filter((check) => check.status === "fail")
+      .map((check) => `${check.name}:${check.detail}`);
+    return { failures, name: "batch-mainnet-preflight", status: failures.length > 0 ? "fail" : "ok", warnings: [] };
+  } catch (error: unknown) {
+    return failureStage("batch-mainnet-preflight", error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function batchSettlementReceiptStage(env: NodeJS.ProcessEnv, reader?: BatchSettlementReceiptReader): Promise<ReadinessStage> {
+  try {
+    await verifyBatchSettlementReceipt({
+      ...batchSettlementReceiptOptionsFromEnv(env),
+      ...(reader ? { reader } : {})
+    });
+    return { failures: [], name: "batch-settlement-receipt", status: "ok", warnings: [] };
+  } catch (error: unknown) {
+    return failureStage("batch-settlement-receipt", error instanceof Error ? error.message : String(error));
+  }
+}
+
 export async function buildReadinessReportWithSmoke(
   cwd: string,
   env: NodeJS.ProcessEnv,
@@ -206,9 +325,10 @@ export async function buildReadinessReportWithSmoke(
 ): Promise<ReadinessReport> {
   const base = buildReadinessReport(cwd, env);
   let stages = [...base.stages];
+  const requireBatchSmoke = Boolean(options.includeBatchMainnetPreflight || options.includeBatchSettlementReceipt);
   if (options.includeCanisterEnvSmoke) {
     try {
-      checkCanisterEnvSmoke(env, options.canisterEnvNamesOutput);
+      checkCanisterEnvSmoke(env, options.canisterEnvNamesOutput, { requireBatch: requireBatchSmoke });
       stages = [...stages, { failures: [], name: "canister-env", status: "ok", warnings: [] }];
     } catch (error: unknown) {
       stages = [...stages, failureStage("canister-env", error instanceof Error ? error.message : String(error))];
@@ -216,7 +336,11 @@ export async function buildReadinessReportWithSmoke(
   }
   if (options.includeCanisterSmoke) {
     try {
-      await checkCanisterSmoke(options.fetchFn ? { allowMissingSeller: true, env, fetchFn: options.fetchFn } : { allowMissingSeller: true, env });
+      await checkCanisterSmoke(
+        options.fetchFn
+          ? { allowMissingSeller: true, env, fetchFn: options.fetchFn, requireBatch: requireBatchSmoke }
+          : { allowMissingSeller: true, env, requireBatch: requireBatchSmoke }
+      );
       stages = [...stages, { failures: [], name: "canister-http", status: "ok", warnings: [] }];
     } catch (error: unknown) {
       stages = [...stages, failureStage("canister-http", error instanceof Error ? error.message : String(error))];
@@ -236,6 +360,12 @@ export async function buildReadinessReportWithSmoke(
   if (options.includeSettlementReceipt) {
     stages = [...stages, await settlementReceiptStage(env, options.receiptReader)];
   }
+  if (options.includeBatchMainnetPreflight) {
+    stages = [...stages, await batchMainnetPreflightStage(env, options.batchPreflightReader)];
+  }
+  if (options.includeBatchSettlementReceipt) {
+    stages = [...stages, await batchSettlementReceiptStage(env, options.batchSettlementReceiptReader)];
+  }
   stages = [...softenDeployOnlyCanisterFailures(stages)];
   return {
     nextCommands: nextCommands(stages, env),
@@ -254,6 +384,8 @@ if (isDirectRun()) {
   loadDotenv();
   const requireSettlementReceipt = process.argv.includes("--with-settlement-receipt");
   buildReadinessReportWithSmoke(process.cwd(), process.env, {
+    includeBatchMainnetPreflight: process.argv.includes("--with-batch-mainnet-preflight"),
+    includeBatchSettlementReceipt: process.argv.includes("--with-batch-settlement-receipt"),
     includeCanisterEnvSmoke: process.argv.includes("--with-canister-env-smoke"),
     includeCanisterSmoke: process.argv.includes("--with-canister-smoke"),
     includePaidNegativeSmoke: process.argv.includes("--with-paid-negative-smoke"),

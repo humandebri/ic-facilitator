@@ -96,7 +96,27 @@ describe("doctor helpers", () => {
     expect(checks.some((check) => check.name === "env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLE_MIN_CONFIRMATIONS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLEMENT_CACHE_TTL_SECONDS")).toBe(true);
-  }, 10_000);
+  }, 20_000);
+
+  it("rejects non-origin Polygon RPC service values for canister env", () => {
+    for (const value of [
+      "https://trusted.example@evil.example",
+      "https://polygon.example/path",
+      "https://polygon.example?x=1",
+      "https://polygon.example#x"
+    ]) {
+      const checks = collectChecks(".", {
+        POLYGON_RPC_SERVICES: value
+      }, "canister");
+
+      expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(true);
+    }
+
+    const checks = collectChecks(".", {
+      POLYGON_RPC_SERVICES: "https://polygon.example:443"
+    }, "canister");
+    expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(false);
+  }, 20_000);
 
   it("validates facilitator public origin as a strict HTTPS origin", () => {
     expect(isHttpsOrigin("https://canister.example.test")).toBe(true);

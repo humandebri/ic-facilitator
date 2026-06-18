@@ -73,6 +73,7 @@ pub fn failed_settlement(
         error_reason: Some(reason.to_string()),
         error_message: Some(message.to_string()),
         extra: None,
+        extra_json: None,
     }
 }
 
@@ -86,6 +87,7 @@ pub fn successful_settlement(tx: String, payer: String, amount: String) -> Settl
         error_reason: None,
         error_message: None,
         extra: None,
+        extra_json: None,
     }
 }
 

@@ -1,6 +1,7 @@
 // rust/facilitator/src/types.rs: x402 facilitator HTTP JSON と IC HTTP gateway 型を定義する。
 use candid::{CandidType, Deserialize as CandidDeserialize};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -64,7 +65,7 @@ pub struct FacilitatorRequest {
     pub payment_requirements: PaymentRequirements,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentRequiredResponse {
     pub x402_version: u64,
@@ -73,8 +74,7 @@ pub struct PaymentRequiredResponse {
     pub accepts: Vec<PaymentRequirements>,
 }
 
-#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
 pub struct SettleResponse {
     pub success: bool,
     pub transaction: String,
@@ -89,6 +89,107 @@ pub struct SettleResponse {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra: Option<BTreeMap<String, String>>,
+    pub extra_json: Option<String>,
+}
+
+impl Serialize for SettleResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut len = 3;
+        len += usize::from(self.payer.is_some());
+        len += usize::from(self.amount.is_some());
+        len += usize::from(self.error_reason.is_some());
+        len += usize::from(self.error_message.is_some());
+        len += usize::from(self.extra.is_some() || self.extra_json.is_some());
+        let mut out = serializer.serialize_struct("SettleResponse", len)?;
+        out.serialize_field("success", &self.success)?;
+        out.serialize_field("transaction", &self.transaction)?;
+        out.serialize_field("network", &self.network)?;
+        if let Some(payer) = &self.payer {
+            out.serialize_field("payer", payer)?;
+        }
+        if let Some(amount) = &self.amount {
+            out.serialize_field("amount", amount)?;
+        }
+        if let Some(error_reason) = &self.error_reason {
+            out.serialize_field("errorReason", error_reason)?;
+        }
+        if let Some(error_message) = &self.error_message {
+            out.serialize_field("errorMessage", error_message)?;
+        }
+        if self.extra.is_some() || self.extra_json.is_some() {
+            out.serialize_field("extra", &self.extra_value())?;
+        }
+        out.end()
+    }
+}
+
+impl SettleResponse {
+    fn extra_value(&self) -> Value {
+        let mut value = self
+            .extra_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Value::Object(object) = &mut value {
+            if let Some(extra) = &self.extra {
+                for (key, item) in extra {
+                    object.insert(key.clone(), Value::String(item.clone()));
+                }
+            }
+        }
+        value
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleResponseExtra {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_state: Option<SettleChannelStateExtra>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voucher_state: Option<SettleVoucherStateExtra>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleChannelStateExtra {
+    pub channel_id: String,
+    pub balance: String,
+    pub total_claimed: String,
+    pub withdraw_requested_at: u64,
+    pub refund_nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_cumulative_amount: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleVoucherStateExtra {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_max_claimable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyResponse {
+    pub is_valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -152,5 +253,44 @@ pub fn text_response(status_code: u16, text: &str) -> HttpResponse {
         ],
         body: text.as_bytes().to_vec(),
         upgrade: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settle_response_merges_legacy_extra_and_nested_batch_extra() {
+        let mut legacy = BTreeMap::new();
+        legacy.insert("settlementKey".to_string(), "0xabc".to_string());
+        let response = SettleResponse {
+            success: true,
+            transaction: "0xtx".to_string(),
+            network: "eip155:137".to_string(),
+            payer: Some("0xpayer".to_string()),
+            amount: Some("100".to_string()),
+            error_reason: None,
+            error_message: None,
+            extra: Some(legacy),
+            extra_json: Some(
+                serde_json::json!({
+                    "chargedAmount": "7",
+                    "channelState": {
+                        "channelId": "0xchannel",
+                        "balance": "1000",
+                        "totalClaimed": "300",
+                        "withdrawRequestedAt": 0,
+                        "refundNonce": "2"
+                    }
+                })
+                .to_string(),
+            ),
+        };
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["extra"]["settlementKey"], "0xabc");
+        assert_eq!(value["extra"]["chargedAmount"], "7");
+        assert_eq!(value["extra"]["channelState"]["balance"], "1000");
     }
 }
