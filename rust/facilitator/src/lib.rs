@@ -377,12 +377,16 @@ fn get_active_settlement(from: &str) -> Option<ActiveSettlement> {
     })
 }
 
-fn put_batch_channel(channel_id: &str, channel: BatchChannel) {
+fn put_batch_channel(channel_id: &str, channel: BatchChannel) -> Result<(), String> {
     BATCH_CHANNELS.with(|items| {
-        items
-            .borrow_mut()
-            .insert(channel_id.to_ascii_lowercase(), encode_stable(&channel));
-    });
+        let mut items = items.borrow_mut();
+        let key = channel_id.to_ascii_lowercase();
+        if !items.contains_key(&key) && items.len() >= MAX_BATCH_CHANNELS_STORED {
+            return Err("batch channel storage limit reached".to_string());
+        }
+        items.insert(key, encode_stable(&channel));
+        Ok(())
+    })
 }
 
 fn get_batch_channel(channel_id: &str) -> Option<BatchChannel> {
@@ -578,7 +582,7 @@ fn migrate_legacy_state(state: StableState) {
         put_nonce_state(&key, nonce);
     }
     for (key, channel) in state.batch_channels.unwrap_or_default() {
-        put_batch_channel(&key, channel);
+        put_batch_channel(&key, channel).expect("legacy batch channel storage exceeds limit");
     }
     for (key, deleted) in state.batch_deleted_channels.unwrap_or_default() {
         put_batch_deleted_channel(&key, deleted);
@@ -638,52 +642,7 @@ fn supported_response() -> HttpResponse {
         }
     };
     let mut response = supported(facilitator_address(), &version);
-    let receiver_authorizer = match optional_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY") {
-        Some(_) => match batch_receiver_authorizer_address() {
-            Ok(value) => Some(value),
-            Err(message) => {
-                return json_response(
-                    500,
-                    &serde_json::json!({ "error": "invalid_config", "message": message }),
-                )
-            }
-        },
-        None => None,
-    };
-    if let Some(receiver_authorizer) = receiver_authorizer {
-        let withdraw_delay = match batch_withdraw_delay_seconds() {
-            Ok(value) => value,
-            Err(message) => {
-                return json_response(
-                    500,
-                    &serde_json::json!({ "error": "invalid_config", "message": message }),
-                )
-            }
-        };
-        if let Err(message) = configured_batch_settlement_contract() {
-            return json_response(
-                500,
-                &serde_json::json!({ "error": "invalid_config", "message": message }),
-            );
-        }
-        if let Err(message) = required_positive_u128("BATCH_SETTLEMENT_FEE_AMOUNT") {
-            return json_response(
-                500,
-                &serde_json::json!({ "error": "invalid_config", "message": message }),
-            );
-        }
-        if let Err(message) = required_batch_channel_storage_writer_principal() {
-            return json_response(
-                500,
-                &serde_json::json!({ "error": "invalid_config", "message": message }),
-            );
-        }
-        if let Err(message) = validate_batch_key_separation(&receiver_authorizer) {
-            return json_response(
-                500,
-                &serde_json::json!({ "error": "invalid_config", "message": message }),
-            );
-        }
+    if let Some((receiver_authorizer, withdraw_delay)) = supported_batch_config() {
         response.kinds.push(SupportedKind {
             x402_version: 2,
             scheme: BATCH_SCHEME.to_string(),
@@ -703,6 +662,17 @@ fn supported_response() -> HttpResponse {
             .push(facilitator_address());
     }
     json_response(200, &response)
+}
+
+fn supported_batch_config() -> Option<(String, u64)> {
+    optional_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY")?;
+    let receiver_authorizer = batch_receiver_authorizer_address().ok()?;
+    let withdraw_delay = batch_withdraw_delay_seconds().ok()?;
+    configured_batch_settlement_contract().ok()?;
+    required_positive_u128("BATCH_SETTLEMENT_FEE_AMOUNT").ok()?;
+    required_batch_channel_storage_writer_principal().ok()?;
+    validate_batch_key_separation(&receiver_authorizer).ok()?;
+    Some((receiver_authorizer, withdraw_delay))
 }
 
 fn batch_withdraw_delay_seconds() -> Result<u64, String> {
@@ -781,18 +751,23 @@ async fn verify_http(request: HttpRequest) -> HttpResponse {
         Ok(value) => value,
         Err(message) => return json_response(500, &verify_error("invalid_config", &message, None)),
     };
-    if let Err(message) = validate_batch_eip712_version(&body, &expected_version) {
-        return json_response(
-            402,
-            &verify_error("invalid_batch_settlement", &message, None),
-        );
-    }
     let payload = match batch_payload(&body.payment_payload.payload) {
         Ok(payload) => payload,
         Err(message) => {
             return json_response(400, &verify_error("invalid_request", &message, None));
         }
     };
+    let version_check = if requires_batch_eip712_version(&payload) {
+        validate_batch_eip712_version(&body, &expected_version)
+    } else {
+        validate_optional_batch_eip712_version(&body, &expected_version)
+    };
+    if let Err(message) = version_check {
+        return json_response(
+            402,
+            &verify_error("invalid_batch_settlement", &message, None),
+        );
+    }
     let channel_id = match voucher_channel_id(&payload) {
         Ok(channel_id) => channel_id,
         Err(message) => {
@@ -3493,14 +3468,6 @@ fn batch_update_channel(
     }
     match update.channel {
         Some(mut channel) => {
-            if current.is_none() && batch_channel_count() >= MAX_BATCH_CHANNELS_STORED {
-                return BatchChannelUpdateResult {
-                    status: "invalid".to_string(),
-                    channel: current,
-                    current_revision,
-                    message: Some("batch channel storage limit reached".to_string()),
-                };
-            }
             let contract = match configured_batch_settlement_contract() {
                 Ok(contract) => contract,
                 Err(message) => {
@@ -3530,7 +3497,14 @@ fn batch_update_channel(
             }
             channel.channel_id = key.clone();
             channel.revision = current_revision.unwrap_or(0).saturating_add(1);
-            put_batch_channel(&key, channel.clone());
+            if let Err(message) = put_batch_channel(&key, channel.clone()) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
             BatchChannelUpdateResult {
                 status: "updated".to_string(),
                 channel: Some(channel.clone()),
@@ -4781,6 +4755,35 @@ mod hardening_tests {
         }
     }
 
+    fn test_initial_batch_channel(channel_id: &str, signed_max_claimable: &str) -> BatchChannel {
+        test_initial_batch_channel_for_config(
+            channel_id,
+            test_batch_channel_config(),
+            signed_max_claimable,
+        )
+    }
+
+    fn test_initial_batch_channel_for_config(
+        channel_id: &str,
+        channel_config: crate::batch::BatchChannelConfig,
+        signed_max_claimable: &str,
+    ) -> BatchChannel {
+        let mut channel = test_batch_channel_for_config(channel_id, channel_config, "0");
+        channel.signed_max_claimable = signed_max_claimable.to_string();
+        channel.signature = crate::batch::sign_batch_voucher_for_test(
+            channel_id,
+            signed_max_claimable,
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        channel.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: format!("request-{signed_max_claimable}"),
+            signed_max_claimable: signed_max_claimable.to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        channel
+    }
+
     fn test_batch_channel_config() -> crate::batch::BatchChannelConfig {
         crate::batch::BatchChannelConfig {
             payer: PAYER.to_string(),
@@ -5380,7 +5383,7 @@ mod hardening_tests {
         channel.balance = "100000".to_string();
         channel.total_claimed = "500".to_string();
         channel.refund_nonce = "1".to_string();
-        put_batch_channel(&channel_id, channel.clone());
+        put_batch_channel(&channel_id, channel.clone()).unwrap();
         let before = get_batch_channel(&channel_id);
         assert_eq!(batch_channel_count(), 1);
 
@@ -5446,7 +5449,7 @@ mod hardening_tests {
 
         let mut channel = test_batch_channel(&channel_id, "0");
         channel.balance = "100".to_string();
-        put_batch_channel(&channel_id, channel.clone());
+        put_batch_channel(&channel_id, channel.clone()).unwrap();
 
         let unreserved_response = run_ready(verify_http(HttpRequest {
             method: "POST".to_string(),
@@ -5468,7 +5471,7 @@ mod hardening_tests {
             signed_max_claimable: "25".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
         });
-        put_batch_channel(&channel_id, expired);
+        put_batch_channel(&channel_id, expired).unwrap();
         let expired_response = run_ready(verify_http(HttpRequest {
             method: "POST".to_string(),
             url: "/verify".to_string(),
@@ -5488,7 +5491,7 @@ mod hardening_tests {
             signed_max_claimable: "26".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
         });
-        put_batch_channel(&channel_id, channel.clone());
+        put_batch_channel(&channel_id, channel.clone()).unwrap();
         let mismatch_response = run_ready(verify_http(HttpRequest {
             method: "POST".to_string(),
             url: "/verify".to_string(),
@@ -5508,7 +5511,7 @@ mod hardening_tests {
             signed_max_claimable: "25".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
         });
-        put_batch_channel(&channel_id, channel);
+        put_batch_channel(&channel_id, channel).unwrap();
 
         let response = run_ready(verify_http(HttpRequest {
             method: "POST".to_string(),
@@ -5571,7 +5574,7 @@ mod hardening_tests {
     }
 
     #[test]
-    fn supported_rejects_batch_withdraw_delay_outside_official_range() {
+    fn supported_omits_batch_for_invalid_partial_batch_config() {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
@@ -5581,17 +5584,19 @@ mod hardening_tests {
 
         let response = supported_response();
         let value: Value = serde_json::from_slice(&response.body).unwrap();
+        let kinds = value["kinds"].as_array().unwrap();
 
-        assert_eq!(response.status_code, 500);
-        assert_eq!(value["error"], "invalid_config");
-        assert_eq!(
-            value["message"],
-            "batch withdrawDelay must be between 900 and 2592000 seconds"
-        );
+        assert_eq!(response.status_code, 200);
+        assert!(kinds
+            .iter()
+            .any(|kind| kind["scheme"] == "exact" && kind["network"] == NETWORK));
+        assert!(!kinds
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
     }
 
     #[test]
-    fn supported_requires_full_batch_settlement_config_before_advertising() {
+    fn supported_requires_full_batch_settlement_config_before_advertising_batch() {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
@@ -5600,42 +5605,43 @@ mod hardening_tests {
 
         let missing_contract = supported_response();
         let missing_contract_value: Value = serde_json::from_slice(&missing_contract.body).unwrap();
-        assert_eq!(missing_contract.status_code, 500);
-        assert_eq!(missing_contract_value["error"], "invalid_config");
-        assert_eq!(
-            missing_contract_value["message"],
-            "missing required env: BATCH_SETTLEMENT_CONTRACT"
-        );
+        assert_eq!(missing_contract.status_code, 200);
+        assert!(!missing_contract_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
 
         set_default_batch_contract();
         let missing_fee = supported_response();
         let missing_fee_value: Value = serde_json::from_slice(&missing_fee.body).unwrap();
-        assert_eq!(missing_fee.status_code, 500);
-        assert_eq!(missing_fee_value["error"], "invalid_config");
-        assert_eq!(
-            missing_fee_value["message"],
-            "missing required env: BATCH_SETTLEMENT_FEE_AMOUNT"
-        );
+        assert_eq!(missing_fee.status_code, 200);
+        assert!(!missing_fee_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
 
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "0");
         let invalid_fee = supported_response();
         let invalid_fee_value: Value = serde_json::from_slice(&invalid_fee.body).unwrap();
-        assert_eq!(invalid_fee.status_code, 500);
-        assert_eq!(
-            invalid_fee_value["message"],
-            "BATCH_SETTLEMENT_FEE_AMOUNT must be a positive integer"
-        );
+        assert_eq!(invalid_fee.status_code, 200);
+        assert!(!invalid_fee_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
 
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("BATCH_SETTLEMENT_CONTRACT", "not an address");
         let invalid_contract = supported_response();
         let invalid_contract_value: Value = serde_json::from_slice(&invalid_contract.body).unwrap();
-        assert_eq!(invalid_contract.status_code, 500);
-        assert_eq!(invalid_contract_value["error"], "invalid_config");
-        assert_eq!(
-            invalid_contract_value["message"],
-            "BATCH_SETTLEMENT_CONTRACT: invalid hex"
-        );
+        assert_eq!(invalid_contract.status_code, 200);
+        assert!(!invalid_contract_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
 
         set_env_value(
             "BATCH_SETTLEMENT_CONTRACT",
@@ -5643,35 +5649,32 @@ mod hardening_tests {
         );
         let wrong_contract = supported_response();
         let wrong_contract_value: Value = serde_json::from_slice(&wrong_contract.body).unwrap();
-        assert_eq!(wrong_contract.status_code, 500);
-        assert_eq!(wrong_contract_value["error"], "invalid_config");
-        assert_eq!(
-            wrong_contract_value["message"],
-            format!(
-                "BATCH_SETTLEMENT_CONTRACT must equal official @x402/evm BATCH_SETTLEMENT_ADDRESS {}",
-                DEFAULT_BATCH_SETTLEMENT_CONTRACT
-            )
-        );
+        assert_eq!(wrong_contract.status_code, 200);
+        assert!(!wrong_contract_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
 
         set_default_batch_contract();
         let missing_writer = supported_response();
         let missing_writer_value: Value = serde_json::from_slice(&missing_writer.body).unwrap();
-        assert_eq!(missing_writer.status_code, 500);
-        assert_eq!(missing_writer_value["error"], "invalid_config");
-        assert_eq!(
-            missing_writer_value["message"],
-            "missing required env: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
-        );
+        assert_eq!(missing_writer.status_code, 200);
+        assert!(!missing_writer_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
 
         set_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "2vxsx-fae");
         let invalid_writer = supported_response();
         let invalid_writer_value: Value = serde_json::from_slice(&invalid_writer.body).unwrap();
-        assert_eq!(invalid_writer.status_code, 500);
-        assert_eq!(invalid_writer_value["error"], "invalid_config");
-        assert_eq!(
-            invalid_writer_value["message"],
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal"
-        );
+        assert_eq!(invalid_writer.status_code, 200);
+        assert!(!invalid_writer_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
     }
 
     #[test]
@@ -5727,7 +5730,7 @@ mod hardening_tests {
     }
 
     #[test]
-    fn supported_rejects_invalid_batch_receiver_authorizer_key() {
+    fn supported_omits_batch_for_invalid_batch_receiver_authorizer_key() {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
@@ -5736,13 +5739,16 @@ mod hardening_tests {
         let response = supported_response();
         let value: Value = serde_json::from_slice(&response.body).unwrap();
 
-        assert_eq!(response.status_code, 500);
-        assert_eq!(value["error"], "invalid_config");
-        assert!(value["message"].as_str().unwrap().contains("hex"));
+        assert_eq!(response.status_code, 200);
+        assert!(!value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
     }
 
     #[test]
-    fn supported_rejects_batch_receiver_authorizer_key_matching_facilitator_key() {
+    fn supported_omits_batch_when_receiver_authorizer_key_matches_facilitator_key() {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_full_batch_config();
@@ -5751,12 +5757,12 @@ mod hardening_tests {
         let response = supported_response();
         let value: Value = serde_json::from_slice(&response.body).unwrap();
 
-        assert_eq!(response.status_code, 500);
-        assert_eq!(value["error"], "invalid_config");
-        assert_eq!(
-            value["message"],
-            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY must not derive the FACILITATOR_EVM_PRIVATE_KEY address"
-        );
+        assert_eq!(response.status_code, 200);
+        assert!(!value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
     }
 
     #[test]
@@ -5794,7 +5800,7 @@ mod hardening_tests {
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
         )
         .unwrap();
-        put_batch_channel(&channel_id, test_batch_channel(&channel_id, "100"));
+        put_batch_channel(&channel_id, test_batch_channel(&channel_id, "100")).unwrap();
         assert!(!stable_structures_empty());
     }
 
@@ -5967,6 +5973,42 @@ mod hardening_tests {
     }
 
     #[test]
+    fn batch_verify_allows_minimal_operation_requirements_before_kind_validation() {
+        clear_batch_channels();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+
+        let claim = with_minimal_batch_operation_requirements(batch_claim_json("100", "75"));
+        let claim_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&claim).unwrap(),
+            certificate_version: None,
+        }));
+        let claim_value: Value = serde_json::from_slice(&claim_response.body).unwrap();
+        assert_ne!(
+            claim_value["invalidMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+
+        let settle = with_minimal_batch_operation_requirements(batch_settle_json());
+        let settle_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&settle).unwrap(),
+            certificate_version: None,
+        }));
+        let settle_value: Value = serde_json::from_slice(&settle_response.body).unwrap();
+        assert_ne!(
+            settle_value["invalidMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+    }
+
+    #[test]
     fn batch_settle_accepts_official_manager_minimal_claim_and_settle_requirements() {
         clear_settlement_state();
         clear_seller_credits();
@@ -6054,19 +6096,7 @@ mod hardening_tests {
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
         )
         .unwrap();
-        let mut channel = test_batch_channel(&channel_id, "100");
-        channel.signed_max_claimable = "200".to_string();
-        channel.signature = crate::batch::sign_batch_voucher_for_test(
-            &channel_id,
-            "200",
-            PAYER_PRIVATE_KEY,
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        );
-        channel.pending_request = Some(crate::batch::BatchPendingRequest {
-            pending_id: "request-200".to_string(),
-            signed_max_claimable: "200".to_string(),
-            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
-        });
+        let channel = test_initial_batch_channel(&channel_id, "200");
 
         let missing_pending = batch_update_channel(
             channel_id.clone(),
@@ -6135,6 +6165,49 @@ mod hardening_tests {
                     .to_string()
             )
         );
+
+        let initial_invariant_cases: [(&str, fn(&mut BatchChannel)); 6] = [
+            (
+                "batch channel create requires chargedCumulativeAmount 0",
+                |channel: &mut BatchChannel| channel.charged_cumulative_amount = "1".to_string(),
+            ),
+            (
+                "batch channel create requires balance 0",
+                |channel: &mut BatchChannel| channel.balance = "1".to_string(),
+            ),
+            (
+                "batch channel create requires totalClaimed 0",
+                |channel: &mut BatchChannel| {
+                    channel.total_claimed = "1".to_string();
+                    channel.balance = "1".to_string();
+                },
+            ),
+            (
+                "batch channel create requires refundNonce 0",
+                |channel: &mut BatchChannel| channel.refund_nonce = "1".to_string(),
+            ),
+            (
+                "batch channel create requires withdrawRequestedAt 0",
+                |channel: &mut BatchChannel| channel.withdraw_requested_at = 1,
+            ),
+            (
+                "batch channel create requires onchainSyncedAt empty",
+                |channel: &mut BatchChannel| channel.onchain_synced_at = Some(1),
+            ),
+        ];
+        for (message, mutate) in initial_invariant_cases {
+            let mut invalid_initial = test_initial_batch_channel(&channel_id, "200");
+            mutate(&mut invalid_initial);
+            let result = batch_update_channel(
+                channel_id.clone(),
+                None,
+                BatchChannelUpdate {
+                    channel: Some(invalid_initial),
+                },
+            );
+            assert_eq!(result.status, "invalid");
+            assert_eq!(result.message, Some(message.to_string()));
+        }
 
         let missing_delete = batch_update_channel(
             channel_id.clone(),
@@ -6215,7 +6288,7 @@ mod hardening_tests {
         .unwrap();
         let mut stored = test_batch_channel(&channel_id, "100");
         stored.revision = 1;
-        put_batch_channel(&channel_id, stored);
+        put_batch_channel(&channel_id, stored).unwrap();
 
         let deleted = batch_update_channel(
             channel_id.clone(),
@@ -6282,21 +6355,14 @@ mod hardening_tests {
         )
         .unwrap();
         let mut channel = test_batch_channel(&channel_id, "100");
+        channel.revision = 1;
         channel.balance = "100".to_string();
         channel.pending_request = Some(crate::batch::BatchPendingRequest {
             pending_id: "request-live".to_string(),
             signed_max_claimable: "100".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
         });
-
-        let created = batch_update_channel(
-            channel_id.clone(),
-            None,
-            BatchChannelUpdate {
-                channel: Some(channel),
-            },
-        );
-        assert_eq!(created.status, "updated");
+        put_batch_channel(&channel_id, channel).unwrap();
 
         let rejected = batch_update_channel(
             channel_id.clone(),
@@ -6317,7 +6383,7 @@ mod hardening_tests {
             signed_max_claimable: "100".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
         });
-        put_batch_channel(&channel_id, expired);
+        put_batch_channel(&channel_id, expired).unwrap();
 
         let deleted = batch_update_channel(
             channel_id.clone(),
@@ -6338,12 +6404,7 @@ mod hardening_tests {
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
         )
         .unwrap();
-        let mut channel = test_batch_channel(&channel_id, "100");
-        channel.pending_request = Some(crate::batch::BatchPendingRequest {
-            pending_id: "request-provisional".to_string(),
-            signed_max_claimable: "100".to_string(),
-            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
-        });
+        let channel = test_initial_batch_channel(&channel_id, "100");
 
         let created = batch_update_channel(
             channel_id.clone(),
@@ -6379,7 +6440,7 @@ mod hardening_tests {
         current.total_claimed = "50".to_string();
         current.refund_nonce = "3".to_string();
         current.revision = 1;
-        put_batch_channel(&channel_id, current);
+        put_batch_channel(&channel_id, current).unwrap();
 
         for (mut rollback, expected_message) in [
             (
@@ -6464,7 +6525,7 @@ mod hardening_tests {
 
         let mut current = test_batch_channel(&channel_id, "100");
         current.revision = 1;
-        put_batch_channel(&channel_id, current);
+        put_batch_channel(&channel_id, current).unwrap();
 
         let without_pending = batch_update_channel(
             channel_id.clone(),
@@ -6486,7 +6547,7 @@ mod hardening_tests {
             signed_max_claimable: "125".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
         });
-        put_batch_channel(&channel_id, expired_current);
+        put_batch_channel(&channel_id, expired_current).unwrap();
         let expired = batch_update_channel(
             channel_id.clone(),
             Some(1),
@@ -6507,7 +6568,7 @@ mod hardening_tests {
             signed_max_claimable: "130".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
         });
-        put_batch_channel(&channel_id, mismatch_current);
+        put_batch_channel(&channel_id, mismatch_current).unwrap();
         let mismatch = batch_update_channel(
             channel_id.clone(),
             Some(1),
@@ -6531,7 +6592,7 @@ mod hardening_tests {
             signed_max_claimable: "125".to_string(),
             expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
         });
-        put_batch_channel(&channel_id, unconsumed_current.clone());
+        put_batch_channel(&channel_id, unconsumed_current.clone()).unwrap();
         let mut unconsumed_next = test_batch_channel(&channel_id, "125");
         unconsumed_next.pending_request = unconsumed_current.pending_request;
         let unconsumed = batch_update_channel(
@@ -6574,16 +6635,12 @@ mod hardening_tests {
             Some("batch channel config does not match channel id".to_string())
         );
 
+        let mut created_ids = Vec::new();
         for salt in ["45", "46"] {
             let mut config = test_batch_channel_config();
             config.salt = format!("0x{}", salt.repeat(32));
             let id = compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
-            let mut channel = test_batch_channel_for_config(&id, config, "100");
-            channel.pending_request = Some(crate::batch::BatchPendingRequest {
-                pending_id: format!("request-{salt}"),
-                signed_max_claimable: "100".to_string(),
-                expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
-            });
+            let channel = test_initial_batch_channel_for_config(&id, config, "100");
             let created = batch_update_channel(
                 id.clone(),
                 None,
@@ -6592,7 +6649,21 @@ mod hardening_tests {
                 },
             );
             assert_eq!(created.status, "updated");
+            created_ids.push(id);
         }
+
+        let mut existing_update = batch_channel(created_ids[0].clone()).unwrap();
+        existing_update.charged_cumulative_amount = "100".to_string();
+        existing_update.pending_request = None;
+        let updated_at_limit = batch_update_channel(
+            created_ids[0].clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(existing_update),
+            },
+        );
+        assert_eq!(updated_at_limit.status, "updated");
+        assert_eq!(updated_at_limit.current_revision, Some(2));
 
         let mut extra_config = test_batch_channel_config();
         extra_config.salt = format!("0x{}", "47".repeat(32));
@@ -6602,7 +6673,7 @@ mod hardening_tests {
             extra_id.clone(),
             None,
             BatchChannelUpdate {
-                channel: Some(test_batch_channel_for_config(
+                channel: Some(test_initial_batch_channel_for_config(
                     &extra_id,
                     extra_config,
                     "100",
@@ -6614,6 +6685,31 @@ mod hardening_tests {
             over_limit.message,
             Some("batch channel storage limit reached".to_string())
         );
+
+        let deleted = batch_update_channel(
+            created_ids[1].clone(),
+            Some(1),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(deleted.status, "deleted");
+
+        let mut replacement_config = test_batch_channel_config();
+        replacement_config.salt = format!("0x{}", "48".repeat(32));
+        let replacement_id =
+            compute_batch_channel_id(&replacement_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT)
+                .unwrap();
+        let replacement = batch_update_channel(
+            replacement_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(test_initial_batch_channel_for_config(
+                    &replacement_id,
+                    replacement_config,
+                    "100",
+                )),
+            },
+        );
+        assert_eq!(replacement.status, "updated");
     }
 
     #[test]

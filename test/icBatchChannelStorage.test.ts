@@ -49,16 +49,20 @@ describe("IcBatchChannelStorage", () => {
     expect(updated.channel?.chargedCumulativeAmount).toBe("200");
   });
 
-  it("works with official BatchSettlementEvmScheme pending reservation hooks", async () => {
+  it("works with official BatchSettlementEvmScheme zero-accounting initial reservation hooks", async () => {
     const channelId = "0x" + "16".repeat(32);
     const client = new FakeBatchChannelClient([]);
     const storage = new IcBatchChannelStorage(client);
+    acceptsChannelStorage(storage);
+    acceptsOfficialChannelStorage(storage);
     const scheme = new BatchSettlementEvmScheme("0x1000000000000000000000000000000000000402", {
       storage,
       withdrawDelay: 900
     });
     const requirements = batchPaymentRequirements();
-    const paymentPayload = batchDepositPaymentPayload(channelId, requirements);
+    const paymentPayload = batchDepositPaymentPayload(channelId, requirements, {
+      maxClaimableAmount: requirements.amount
+    });
     const context: VerifyContext = {
       declaredExtensions: {},
       paymentPayload,
@@ -68,23 +72,36 @@ describe("IcBatchChannelStorage", () => {
     const first = await scheme.schemeHooks.onBeforeVerify?.(context);
     expect(first).toBeUndefined();
     const stored = await storage.get(channelId);
-    expect(stored?.pendingRequest?.signedMaxClaimable).toBe("125");
+    expect(stored).toMatchObject({
+      chargedCumulativeAmount: "0",
+      pendingRequest: {
+        signedMaxClaimable: requirements.amount
+      },
+      signedMaxClaimable: requirements.amount
+    });
     expect(stored?.pendingRequest?.pendingId).toMatch(/^0x[0-9a-f]+$/);
     expect(scheme.readRequestContext(paymentPayload)?.channelId).toBe(channelId);
 
     const second = await scheme.schemeHooks.onBeforeVerify?.({
       declaredExtensions: {},
-      paymentPayload: batchDepositPaymentPayload(channelId, requirements),
+      paymentPayload: batchDepositPaymentPayload(channelId, requirements, {
+        maxClaimableAmount: requirements.amount
+      }),
       requirements
     });
     expect(second).toMatchObject({
       abort: true,
       message: "Channel is already processing a request"
     });
+
+    await scheme.clearPendingRequest(paymentPayload);
+
+    await expect(storage.get(channelId)).resolves.toBeUndefined();
+    expect(client.updateCalls).toBe(2);
   });
 
-  it("lets official cleanup delete a failed new-channel pending reservation", async () => {
-    const channelId = "0x" + "18".repeat(32);
+  it("rejects missing-local nonzero initial charged create", async () => {
+    const channelId = "0x" + "19".repeat(32);
     const client = new FakeBatchChannelClient([]);
     const storage = new IcBatchChannelStorage(client);
     const scheme = new BatchSettlementEvmScheme("0x1000000000000000000000000000000000000402", {
@@ -92,25 +109,40 @@ describe("IcBatchChannelStorage", () => {
       withdrawDelay: 900
     });
     const requirements = batchPaymentRequirements();
-    const paymentPayload = batchDepositPaymentPayload(channelId, requirements);
+    const paymentPayload = batchDepositPaymentPayload(channelId, requirements, {
+      maxClaimableAmount: "125"
+    });
 
-    await scheme.schemeHooks.onBeforeVerify?.({
+    await expect(scheme.schemeHooks.onBeforeVerify?.({
       declaredExtensions: {},
       paymentPayload,
       requirements
-    });
+    })).rejects.toThrow(
+      "batch channel create requires chargedCumulativeAmount 0"
+    );
+    await expect(storage.get(channelId)).resolves.toBeUndefined();
+  });
+
+  it("lets cleanup delete a failed zero-accounting pending reservation", async () => {
+    const channelId = "0x" + "18".repeat(32);
+    const channel = icChannel(channelId, 1, "0");
+    channel.signed_max_claimable = "125";
+    channel.pending_request = livePending("125");
+    const client = new FakeBatchChannelClient([channel]);
+    const storage = new IcBatchChannelStorage(client);
+
     await expect(storage.get(channelId)).resolves.toMatchObject({
-      chargedCumulativeAmount: "100",
+      chargedCumulativeAmount: "0",
       pendingRequest: {
         signedMaxClaimable: "125"
       },
       signedMaxClaimable: "125"
     });
 
-    await scheme.clearPendingRequest(paymentPayload);
+    await storage.updateChannel(channelId, () => undefined);
 
     await expect(storage.get(channelId)).resolves.toBeUndefined();
-    expect(client.updateCalls).toBe(2);
+    expect(client.updateCalls).toBe(1);
   });
 
   it("requires a live pending request when creating a new channel", async () => {
@@ -142,6 +174,49 @@ describe("IcBatchChannelStorage", () => {
       return fromIcFixture(channel);
     })).rejects.toThrow("signedMaxClaimable must match pendingRequest.signedMaxClaimable when creating");
     expect(mismatchClient.updateCalls).toBe(0);
+
+    const cases: Array<{
+      message: string;
+      mutate: (channel: BatchChannel) => BatchChannel;
+    }> = [
+      {
+        message: "batch channel create requires chargedCumulativeAmount 0",
+        mutate: (channel) => ({ ...channel, chargedCumulativeAmount: "1" })
+      },
+      {
+        message: "batch channel create requires balance 0",
+        mutate: (channel) => ({ ...channel, balance: "1" })
+      },
+      {
+        message: "batch channel create requires totalClaimed 0",
+        mutate: (channel) => ({ ...channel, totalClaimed: "1" })
+      },
+      {
+        message: "batch channel create requires refundNonce 0",
+        mutate: (channel) => ({ ...channel, refundNonce: 1 })
+      },
+      {
+        message: "batch channel create requires withdrawRequestedAt 0",
+        mutate: (channel) => ({ ...channel, withdrawRequestedAt: 1 })
+      },
+      {
+        message: "batch channel create requires onchainSyncedAt empty",
+        mutate: (channel) => ({ ...channel, onchainSyncedAt: 1 })
+      }
+    ];
+
+    for (const { message, mutate } of cases) {
+      const client = new FakeBatchChannelClient([]);
+      const storage = new IcBatchChannelStorage(client);
+      await expect(storage.updateChannel(channelId, () => {
+        const channel = icChannel(channelId, 0, "0");
+        channel.signed_max_claimable = "100";
+        channel.signature = hex("0x" + "11".repeat(65));
+        channel.pending_request = livePending("100");
+        return mutate(fromIcFixture(channel));
+      })).rejects.toThrow(message);
+      expect(client.updateCalls).toBe(0);
+    }
   });
 
   it("retries revision conflicts without overwriting the newer channel state", async () => {
@@ -967,7 +1042,11 @@ function batchPaymentRequirements(): PaymentRequirements {
   };
 }
 
-function batchDepositPaymentPayload(channelId: string, accepted: PaymentRequirements): PaymentPayload {
+function batchDepositPaymentPayload(
+  channelId: string,
+  accepted: PaymentRequirements,
+  options: { maxClaimableAmount?: string } = {}
+): PaymentPayload {
   const channelConfig: Record<string, unknown> = {
     payer: "0x3000000000000000000000000000000000000402",
     payerAuthorizer: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993",
@@ -995,7 +1074,7 @@ function batchDepositPaymentPayload(channelId: string, accepted: PaymentRequirem
       type: "deposit",
       voucher: {
         channelId,
-        maxClaimableAmount: "125",
+        maxClaimableAmount: options.maxClaimableAmount ?? "125",
         signature: "0x" + "11".repeat(65)
       }
     },

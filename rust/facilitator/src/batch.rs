@@ -779,9 +779,12 @@ pub fn validate_batch_channel_transition(
 pub fn is_pending_only_provisional_channel(channel: &BatchChannel, now_ms: u64) -> bool {
     channel.pending_request.as_ref().is_some_and(|pending| {
         pending.expires_at > now_ms && pending.signed_max_claimable == channel.signed_max_claimable
-    }) && channel.balance == "0"
+    }) && channel.charged_cumulative_amount == "0"
+        && channel.balance == "0"
         && channel.total_claimed == "0"
         && channel.refund_nonce == "0"
+        && channel.withdraw_requested_at == 0
+        && channel.onchain_synced_at.is_none()
 }
 
 fn validate_initial_channel_create(next: &BatchChannel) -> Result<(), String> {
@@ -797,6 +800,24 @@ fn validate_initial_channel_create(next: &BatchChannel) -> Result<(), String> {
             "batch channel signedMaxClaimable must match pendingRequest.signedMaxClaimable when creating"
                 .to_string(),
         );
+    }
+    if next.charged_cumulative_amount != "0" {
+        return Err("batch channel create requires chargedCumulativeAmount 0".to_string());
+    }
+    if next.total_claimed != "0" {
+        return Err("batch channel create requires totalClaimed 0".to_string());
+    }
+    if next.refund_nonce != "0" {
+        return Err("batch channel create requires refundNonce 0".to_string());
+    }
+    if next.balance != "0" {
+        return Err("batch channel create requires balance 0".to_string());
+    }
+    if next.withdraw_requested_at != 0 {
+        return Err("batch channel create requires withdrawRequestedAt 0".to_string());
+    }
+    if next.onchain_synced_at.is_some() {
+        return Err("batch channel create requires onchainSyncedAt empty".to_string());
     }
     Ok(())
 }

@@ -18,6 +18,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - run: npm ci
+      - run: npm run lint:hidden-unicode
       - run: cargo test -p jpyc_x402_facilitator
       - run: cargo fmt -- --check
       - run: cargo clippy -p jpyc_x402_facilitator -- -D warnings

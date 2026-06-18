@@ -80,7 +80,7 @@ BATCH_SETTLEMENT_CONTRACT=0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003
 BATCH_WITHDRAW_DELAY_SECONDS=900
 BATCH_SETTLEMENT_FEE_AMOUNT=1000000000000000
 BATCH_MIN_CANISTER_CYCLES=1000000000000
-BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL=ryjl3-tyaaa-aaaaa-aaaba-cai
+BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL=<resource-server-canister-principal>
 BATCH_SETTLEMENT_ACTION=deposit
 BATCH_SETTLEMENT_TX=0x...
 BATCH_CHANNEL_ID=0x...
@@ -111,7 +111,7 @@ JPYC token contract は Polygon mainnet の固定値 `0x431D5dfF03120AFA4bDf332c
 `FACILITATOR_PUBLIC_ORIGIN` は payment resource URL の origin。Host / forwarded proto header は信用しない。
 `SETTLE_MIN_CONFIRMATIONS` は settlement receipt を success 扱いする最小 confirmation 数。既定値は `3`。
 `SELLER_CREDIT_PAY_TO` は seller credit 購入代金の受取先。`SELLER_CREDIT_TOPUP_AMOUNT` と `SELLER_SETTLEMENT_FEE_AMOUNT` は JPYC atomic unit。`FACILITATOR_MAX_SETTLEMENT_FEE_WEI` は `gas_limit * max_fee_per_gas` の送信前 cap。超過時は tx を broadcast せず `gas_too_expensive` を返す。
-`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY`、`BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL`、`BATCH_WITHDRAW_DELAY_SECONDS`、`BATCH_SETTLEMENT_FEE_AMOUNT`、`BATCH_SETTLEMENT_CONTRACT` が有効な時だけ `/supported` に `batch-settlement` を広告し、batch `/verify` も同じ full config を要求する。`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY` は `FACILITATOR_EVM_PRIVATE_KEY` と別 address を導出する鍵にする。`BATCH_SETTLEMENT_CONTRACT` は pinned `@x402/evm` の公式 `BATCH_SETTLEMENT_ADDRESS` `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003` だけ許可する。`BATCH_WITHDRAW_DELAY_SECONDS` は x402 公式範囲の 900〜2592000 秒だけ許可する。`BATCH_SETTLEMENT_FEE_AMOUNT` は batch `/settle` の onchain tx fee reserve 用。`BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL` は resource server が使う非system canister actor principal で、batch 有効化時は必須。canister の `batch_update_channel` は per-channel CAS、channel id/config/signature 検証、storage 上限、`chargedCumulativeAmount` / `signedMaxClaimable` / `totalClaimed` / `refundNonce` の単調増加を強制し、`chargedCumulativeAmount` 増加は live `pendingRequest` 消費時だけ許可する。公式 `BatchSettlementChannelManager.refundChannel()` の成功後cleanupと同じ channel delete を許可し、削除直前の最終snapshotは上限付きの `batch_deleted_channel*` 監査APIに残す。batch `/settle` は deposit / claim / settle / refund の x402 公式 ABI calldata を送信する。deposit / refund は client-signed payment なので full batch `extra` と EIP-712 version を検証する。claim / settle は公式 `BatchSettlementChannelManager` が `extra: {}` の最小 requirements で送るため、`amount == "0"`、`payTo` / `asset` / channel config / voucher signature / receiverAuthorizer 一致を検証して受理する。tx 送信前に channel / receiver / ERC-20 balance を `eth_call` で検証し、receipt は tx status、confirmations、contract address に加え、settle は `Settled` event、deposit / claim / refund は channel post-state を検証する。
+`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY`、`BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL`、`BATCH_WITHDRAW_DELAY_SECONDS`、`BATCH_SETTLEMENT_FEE_AMOUNT`、`BATCH_SETTLEMENT_CONTRACT` が有効な時だけ `/supported` に `batch-settlement` を広告し、partial / invalid batch config では base capability だけを返す。batch `/verify` / `/settle` は同じ full config を要求する。`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY` は `FACILITATOR_EVM_PRIVATE_KEY` と別 address を導出する鍵にする。`BATCH_SETTLEMENT_CONTRACT` は pinned `@x402/evm` の公式 `BATCH_SETTLEMENT_ADDRESS` `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003` だけ許可する。`BATCH_WITHDRAW_DELAY_SECONDS` は x402 公式範囲の 900〜2592000 秒だけ許可する。`BATCH_SETTLEMENT_FEE_AMOUNT` は batch `/settle` の onchain tx fee reserve 用。`BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL` は resource server が使う非system canister actor principal で、batch 有効化時は必須。canister の `batch_update_channel` は per-channel CAS、channel id/config/signature 検証、storage 上限、初期create時の会計ゼロ状態、`chargedCumulativeAmount` / `signedMaxClaimable` / `totalClaimed` / `refundNonce` の単調増加を強制し、`chargedCumulativeAmount` 増加は live `pendingRequest` 消費時だけ許可する。公式 `BatchSettlementChannelManager.refundChannel()` の成功後cleanupと同じ channel delete を許可し、削除直前の最終snapshotは上限付きの `batch_deleted_channel*` 監査APIに残す。batch `/settle` は deposit / claim / settle / refund の x402 公式 ABI calldata を送信する。deposit / refund は client-signed payment なので full batch `extra` と EIP-712 version を検証する。claim / settle は公式 `BatchSettlementChannelManager` が `extra: {}` の最小 requirements で送るため、`amount == "0"`、`payTo` / `asset` / channel config / voucher signature / receiverAuthorizer 一致を検証して受理する。tx 送信前に channel / receiver / ERC-20 balance を `eth_call` で検証し、receipt は tx status、confirmations、contract address に加え、settle は `Settled` event、deposit / claim / refund は channel post-state を検証する。
 
 ## Cost 計測
 
@@ -174,6 +174,8 @@ const scheme = new BatchSettlementEvmScheme(receiverAddress, {
   storage
 });
 ```
+
+`IcBatchChannelStorage` は公式 `ChannelStorage` として使えるが、canister への初期 channel create は会計ゼロ状態だけ許可する。初回 payment は `voucher.maxClaimableAmount == PaymentRequirements.amount` の pending reservation として作る。非ゼロ `chargedCumulativeAmount` は既存 canister channel の live `pendingRequest` を消費する更新でだけ反映し、local storage 欠落から非ゼロ state を新規作成しない。
 
 公式 `scheme.createChannelManager(facilitator, "eip155:137")` の `claim()` / `settle()` は最小 `PaymentRequirements.extra = {}` を送る。facilitator は claim/settle では full extra を要求せず、channel payload と signed voucher から整合性を検証する。deposit/refund の verify/settle は full extra を維持する。
 

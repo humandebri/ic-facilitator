@@ -14,6 +14,7 @@
     "ic:deploy:mainnet": "icp deploy -e ic edge --yes",
     "ic:env:local": "scripts/set_canister_env.sh local",
     "ic:env:mainnet": "scripts/set_canister_env.sh ic",
+    "lint:hidden-unicode": "node scripts/check_hidden_unicode.mjs",
     "pay:jpyc": "node --import tsx scripts/pay_jpyc.ts",
     "preflight:batch": "node --import tsx scripts/batch_mainnet_preflight.ts",
     "readiness:batch": "node --import tsx scripts/batch_production_readiness.ts",

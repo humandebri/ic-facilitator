@@ -354,6 +354,24 @@ function requireInitialChannelCreate(next: BatchChannel): void {
   if (next.signedMaxClaimable !== pending.signedMaxClaimable) {
     throw new Error("signedMaxClaimable must match pendingRequest.signedMaxClaimable when creating");
   }
+  if (next.chargedCumulativeAmount !== "0") {
+    throw new Error("batch channel create requires chargedCumulativeAmount 0");
+  }
+  if (next.balance !== "0") {
+    throw new Error("batch channel create requires balance 0");
+  }
+  if (next.totalClaimed !== "0") {
+    throw new Error("batch channel create requires totalClaimed 0");
+  }
+  if (next.refundNonce !== 0) {
+    throw new Error("batch channel create requires refundNonce 0");
+  }
+  if (next.withdrawRequestedAt !== 0) {
+    throw new Error("batch channel create requires withdrawRequestedAt 0");
+  }
+  if (next.onchainSyncedAt !== undefined) {
+    throw new Error("batch channel create requires onchainSyncedAt empty");
+  }
 }
 
 function requirePendingChargeCommit(current: BatchChannel, next: BatchChannel): void {
@@ -390,9 +408,12 @@ function requireNoLivePendingBeforeDelete(current: BatchChannel | undefined): vo
 function isPendingOnlyProvisionalChannel(channel: BatchChannel): boolean {
   return channel.pendingRequest !== undefined &&
     channel.pendingRequest.signedMaxClaimable === channel.signedMaxClaimable &&
+    channel.chargedCumulativeAmount === "0" &&
     channel.balance === "0" &&
     channel.totalClaimed === "0" &&
-    channel.refundNonce === 0;
+    channel.refundNonce === 0 &&
+    channel.withdrawRequestedAt === 0 &&
+    channel.onchainSyncedAt === undefined;
 }
 
 function requireMonotonicDecimal(label: string, current: string, next: string): void {
