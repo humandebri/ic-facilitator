@@ -171,7 +171,6 @@ describe("set_canister_env facilitator validation", () => {
         encoding: "utf8",
         env: {
           ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -196,36 +195,6 @@ describe("set_canister_env facilitator validation", () => {
     }
   });
 
-  it("rejects missing batch channel storage writer principal when batch is enabled", () => {
-    const { dir, logPath } = fakeIcpDir();
-    try {
-      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
-          BATCH_SETTLEMENT_FEE_AMOUNT: "100",
-          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
-          ICP_FAKE_LOG: logPath,
-          JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
-          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
-          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
-          PATH: `${dir}:${process.env.PATH ?? ""}`
-        }
-      });
-
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("missing required env: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL");
-      expect(() => readFileSync(logPath, "utf8")).toThrow();
-    } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
   it("rejects missing batch settlement contract when batch is enabled", () => {
     const { dir, logPath } = fakeIcpDir();
     try {
@@ -234,7 +203,6 @@ describe("set_canister_env facilitator validation", () => {
         encoding: "utf8",
         env: {
           ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
@@ -265,7 +233,6 @@ describe("set_canister_env facilitator validation", () => {
         encoding: "utf8",
         env: {
           ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_CONTRACT: "0x0000000000000000000000000000000000000001",
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -289,38 +256,6 @@ describe("set_canister_env facilitator validation", () => {
     }
   });
 
-  it("rejects invalid batch channel storage writer principal before calling icp", () => {
-    const { dir, logPath } = fakeIcpDir();
-    try {
-      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "not a principal",
-          BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
-          BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
-          BATCH_SETTLEMENT_FEE_AMOUNT: "100",
-          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
-          ICP_FAKE_LOG: logPath,
-          JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
-          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
-          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
-          PATH: `${dir}:${process.env.PATH ?? ""}`
-        }
-      });
-
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal");
-      expect(() => readFileSync(logPath, "utf8")).toThrow();
-    } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
   it("rejects batch settlement fee amount above uint128 before calling icp", () => {
     const { dir, logPath } = fakeIcpDir();
     try {
@@ -329,7 +264,6 @@ describe("set_canister_env facilitator validation", () => {
         encoding: "utf8",
         env: {
           ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "340282366920938463463374607431768211456",
@@ -353,70 +287,6 @@ describe("set_canister_env facilitator validation", () => {
     }
   });
 
-  it("rejects batch channel storage writer principal with invalid checksum before calling icp", () => {
-    const { dir, logPath } = fakeIcpDir();
-    try {
-      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-caj",
-          BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
-          BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
-          BATCH_SETTLEMENT_FEE_AMOUNT: "100",
-          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
-          ICP_FAKE_LOG: logPath,
-          JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
-          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
-          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
-          PATH: `${dir}:${process.env.PATH ?? ""}`
-        }
-      });
-
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal");
-      expect(() => readFileSync(logPath, "utf8")).toThrow();
-    } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("rejects anonymous batch channel storage writer principal before calling icp", () => {
-    const { dir, logPath } = fakeIcpDir();
-    try {
-      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "2vxsx-fae",
-          BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
-          BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
-          BATCH_SETTLEMENT_FEE_AMOUNT: "100",
-          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
-          ICP_FAKE_LOG: logPath,
-          JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
-          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
-          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
-          PATH: `${dir}:${process.env.PATH ?? ""}`
-        }
-      });
-
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal");
-      expect(() => readFileSync(logPath, "utf8")).toThrow();
-    } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
   it("rejects matching facilitator and batch receiver authorizer keys before calling icp", () => {
     const { dir, logPath } = fakeIcpDir();
     try {
@@ -425,7 +295,6 @@ describe("set_canister_env facilitator validation", () => {
         encoding: "utf8",
         env: {
           ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: privateKey,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -484,7 +353,6 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).toContain('set_env ("SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "60")');
       expect(log).toContain('set_env ("SETTLE_MIN_CONFIRMATIONS", "3")');
       expect(log).toContain('set_env ("SETTLEMENT_CACHE_TTL_SECONDS", "86400")');
-      expect(log).toContain('set_env ("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "")');
       expect(log).toContain('set_env ("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "")');
       expect(log).toContain('set_env ("BATCH_SETTLEMENT_CONTRACT", "")');
       expect(log).toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS", "")');
@@ -494,7 +362,7 @@ describe("set_canister_env facilitator validation", () => {
     }
   });
 
-  it("sets batch channel storage writer principal when batch is enabled", () => {
+  it("sets batch env when batch is enabled", () => {
     const { dir, logPath } = fakeIcpDir();
     const batchReceiverAuthorizerKey = `0x${"2".repeat(64)}`;
     try {
@@ -503,7 +371,6 @@ describe("set_canister_env facilitator validation", () => {
         encoding: "utf8",
         env: {
           ...process.env,
-          BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: batchReceiverAuthorizerKey,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -521,7 +388,6 @@ describe("set_canister_env facilitator validation", () => {
 
       expect(result.status).toBe(0);
       const log = readFileSync(logPath, "utf8");
-      expect(log).toContain('set_env ("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "ryjl3-tyaaa-aaaaa-aaaba-cai")');
       expect(log).toContain(`set_env ("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "${batchReceiverAuthorizerKey}")`);
       expect(log).toContain(`set_env ("BATCH_SETTLEMENT_CONTRACT", "${batchSettlementContract}")`);
       expect(log).toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS", "900")');

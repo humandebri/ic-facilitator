@@ -20,6 +20,10 @@ export type GenerateDidOptions = {
   readonly wasmPath: string;
 };
 
+export function normalizeDidServiceConstructor(did: string): string {
+  return did.replace(/\bservice\s*:\s*\(\s*\)\s*->\s*\{/, "service : {");
+}
+
 function runCandidExtractor(wasmPath: string): CandidExtractorResult {
   const result = spawnSync("candid-extractor", [wasmPath], { encoding: "utf8" });
   const error = result.error instanceof Error
@@ -49,14 +53,15 @@ export function generateDid(options: GenerateDidOptions): void {
       `candid-extractor failed with status ${result.status ?? "unknown"}`
     );
   }
-  if (!stdout.includes("service :")) {
+  const normalized = normalizeDidServiceConstructor(stdout);
+  if (!normalized.includes("service :")) {
     throw new Error("candid-extractor output did not include a service definition");
   }
 
   mkdirSync(dirname(options.didPath), { recursive: true });
   const tmpPath = `${options.didPath}.tmp-${process.pid}`;
   try {
-    writeFileSync(tmpPath, stdout);
+    writeFileSync(tmpPath, normalized);
     renameSync(tmpPath, options.didPath);
   } catch (error: unknown) {
     rmSync(tmpPath, { force: true });

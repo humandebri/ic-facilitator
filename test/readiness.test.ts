@@ -177,7 +177,6 @@ describe("jpyc readiness", () => {
       return new Response("not found", { status: 404 });
     };
     const report = await buildReadinessReportWithSmoke(".", {
-      BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
       BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
       BATCH_SETTLEMENT_CONTRACT: batchContract,
       BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -220,7 +219,6 @@ describe("jpyc readiness", () => {
 
   it("requires batch canister env names when batch readiness stages are enabled", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
-      BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
       BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
       BATCH_SETTLEMENT_CONTRACT: batchContract,
       BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -241,7 +239,6 @@ describe("jpyc readiness", () => {
 
     const envStage = report.stages.find((stage) => stage.name === "canister-env");
     expect(envStage?.status).toBe("fail");
-    expect(envStage?.failures[0]).toContain("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL");
     expect(report.nextCommands).toContain("npm run smoke:canister:env -- --with-batch");
     expect(report.nextCommands).not.toContain("npm run smoke:canister:env");
   });
@@ -432,7 +429,6 @@ describe("jpyc readiness", () => {
 
   it("can include batch mainnet preflight", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
-      BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
       BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
       BATCH_SETTLEMENT_CONTRACT: batchContract,
       BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -470,7 +466,6 @@ describe("jpyc readiness", () => {
     expect(report.nextCommands).toContain(`set BATCH_SETTLEMENT_CONTRACT=${batchContract}`);
     expect(report.nextCommands).toContain("set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key");
     expect(report.nextCommands).toContain("set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer");
-    expect(report.nextCommands).toContain("set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to the resource server actor principal");
   });
 
   it("can include batch settlement receipt verification", async () => {

@@ -87,14 +87,6 @@ impl SettlementRecord {
         Self::new("settled", response, Some(pay_to), now, ttl)
     }
 
-    pub fn with_batch_pre_refund_snapshot(
-        mut self,
-        snapshot: Option<&BatchChannelSnapshot>,
-    ) -> Self {
-        self.batch_pre_refund_snapshot = snapshot.cloned();
-        self
-    }
-
     pub fn failed(
         tx: String,
         message: String,
@@ -247,15 +239,15 @@ mod tests {
             withdraw_requested_at: 0,
             refund_nonce: "1".to_string(),
         };
-        let broadcast = SettlementRecord::broadcast(
+        let mut broadcast = SettlementRecord::broadcast(
             "0xtx".to_string(),
             "0xabc".to_string(),
             "0xdef".to_string(),
             "100".to_string(),
             10,
             60,
-        )
-        .with_batch_pre_refund_snapshot(Some(&snapshot));
+        );
+        broadcast.batch_pre_refund_snapshot = Some(snapshot.clone());
         assert_eq!(
             broadcast.broadcast_settlement(),
             Some(BroadcastSettlement {

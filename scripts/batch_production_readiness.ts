@@ -20,6 +20,7 @@ import type { BatchSettlementReceiptReader, BatchSettlementReceiptResult } from 
 import { loadDotenv } from "./env_file";
 import { checkCanisterSmoke } from "./smoke_canister";
 import { REQUIRED_BATCH_ENV_NAMES, parseEnvNames } from "./smoke_canister_env";
+import { normalizeDidServiceConstructor } from "./generate_did";
 
 export type BatchProductionReadinessStatus = "fail" | "ok";
 
@@ -78,15 +79,22 @@ const UINT128_MAX = (1n << 128n) - 1n;
 const REQUIRED_BATCH_DID_METHODS = [
   "batch_channel",
   "batch_channel_count",
-  "batch_channel_storage_writer",
   "batch_channels",
+  "batch_create_payment_intent",
   "batch_deleted_channel",
   "batch_deleted_channel_count",
   "batch_deleted_channels",
+  "batch_mark_payment_intent",
+  "batch_payment_intent",
   "batch_receiver_authorizer",
+  "batch_set_seller",
+  "batch_set_writer_receiver_scope",
   "batch_settlement_contract",
   "batch_settlement_fee_amount",
-  "batch_update_channel"
+  "batch_update_channel",
+  "batch_writer_receiver_scope",
+  "batch_writer_receiver_scope_count",
+  "batch_writer_receiver_scopes"
 ];
 const REQUIRED_BATCH_DID_SHAPES: readonly { readonly name: string; readonly pattern: RegExp }[] = [
   {
@@ -104,6 +112,18 @@ const REQUIRED_BATCH_DID_SHAPES: readonly { readonly name: string; readonly patt
   {
     name: "type BatchDeletedChannel",
     pattern: /\btype\s+BatchDeletedChannel\s*=\s*record\s*\{[\s\S]*\bdeleted_at\s*:\s*nat64\s*;[\s\S]*\bdeleted_by\s*:\s*text\s*;[\s\S]*\bchannel\s*:\s*BatchChannel\s*;[\s\S]*\}/
+  },
+  {
+    name: "type BatchPaymentIntent",
+    pattern: /\btype\s+BatchPaymentIntent\s*=\s*record\s*\{[\s\S]*\bintent_id\s*:\s*text\s*;[\s\S]*\breceiver_address\s*:\s*text\s*;[\s\S]*\bstatus\s*:\s*text\s*;[\s\S]*\}/
+  },
+  {
+    name: "type BatchSeller",
+    pattern: /\btype\s+BatchSeller\s*=\s*record\s*\{[\s\S]*\breceiver_address\s*:\s*text\s*;[\s\S]*\bstatus\s*:\s*text\s*;[\s\S]*\}/
+  },
+  {
+    name: "type BatchWriterReceiverScope",
+    pattern: /\btype\s+BatchWriterReceiverScope\s*=\s*record\s*\{[\s\S]*\bwriter_principal\s*:\s*principal\s*;[\s\S]*\breceiver_address\s*:\s*text\s*;[\s\S]*\benabled\s*:\s*bool\s*;[\s\S]*\}/
   }
 ];
 const REQUIRED_BATCH_CHANNEL_OUTPUT_FIELDS = [
@@ -322,7 +342,7 @@ function optionalPositiveBigIntEnv(env: NodeJS.ProcessEnv, name: string): bigint
 }
 
 function didHasMethod(did: string, method: string): boolean {
-  const service = /\bservice\s*:\s*\{([\s\S]*)\}\s*;?\s*$/.exec(did)?.[1];
+  const service = /\bservice\s*:\s*(?:\(\s*\)\s*->\s*)?\{([\s\S]*)\}\s*;?\s*$/.exec(did)?.[1];
   if (service === undefined) {
     return false;
   }
@@ -332,7 +352,7 @@ function didHasMethod(did: string, method: string): boolean {
 
 function missingBatchDidStorageItems(did: string): readonly string[] {
   const missing: string[] = [];
-  const service = /\bservice\s*:\s*\{([\s\S]*)\}\s*;?\s*$/.exec(did)?.[1];
+  const service = /\bservice\s*:\s*(?:\(\s*\)\s*->\s*)?\{([\s\S]*)\}\s*;?\s*$/.exec(did)?.[1];
   for (const method of REQUIRED_BATCH_DID_METHODS) {
     if (!didHasMethod(did, method)) {
       missing.push(`method ${method}`);
@@ -342,15 +362,23 @@ function missingBatchDidStorageItems(did: string): readonly string[] {
     const serviceShapes: readonly { readonly name: string; readonly pattern: RegExp }[] = [
       { name: "method batch_channel signature", pattern: /\bbatch_channel\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+BatchChannel\s*\)\s*query\s*;/ },
       { name: "method batch_channel_count signature", pattern: /\bbatch_channel_count\s*:\s*\(\s*\)\s*->\s*\(\s*nat64\s*\)\s*query\s*;/ },
-      { name: "method batch_channel_storage_writer signature", pattern: /\bbatch_channel_storage_writer\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+principal\s*\)\s*query\s*;/ },
       { name: "method batch_channels signature", pattern: /\bbatch_channels\s*:\s*\(\s*opt\s+nat64\s*\)\s*->\s*\(\s*vec\s+BatchChannel\s*\)\s*query\s*;/ },
+      { name: "method batch_create_payment_intent signature", pattern: /\bbatch_create_payment_intent\s*:\s*\(\s*text\s*,\s*text\s*,\s*text\s*,\s*text\s*,\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result\s*,?\s*\)\s*;/ },
       { name: "method batch_deleted_channel signature", pattern: /\bbatch_deleted_channel\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+BatchDeletedChannel\s*\)\s*query\s*;/ },
       { name: "method batch_deleted_channel_count signature", pattern: /\bbatch_deleted_channel_count\s*:\s*\(\s*\)\s*->\s*\(\s*nat64\s*\)\s*query\s*;/ },
       { name: "method batch_deleted_channels signature", pattern: /\bbatch_deleted_channels\s*:\s*\(\s*opt\s+nat64\s*\)\s*->\s*\(\s*vec\s+BatchDeletedChannel\s*\)\s*query\s*;/ },
+      { name: "method batch_mark_payment_intent signature", pattern: /\bbatch_mark_payment_intent\s*:\s*\(\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result\s*,?\s*\)\s*;/ },
+      { name: "method batch_payment_intent signature", pattern: /\bbatch_payment_intent\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+BatchPaymentIntent\s*\)\s*query\s*;/ },
       { name: "method batch_receiver_authorizer signature", pattern: /\bbatch_receiver_authorizer\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
+      { name: "method batch_set_seller signature", pattern: /\bbatch_set_seller\s*:\s*\(\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result_1\s*,?\s*\)\s*;/ },
+      { name: "method batch_set_writer_receiver_scope signature", pattern: /\bbatch_set_writer_receiver_scope\s*:\s*\(\s*principal\s*,\s*text\s*,\s*bool\s*\)\s*->\s*\(\s*Result_2\s*,?\s*\)\s*;/ },
       { name: "method batch_settlement_contract signature", pattern: /\bbatch_settlement_contract\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
       { name: "method batch_settlement_fee_amount signature", pattern: /\bbatch_settlement_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
-      { name: "method batch_update_channel signature", pattern: /\bbatch_update_channel\s*:\s*\(\s*text\s*,\s*opt\s+nat64\s*,\s*BatchChannelUpdate\s*\)\s*->\s*\(\s*BatchChannelUpdateResult\s*,?\s*\)\s*;/ }
+      { name: "method batch_update_channel signature", pattern: /\bbatch_update_channel\s*:\s*\(\s*text\s*,\s*opt\s+nat64\s*,\s*BatchChannelUpdate\s*\)\s*->\s*\(\s*BatchChannelUpdateResult\s*,?\s*\)\s*;/ },
+      { name: "method batch_writer_receiver_scope signature", pattern: /\bbatch_writer_receiver_scope\s*:\s*\(\s*principal\s*,\s*text\s*\)\s*->\s*\(\s*opt\s+BatchWriterReceiverScope\s*,?\s*\)\s*query\s*;/ },
+      { name: "method batch_writer_receiver_scope_count signature", pattern: /\bbatch_writer_receiver_scope_count\s*:\s*\(\s*\)\s*->\s*\(\s*nat64\s*\)\s*query\s*;/ },
+      { name: "method batch_writer_receiver_scopes signature", pattern: /\bbatch_writer_receiver_scopes\s*:\s*\(\s*opt\s+nat64\s*\)\s*->\s*\(\s*vec\s+BatchWriterReceiverScope\s*,?\s*\)\s*query\s*;/ },
+      { name: "method settlement signature", pattern: /\bsettlement\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+SettlementRecord\s*\)\s*query\s*;/ }
     ];
     for (const shape of serviceShapes) {
       if (!shape.pattern.test(service)) {
@@ -457,21 +485,6 @@ function crc32(bytes: readonly number[]): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function batchStorageWriterStage(env: NodeJS.ProcessEnv): BatchProductionReadinessStage {
-  const value = env.BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL;
-  if (!value || value.trim() === "") {
-    return fail("batch:storage-writer", "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL is required");
-  }
-  const principal = value.trim();
-  if (!isIcPrincipal(principal)) {
-    return fail("batch:storage-writer", "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal");
-  }
-  if (principal === ANONYMOUS_PRINCIPAL || principal === MANAGEMENT_PRINCIPAL) {
-    return fail("batch:storage-writer", "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal");
-  }
-  return ok("batch:storage-writer", principal);
-}
-
 function batchSettlementFeeStage(env: NodeJS.ProcessEnv): BatchProductionReadinessStage {
   const value = env.BATCH_SETTLEMENT_FEE_AMOUNT;
   if (!value || value.trim() === "") {
@@ -565,11 +578,6 @@ function batchKeySeparationStage(env: NodeJS.ProcessEnv): BatchProductionReadine
   return ok("batch:key-separation", `receiverAuthorizer=${receiverAuthorizer} facilitator=${facilitator}`);
 }
 
-function parseOptionalPrincipal(output: string): string | undefined {
-  const match = /^\s*\(\s*opt\s+principal\s+"([^"]+)"\s*,?\s*\)\s*$/.exec(output);
-  return match?.[1];
-}
-
 function parseOptionalText(output: string): string | undefined {
   const match = /^\s*\(\s*opt\s+"([^"]+)"\s*,?\s*\)\s*$/.exec(output);
   return match?.[1];
@@ -580,29 +588,25 @@ function parseNat64Output(output: string): bigint | undefined {
   return match?.[1] === undefined ? undefined : BigInt(match[1].replaceAll("_", ""));
 }
 
-function canisterStorageWriterStage(
+function canisterWriterScopeStage(
   env: NodeJS.ProcessEnv,
   runner: CommandRunner,
   cwd: string
 ): BatchProductionReadinessStage {
-  const expected = env.BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL?.trim();
-  if (!expected) {
-    return fail("canister:batch-storage-writer", "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL is required");
-  }
   const environment = env.ICP_ENVIRONMENT ?? DEFAULT_ICP_ENVIRONMENT;
   const canister = env.ICP_CANISTER ?? DEFAULT_ICP_CANISTER;
-  const result = runner("icp", ["canister", "call", canister, "batch_channel_storage_writer", "()", "--environment", environment], cwd);
+  const result = runner("icp", ["canister", "call", canister, "batch_writer_receiver_scope_count", "()", "--environment", environment], cwd);
   if (result.status !== 0) {
-    return fail("canister:batch-storage-writer", result.output || "failed to query batch_channel_storage_writer");
+    return fail("canister:batch-writer-scope", result.output || "failed to query batch_writer_receiver_scope_count");
   }
-  const actual = parseOptionalPrincipal(result.output);
-  if (!actual) {
-    return fail("canister:batch-storage-writer", "batch channel storage writer is not configured on canister");
+  const count = parseNat64Output(result.output);
+  if (count === undefined) {
+    return fail("canister:batch-writer-scope", `unexpected batch_writer_receiver_scope_count output: ${result.output}`);
   }
-  if (actual !== expected) {
-    return fail("canister:batch-storage-writer", `expected ${expected}, got ${actual}`);
+  if (count === 0n) {
+    return fail("canister:batch-writer-scope", "active seller writer receiver scope count must be greater than 0");
   }
-  return ok("canister:batch-storage-writer", `${canister}@${environment} writer ${actual}`);
+  return ok("canister:batch-writer-scope", `${canister}@${environment} active seller enabled scopes=${count.toString()}`);
 }
 
 function canisterReceiverAuthorizerStage(
@@ -1052,10 +1056,6 @@ function canisterOperationalSafetyStage(
   if (controllers.length < 2) {
     return fail("canister:operational-safety", "canister must have at least two non-system controllers");
   }
-  const writer = env.BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL?.trim();
-  if (writer && isIcPrincipal(writer) && controllers.includes(writer)) {
-    return fail("canister:operational-safety", "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must not be a canister controller");
-  }
   if (status.freezingThreshold === undefined) {
     return fail("canister:operational-safety", "canister status did not include freezing threshold");
   }
@@ -1124,7 +1124,10 @@ function artifactStages(
       const generated = options.commandRunner("candid-extractor", [options.wasmPath], options.cwd);
       if (generated.status !== 0) {
         stages.push(fail("did:generated", generated.output || "failed to extract DID from local wasm"));
-      } else if (generated.output.trim() !== did.trim()) {
+      } else if (
+        normalizeDidServiceConstructor(generated.output).trim() !==
+        normalizeDidServiceConstructor(did).trim()
+      ) {
         stages.push(fail("did:generated", "dist/facilitator.did does not match local wasm candid-extractor output"));
       } else {
         stages.push(ok("did:generated", "dist/facilitator.did matches local wasm"));
@@ -1249,9 +1252,6 @@ function nextCommands(
   if (stages.some((stage) => stage.name === "batch:receipt-confirmations" && stage.status === "fail")) {
     commands.push("set SETTLE_MIN_CONFIRMATIONS to 3 or higher for production batch receipt verification");
   }
-  if (stages.some((stage) => stage.name === "batch:storage-writer" && stage.status === "fail")) {
-    commands.push("set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to the resource server actor principal");
-  }
   if (stages.some((stage) => stage.name === "batch:settlement-fee" && stage.status === "fail")) {
     commands.push("set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer");
   }
@@ -1263,8 +1263,9 @@ function nextCommands(
     commands.push(canisterEnvSmokeCommand(environment, canister));
     commands.push(readinessCommand(environment, canister, requireBatchReceipt));
   }
-  if (stages.some((stage) => stage.name === "canister:batch-storage-writer" && stage.status === "fail")) {
-    commands.push(canisterEnvCommand(environment, canister));
+  if (stages.some((stage) => stage.name === "canister:batch-writer-scope" && stage.status === "fail")) {
+    commands.push(`icp canister call ${canister} batch_set_seller '("<receiver-address>", "active")' -e ${environment}`);
+    commands.push(`icp canister call ${canister} batch_set_writer_receiver_scope '(principal "<writer-principal>", "<receiver-address>", true)' -e ${environment}`);
     commands.push(readinessCommand(environment, canister, requireBatchReceipt));
   }
   if (stages.some((stage) => stage.name === "canister:batch-receiver-authorizer" && stage.status === "fail")) {
@@ -1298,17 +1299,8 @@ function nextCommands(
     commands.push(readinessCommand(environment, canister, requireBatchReceipt));
   }
   if (stages.some((stage) => stage.name === "canister:operational-safety" && stage.status === "fail")) {
-    const writerControllerConflict = stages.some((stage) => stage.name === "canister:operational-safety" && stage.detail === "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must not be a canister controller");
-    const writer = env.BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL?.trim();
-    if (writerControllerConflict) {
-      commands.push("set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to a non-controller resource server actor principal");
-      commands.push(canisterEnvCommand(environment, canister));
-    }
     commands.push(`icp canister settings update ${canister} --freezing-threshold 7776000 -e ${environment}`);
     commands.push(`icp canister settings update ${canister} --add-controller <backup-principal> -e ${environment}`);
-    if (writerControllerConflict && writer && isIcPrincipal(writer)) {
-      commands.push(`icp canister settings update ${canister} --remove-controller ${writer} -e ${environment}`);
-    }
     commands.push(readinessCommand(environment, canister, requireBatchReceipt));
   }
   if (stages.some((stage) => stage.name.startsWith("wasm:") && stage.status === "fail")) {
@@ -1357,8 +1349,6 @@ function preflightNextCommands(stageName: string): readonly string[] {
       return ["set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key"];
     case "batch:preflight:env:BATCH_SETTLEMENT_FEE_AMOUNT":
       return ["set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
-    case "batch:preflight:env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL":
-      return ["set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to the resource server actor principal"];
     default:
       return ["npm run preflight:batch"];
   }
@@ -1416,11 +1406,10 @@ export async function buildBatchProductionReadinessReport(
   });
   let stages = [
     ...await preflightStages(options),
-    batchStorageWriterStage(options.env),
     batchSettlementFeeStage(options.env),
     batchKeySeparationStage(options.env),
     canisterEnvStage(options.env, commandRunner, cwd),
-    canisterStorageWriterStage(options.env, commandRunner, cwd),
+    canisterWriterScopeStage(options.env, commandRunner, cwd),
     canisterReceiverAuthorizerStage(options.env, commandRunner, cwd),
     canisterSettlementContractStage(options.env, commandRunner, cwd),
     canisterSettlementFeeStage(options.env, commandRunner, cwd),

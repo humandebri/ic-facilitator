@@ -19,9 +19,6 @@ const MIN_BATCH_WITHDRAW_DELAY_SECONDS = 900;
 const MAX_BATCH_WITHDRAW_DELAY_SECONDS = 2_592_000;
 const ZERO_BYTES32: Hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
 const PROBE_RECEIVER: Address = "0x0000000000000000000000000000000000000001";
-const ANONYMOUS_PRINCIPAL = "2vxsx-fae";
-const MANAGEMENT_PRINCIPAL = "aaaaa-aa";
-const PRINCIPAL_BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 const UINT128_MAX = (1n << 128n) - 1n;
 
 const JPYC_ABI = parseAbi([
@@ -201,112 +198,6 @@ function batchSettlementFeeCheck(env: NodeJS.ProcessEnv): BatchMainnetPreflightC
   return ok("env:BATCH_SETTLEMENT_FEE_AMOUNT", amount);
 }
 
-function batchChannelStorageWriterCheck(env: NodeJS.ProcessEnv): BatchMainnetPreflightCheck {
-  const value = env.BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL;
-  if (!value || value.trim() === "") {
-    return fail("env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "未設定");
-  }
-  const principal = value.trim();
-  if (!isIcPrincipal(principal)) {
-    return fail("env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "IC principal ではない");
-  }
-  if (principal === ANONYMOUS_PRINCIPAL || principal === MANAGEMENT_PRINCIPAL) {
-    return fail("env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "system principal は不可");
-  }
-  return ok("env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", principal);
-}
-
-function isIcPrincipal(value: string): boolean {
-  const bytes = decodePrincipalText(value);
-  return bytes !== undefined && hasValidPrincipalChecksum(bytes);
-}
-
-function decodePrincipalText(value: string): number[] | undefined {
-  if (value !== value.toLowerCase()) {
-    return undefined;
-  }
-  const compact = value.replaceAll("-", "");
-  if (compact.length === 0) {
-    return undefined;
-  }
-  let buffer = 0;
-  let bits = 0;
-  const bytes: number[] = [];
-  for (const char of compact) {
-    const index = PRINCIPAL_BASE32_ALPHABET.indexOf(char);
-    if (index < 0) {
-      return undefined;
-    }
-    buffer = (buffer << 5) | index;
-    bits += 5;
-    while (bits >= 8) {
-      bits -= 8;
-      bytes.push((buffer >> bits) & 0xff);
-      buffer &= (1 << bits) - 1;
-    }
-  }
-  if (bytes.length < 4 || encodePrincipalText(bytes) !== value) {
-    return undefined;
-  }
-  return bytes;
-}
-
-function encodePrincipalText(bytes: readonly number[]): string {
-  let buffer = 0;
-  let bits = 0;
-  let compact = "";
-  for (const byte of bytes) {
-    buffer = (buffer << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      bits -= 5;
-      compact += PRINCIPAL_BASE32_ALPHABET.charAt((buffer >> bits) & 0x1f);
-      buffer &= (1 << bits) - 1;
-    }
-  }
-  if (bits > 0) {
-    compact += PRINCIPAL_BASE32_ALPHABET.charAt((buffer << (5 - bits)) & 0x1f);
-  }
-  return groupPrincipalText(compact);
-}
-
-function groupPrincipalText(compact: string): string {
-  const groups: string[] = [];
-  for (let index = 0; index < compact.length; index += 5) {
-    groups.push(compact.slice(index, index + 5));
-  }
-  return groups.join("-");
-}
-
-function hasValidPrincipalChecksum(bytes: readonly number[]): boolean {
-  const first = bytes[0];
-  const second = bytes[1];
-  const third = bytes[2];
-  const fourth = bytes[3];
-  if (first === undefined || second === undefined || third === undefined || fourth === undefined) {
-    return false;
-  }
-  const checksum = crc32(bytes.slice(4));
-  return (
-    first === ((checksum >>> 24) & 0xff) &&
-    second === ((checksum >>> 16) & 0xff) &&
-    third === ((checksum >>> 8) & 0xff) &&
-    fourth === (checksum & 0xff)
-  );
-}
-
-function crc32(bytes: readonly number[]): number {
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      const mask = -(crc & 1);
-      crc = (crc >>> 1) ^ (0xedb88320 & mask);
-    }
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
 function createReader(rpcUrl: string): BatchMainnetPreflightReader {
   const client = createPublicClient({
     chain: polygon,
@@ -408,8 +299,7 @@ export async function checkBatchMainnetPreflight(
     batchWithdrawDelayCheck(options.env),
     batchReceiverAuthorizerKeyCheck(options.env),
     batchAuthorizerKeySeparationCheck(options.env),
-    batchSettlementFeeCheck(options.env),
-    batchChannelStorageWriterCheck(options.env)
+    batchSettlementFeeCheck(options.env)
   ];
   const batchContract = batchContractCheck.address;
   const jpyc = DEFAULT_JPYC_POLYGON_ADDRESS;

@@ -221,8 +221,6 @@ function batchPreflightNextCommands(failure: string): readonly string[] {
       return ["set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key"];
     case "env:BATCH_SETTLEMENT_FEE_AMOUNT":
       return ["set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
-    case "env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL":
-      return ["set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to the resource server actor principal"];
     default:
       return ["npm run preflight:batch"];
   }

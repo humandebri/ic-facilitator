@@ -8,7 +8,6 @@ const facilitatorAddress = "0x1000000000000000000000000000000000000402";
 const receiverAuthorizerPrivateKey = `0x${"2".repeat(64)}`;
 const receiverAuthorizer = "0x1563915e194D8CfBA1943570603F7606A3115508";
 const batchSettlementContract = "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003";
-const writerPrincipal = "ryjl3-tyaaa-aaaaa-aaaba-cai";
 
 type SupportedKind = {
   readonly extra: Record<string, unknown>;
@@ -25,7 +24,6 @@ type SupportedResponse = {
 
 function env(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
-    BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: writerPrincipal,
     BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
     BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
     BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -284,21 +282,6 @@ describe("canister smoke", () => {
       })
     ).rejects.toThrow(`BATCH_SETTLEMENT_CONTRACT must equal official @x402/evm BATCH_SETTLEMENT_ADDRESS ${batchSettlementContract}`);
 
-    await expect(
-      checkCanisterSmoke({
-        env: env({ BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "2vxsx-fae" }),
-        fetchFn: responseFor(supportedWithBatch()),
-        requireBatch: true
-      })
-    ).rejects.toThrow("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal");
-
-    await expect(
-      checkCanisterSmoke({
-        env: env({ BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-caj" }),
-        fetchFn: responseFor(supportedWithBatch()),
-        requireBatch: true
-      })
-    ).rejects.toThrow("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal");
   });
 
   it("rejects batch support when withdrawDelay or version differs from env", async () => {

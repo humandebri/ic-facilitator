@@ -13,7 +13,7 @@ const envNamesOutput = `(
   vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "FACILITATOR_PUBLIC_ORIGIN"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_SERVICES"; "SELLER_CREDIT_PAY_TO"; "SELLER_CREDIT_TOPUP_AMOUNT"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLE_MIN_CONFIRMATIONS"; "SETTLEMENT_CACHE_TTL_SECONDS";},
 )`;
 const batchEnvNamesOutput = `(
-  vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "FACILITATOR_PUBLIC_ORIGIN"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_SERVICES"; "SELLER_CREDIT_PAY_TO"; "SELLER_CREDIT_TOPUP_AMOUNT"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLE_MIN_CONFIRMATIONS"; "SETTLEMENT_CACHE_TTL_SECONDS"; "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"; "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"; "BATCH_SETTLEMENT_CONTRACT"; "BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_WITHDRAW_DELAY_SECONDS";},
+  vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "FACILITATOR_PUBLIC_ORIGIN"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_SERVICES"; "SELLER_CREDIT_PAY_TO"; "SELLER_CREDIT_TOPUP_AMOUNT"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLE_MIN_CONFIRMATIONS"; "SETTLEMENT_CACHE_TTL_SECONDS"; "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"; "BATCH_SETTLEMENT_CONTRACT"; "BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_WITHDRAW_DELAY_SECONDS";},
 )`;
 
 describe("canister env smoke", () => {
@@ -45,11 +45,11 @@ describe("canister env smoke", () => {
     expect(checkCanisterEnvNames(batchEnvNamesOutput, "ic", "edge", { requireBatch: true })).toMatchObject({
       canister: "edge",
       environment: "ic",
-      names: expect.arrayContaining(["BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"])
+      names: expect.arrayContaining(["BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "BATCH_SETTLEMENT_CONTRACT"])
     });
 
     expect(() => checkCanisterEnvNames(envNamesOutput, "ic", "edge", { requireBatch: true })).toThrow(
-      "missing canister env names: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
+      "missing canister env names: BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
     );
   });
 
@@ -60,7 +60,7 @@ describe("canister env smoke", () => {
     const options = canisterEnvSmokeOptionsFromArgs(["node", "scripts/smoke_canister_env.ts", "--with-batch"]);
     expect(options).toEqual({ requireBatch: true });
     expect(() => checkCanisterEnvNames(envNamesOutput, "ic", "edge", options)).toThrow(
-      "missing canister env names: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
+      "missing canister env names: BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
     );
   });
 });

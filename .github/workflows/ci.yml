@@ -25,6 +25,6 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm audit --audit-level=high
-      - run: cargo install candid-extractor --locked
+      - run: cargo install candid-extractor --version 0.1.6 --locked
       - run: npm run did:generate
       - run: npm run did:check

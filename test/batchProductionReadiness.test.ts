@@ -1,4 +1,5 @@
 // test/batchProductionReadiness.test.ts: batch本番投入前レポートのready条件を確認する。
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, parseAbi } from "viem";
 import type { Address, Hex, TransactionReceipt } from "viem";
@@ -28,65 +29,10 @@ const backupControllerPrincipal = "rrkah-fqaaa-aaaaa-aaaaq-cai";
 const wasmBytes = Buffer.from("wasm");
 const wasmSha256 = "336154bf67f765f8f75d16a0accee61b5ee5f6a75b2a2905703df913bd550f3e";
 const canisterStatusOutput = canisterStatus(wasmSha256);
-const didBytes = Buffer.from(`
-type BatchChannel = record {
-  channel_id : text;
-  signature : text;
-  channel_config : BatchChannelConfig;
-  balance : text;
-  charged_cumulative_amount : text;
-  pending_request : opt BatchPendingRequest;
-  refund_nonce : text;
-  signed_max_claimable : text;
-  revision : nat64;
-  last_request_timestamp : nat64;
-  onchain_synced_at : opt nat64;
-  total_claimed : text;
-  withdraw_requested_at : nat64;
-};
-type BatchChannelConfig = record {
-  token : text;
-  withdraw_delay : nat64;
-  salt : text;
-  receiver_authorizer : text;
-  payer_authorizer : text;
-  payer : text;
-  receiver : text;
-};
-type BatchChannelUpdate = record { channel : opt BatchChannel };
-type BatchChannelUpdateResult = record {
-  status : text;
-  current_revision : opt nat64;
-  message : opt text;
-  channel : opt BatchChannel;
-};
-type BatchDeletedChannel = record {
-  deleted_at : nat64;
-  deleted_by : text;
-  channel : BatchChannel;
-};
-type BatchPendingRequest = record {
-  signed_max_claimable : text;
-  pending_id : text;
-  expires_at : nat64;
-};
-service : {
-  batch_channel : (text) -> (opt BatchChannel) query;
-  batch_channel_count : () -> (nat64) query;
-  batch_channel_storage_writer : () -> (opt principal) query;
-  batch_channels : (opt nat64) -> (vec BatchChannel) query;
-  batch_deleted_channel : (text) -> (opt BatchDeletedChannel) query;
-  batch_deleted_channel_count : () -> (nat64) query;
-  batch_deleted_channels : (opt nat64) -> (vec BatchDeletedChannel) query;
-  batch_receiver_authorizer : () -> (opt text) query;
-  batch_settlement_contract : () -> (opt text) query;
-  batch_settlement_fee_amount : () -> (opt text) query;
-  batch_update_channel : (text, opt nat64, BatchChannelUpdate) -> (BatchChannelUpdateResult);
-}
-`);
+const didBytes = readFileSync("dist/facilitator.did");
 const baseUrl = "https://canister.example.test";
 const batchEnvNamesOutput = `(
-  vec { "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"; "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"; "BATCH_SETTLEMENT_CONTRACT"; "BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_WITHDRAW_DELAY_SECONDS"; },
+  vec { "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"; "BATCH_SETTLEMENT_CONTRACT"; "BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_WITHDRAW_DELAY_SECONDS"; },
 )`;
 const readinessChannelId = `0x${"00".repeat(32)}`;
 
@@ -252,7 +198,6 @@ function env(): NodeJS.ProcessEnv {
     BATCH_REFUND_CHANNEL_ID: channelId,
     BATCH_REFUND_EXPECTED_MIN_REFUND_NONCE: "1",
     BATCH_REFUND_TX: refundHash,
-    BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: writerPrincipal,
     BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
     BATCH_SETTLEMENT_CONTRACT: batchContract,
     BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -372,8 +317,8 @@ function passingCommandRunner(command: string, args: readonly string[], _cwd = "
 }
 
 function batchStorageQueryOutput(args: readonly string[]): { readonly output: string; readonly status: number } | undefined {
-  if (args.includes("batch_channel_storage_writer")) {
-    return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
+  if (args.includes("batch_writer_receiver_scope_count")) {
+    return { output: "(1 : nat64)", status: 0 };
   }
   if (args.includes("batch_receiver_authorizer")) {
     return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
@@ -455,6 +400,12 @@ function batchDeletedChannelRecord(id = channelId): string {
 }
 
 describe("batch production readiness", () => {
+  it("keeps the committed DID as a constructorless service", () => {
+    const did = didBytes.toString("utf8");
+    expect(did).toContain("service : {");
+    expect(did).not.toContain("service : () ->");
+  });
+
   it("reports ready when preflight, all receipts, wasm, and DID checks pass", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -468,10 +419,8 @@ describe("batch production readiness", () => {
     expect(report.ready).toBe(true);
     expect(report.wasmSha256).toBe(wasmSha256);
     expect(report.stages.map((stage) => stage.name)).toEqual(expect.arrayContaining([
-      "batch:storage-writer",
       "batch:settlement-fee",
       "batch:key-separation",
-      "canister:batch-storage-writer",
       "canister:batch-receiver-authorizer",
       "canister:batch-settlement-contract",
       "canister:batch-settlement-fee",
@@ -505,7 +454,6 @@ describe("batch production readiness", () => {
 
     expect(report.ready).toBe(true);
     expect(report.stages.some((stage) => stage.name.startsWith("batch:receipt"))).toBe(false);
-    expect(report.stages.some((stage) => stage.name === "batch:storage-writer")).toBe(true);
     expect(report.stages.some((stage) => stage.name === "batch:settlement-fee")).toBe(true);
   });
 
@@ -530,53 +478,6 @@ describe("batch production readiness", () => {
     expect(report.ready).toBe(false);
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch:preflight");
     expect(report.nextCommands).not.toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch");
-  });
-
-  it("fails when the batch storage writer principal is missing, invalid, or system-owned", async () => {
-    const missing = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-    expect(missing.ready).toBe(false);
-    expect(missing.stages).toContainEqual({
-      detail: "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL is required",
-      name: "batch:storage-writer",
-      status: "fail"
-    });
-
-    const invalid = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-caj" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-    expect(invalid.ready).toBe(false);
-    expect(invalid.stages).toContainEqual({
-      detail: "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal",
-      name: "batch:storage-writer",
-      status: "fail"
-    });
-
-    const anonymous = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "2vxsx-fae" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-    expect(anonymous.ready).toBe(false);
-    expect(anonymous.stages).toContainEqual({
-      detail: "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal",
-      name: "batch:storage-writer",
-      status: "fail"
-    });
   });
 
   it("fails when batch receiver authorizer and facilitator keys derive the same address", async () => {
@@ -778,7 +679,6 @@ describe("batch production readiness", () => {
       commandRunner: passingCommandRunner,
       env: {
         ...env(),
-        BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "",
         BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: "",
         BATCH_SETTLEMENT_CONTRACT: "",
         BATCH_SETTLEMENT_FEE_AMOUNT: "",
@@ -795,7 +695,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands).toContain(`set BATCH_SETTLEMENT_CONTRACT=${batchContract}`);
     expect(report.nextCommands).toContain("set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key");
     expect(report.nextCommands).toContain("set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer");
-    expect(report.nextCommands).toContain("set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to the resource server actor principal");
     expect(report.nextCommands).toContain("set BATCH_WITHDRAW_DELAY_SECONDS to the deployed batch withdraw delay in seconds");
   });
 
@@ -879,11 +778,10 @@ describe("batch production readiness", () => {
     });
 
     expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "missing canister batch env names: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL, BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY, BATCH_SETTLEMENT_FEE_AMOUNT, BATCH_WITHDRAW_DELAY_SECONDS",
+    expect(report.stages).toContainEqual(expect.objectContaining({
       name: "canister:batch-env",
       status: "fail"
-    });
+    }));
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=ic npm run ic:env:mainnet");
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=ic ICP_CANISTER=edge npm run smoke:canister:env -- --with-batch");
     expect(report.nextCommands.filter((command) => command === "ICP_ENVIRONMENT=ic npm run ic:env:mainnet")).toHaveLength(1);
@@ -1092,42 +990,6 @@ describe("batch production readiness", () => {
     }
   });
 
-  it("fails when deployed canister storage writer differs from local env", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "rrkah-fqaaa-aaaaa-aaaaq-cai")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp") {
-          const batchQuery = batchStorageQueryOutput(args);
-          if (batchQuery !== undefined) {
-            return batchQuery;
-          }
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: `expected ${writerPrincipal}, got rrkah-fqaaa-aaaaa-aaaaq-cai`,
-      name: "canister:batch-storage-writer",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("ICP_ENVIRONMENT=ic npm run ic:env:mainnet");
-  });
-
   it("fails when deployed canister batch settlement fee differs from local env", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -1135,9 +997,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
           return { output: `(opt "101")`, status: 0 };
         }
@@ -1175,9 +1037,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_settlement_contract")) {
           return { output: `(opt "${otherContract}")`, status: 0 };
         }
@@ -1239,9 +1101,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${otherAuthorizer}")`, status: 0 };
         }
@@ -1284,9 +1146,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `warning "stale" (opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -1424,49 +1286,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands).toContain("icp canister settings update batch-edge --freezing-threshold 7776000 -e staging");
     expect(report.nextCommands).toContain("icp canister settings update batch-edge --add-controller <backup-principal> -e staging");
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch:preflight");
-  });
-
-  it("fails when the batch storage writer is also a canister controller", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("status")) {
-          return {
-            output: canisterStatus(wasmSha256, {
-              controllers: [writerPrincipal, backupControllerPrincipal],
-              cycles: "2000000000000",
-              freezingThreshold: "7776000"
-            }),
-            status: 0
-          };
-        }
-        if (command === "icp") {
-          const batchQuery = batchStorageQueryOutput(args);
-          if (batchQuery !== undefined) {
-            return batchQuery;
-          }
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must not be a canister controller",
-      name: "canister:operational-safety",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("set BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL to a non-controller resource server actor principal");
-    expect(report.nextCommands).toContain("ICP_ENVIRONMENT=ic npm run ic:env:mainnet");
-    expect(report.nextCommands).toContain(`icp canister settings update edge --remove-controller ${writerPrincipal} -e ic`);
-    expect(report.nextCommands).toContain("icp canister settings update edge --add-controller <backup-principal> -e ic");
-    expect(report.nextCommands.indexOf("icp canister settings update edge --add-controller <backup-principal> -e ic"))
-      .toBeLessThan(report.nextCommands.indexOf(`icp canister settings update edge --remove-controller ${writerPrincipal} -e ic`));
   });
 
   it("uses the selected canister and environment in canister env and deploy next commands", async () => {
@@ -1651,9 +1470,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -1693,9 +1512,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -1735,9 +1554,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -1783,9 +1602,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -1933,9 +1752,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -1984,9 +1803,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2032,9 +1851,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2080,9 +1899,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2135,9 +1954,9 @@ describe("batch production readiness", () => {
           if (command === "icp" && args.includes("env_names")) {
             return { output: batchEnvNamesOutput, status: 0 };
           }
-          if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-            return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-          }
+            if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+              return { output: "(1 : nat64)", status: 0 };
+            }
           if (command === "icp" && args.includes("batch_receiver_authorizer")) {
             return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
           }
@@ -2185,9 +2004,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2248,9 +2067,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2296,9 +2115,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2344,9 +2163,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2392,9 +2211,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2440,9 +2259,9 @@ describe("batch production readiness", () => {
         if (command === "icp" && args.includes("env_names")) {
           return { output: batchEnvNamesOutput, status: 0 };
         }
-        if (command === "icp" && args.includes("batch_channel_storage_writer")) {
-          return { output: `(opt principal "${writerPrincipal}")`, status: 0 };
-        }
+          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
+            return { output: "(1 : nat64)", status: 0 };
+          }
         if (command === "icp" && args.includes("batch_receiver_authorizer")) {
           return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
         }
@@ -2516,7 +2335,6 @@ service : {
 type NotService = record {
   batch_channel : text;
   batch_channel_count : text;
-  batch_channel_storage_writer : text;
   batch_channels : text;
   batch_deleted_channel : text;
   batch_deleted_channel_count : text;
@@ -2564,7 +2382,6 @@ type BatchDeletedChannel = record {
 service : {
   batch_channel : (text) -> (opt BatchChannel) query;
   batch_channel_count : () -> (nat64) query;
-  batch_channel_storage_writer : () -> (opt principal) query;
   batch_channels : (opt nat64) -> (vec BatchChannel) query;
   batch_deleted_channel : (text) -> (opt BatchDeletedChannel) query;
   batch_deleted_channel_count : () -> (nat64) query;

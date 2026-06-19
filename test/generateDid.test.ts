@@ -32,6 +32,20 @@ describe("generateDid", () => {
     expect(readFileSync(didPath, "utf8")).toBe(generated);
   });
 
+  it("normalizes a no-arg service constructor for committed DID compatibility", () => {
+    const didPath = tempDidPath();
+
+    generateDid({
+      didPath,
+      runCandidExtractor() {
+        return ok("service : () -> { ping : () -> (); }\n");
+      },
+      wasmPath: "facilitator.wasm"
+    });
+
+    expect(readFileSync(didPath, "utf8")).toBe("service : { ping : () -> (); }\n");
+  });
+
   it("does not overwrite an existing DID when candid-extractor fails", () => {
     const didPath = tempDidPath();
     const existing = "service : { old : () -> (); }\n";

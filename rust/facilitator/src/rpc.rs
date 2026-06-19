@@ -29,6 +29,21 @@ pub enum SettlementOutcome {
     Failed { tx: String, message: String },
 }
 
+pub enum ContractSettlementOutcome {
+    Settled {
+        tx: String,
+        settled_amount: Option<String>,
+    },
+    Pending {
+        nonce: u128,
+        tx: String,
+    },
+    Failed {
+        tx: String,
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettlementSendError {
     GasTooExpensive,
@@ -56,35 +71,10 @@ pub struct FeeQuote {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractExpectation {
-    Deposit {
-        channel_id: String,
-        payer: String,
-        token: String,
-        deposit_amount: String,
-        max_claimable_amount: String,
-        min_balance: String,
-    },
-    Claim {
-        claims: Vec<ExpectedClaimState>,
-    },
-    Settle {
-        receiver: String,
-        token: String,
-        expected_amount: Option<String>,
-        min_total_settled: Option<String>,
-    },
-    Refund {
-        channel_id: String,
-        refund_nonce: String,
-        min_refund_nonce: String,
-        claims: Vec<ExpectedClaimState>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExpectedClaimState {
-    pub channel_id: String,
-    pub min_total_claimed: String,
+    Deposit,
+    Claim,
+    Settle { receiver: String, token: String },
+    Refund,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, CandidDeserialize)]
@@ -108,36 +98,17 @@ impl BatchChannelSnapshot {
     }
 }
 
-pub async fn batch_channel_snapshot(
+pub async fn batch_unsettled_amount(
     config: &RpcConfig,
-    contract: &[u8; 20],
-    channel_id: &str,
-) -> Result<BatchChannelSnapshot, String> {
-    let channel = batch_channel_state(config, contract, channel_id).await?;
-    let withdraw_requested_at = batch_pending_withdrawal(config, contract, channel_id).await?;
-    let refund_nonce = batch_refund_nonce(config, contract, channel_id).await?;
-    Ok(BatchChannelSnapshot {
-        channel_id: channel_id.to_string(),
-        balance: channel.balance,
-        total_claimed: channel.total_claimed,
-        withdraw_requested_at,
-        refund_nonce,
-    })
-}
-
-pub async fn batch_settled_amount(
-    config: &RpcConfig,
-    tx: &str,
     contract: &[u8; 20],
     receiver: &str,
     token: &str,
-) -> Result<String, String> {
-    let result = rpc_value(config, "eth_getTransactionReceipt", json!([tx])).await?;
-    if result.is_null() {
-        return Err("settlement receipt is pending".to_string());
+) -> Result<Option<String>, String> {
+    let state = batch_receiver_state(config, contract, receiver, token).await?;
+    if !settle_has_unsettled_amount(&state.total_claimed, &state.total_settled) {
+        return Ok(None);
     }
-    settled_event_amount(&result, contract, receiver, token)
-        .ok_or_else(|| "expected batch Settled event not found".to_string())
+    decimal_sub(&state.total_claimed, &state.total_settled).map(Some)
 }
 
 pub async fn send_settlement(
@@ -196,12 +167,8 @@ pub async fn send_contract_transaction(
     data: Vec<u8>,
     nonce: u128,
     expectation: &ContractExpectation,
-) -> Result<SettlementOutcome, SettlementSendError> {
+) -> Result<ContractSettlementOutcome, SettlementSendError> {
     let from = crate::private_key_address(private_key)?;
-    let expectation = match preflight_contract_expectation(config, &to, expectation).await? {
-        ContractPreflight::Ready(expectation) => expectation,
-        ContractPreflight::Noop => return Ok(SettlementOutcome::Settled(String::new())),
-    };
     let fees = fee_quote(config).await?;
     let estimate = rpc_hex_u128(
         config,
@@ -238,8 +205,8 @@ pub async fn send_contract_transaction(
         private_key,
     )?;
     let tx = send_raw_transaction(config, &raw).await?;
-    let status = receipt_status_for_contract_tx(config, &tx, &to, Some(&from), &expectation).await;
-    Ok(post_broadcast_outcome(tx, nonce, status))
+    let status = receipt_status_for_contract_tx(config, &tx, &to, Some(&from), expectation).await;
+    Ok(post_contract_broadcast_outcome(tx, nonce, status))
 }
 
 fn ensure_settlement_fee_cap(
@@ -280,16 +247,21 @@ pub async fn refresh_contract_settlement(
     expected_to: &[u8; 20],
     expected_from: Option<&str>,
     expectation: &ContractExpectation,
-) -> Result<SettlementOutcome, String> {
+) -> Result<ContractSettlementOutcome, String> {
     match receipt_status_for_contract_tx(config, tx, expected_to, expected_from, expectation)
         .await?
     {
-        ReceiptStatus::Success => Ok(SettlementOutcome::Settled(tx.to_string())),
-        ReceiptStatus::Pending => Ok(SettlementOutcome::Pending {
+        ContractReceiptStatus::Success { settled_amount } => {
+            Ok(ContractSettlementOutcome::Settled {
+                tx: tx.to_string(),
+                settled_amount,
+            })
+        }
+        ContractReceiptStatus::Pending => Ok(ContractSettlementOutcome::Pending {
             nonce: 0,
             tx: tx.to_string(),
         }),
-        ReceiptStatus::Failed(message) => Ok(SettlementOutcome::Failed {
+        ContractReceiptStatus::Failed(message) => Ok(ContractSettlementOutcome::Failed {
             tx: tx.to_string(),
             message,
         }),
@@ -320,36 +292,32 @@ async fn receipt_status_for_contract_tx(
     expected_to: &[u8; 20],
     expected_from: Option<&str>,
     expectation: &ContractExpectation,
-) -> Result<ReceiptStatus, String> {
+) -> Result<ContractReceiptStatus, String> {
     let result = rpc_value(config, "eth_getTransactionReceipt", json!([tx])).await?;
     if result.is_null() {
-        return Ok(ReceiptStatus::Pending);
+        return Ok(ContractReceiptStatus::Pending);
     }
     let latest_block = rpc_hex_u128(config, "eth_blockNumber", json!([])).await?;
-    let status = receipt_status_for_contract(
+    Ok(receipt_status_for_contract(
         &result,
         expected_to,
         expected_from,
         expectation,
         latest_block,
         config.min_confirmations,
-    );
-    if status != ReceiptStatus::Success {
-        return Ok(status);
-    }
-    let settled_event_amount = contract_settle_event_amount(&result, expected_to, expectation);
-    post_state_status(
-        config,
-        expected_to,
-        expectation,
-        settled_event_amount.as_deref(),
-    )
-    .await
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReceiptStatus {
     Success,
+    Failed(String),
+    Pending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContractReceiptStatus {
+    Success { settled_amount: Option<String> },
     Failed(String),
     Pending,
 }
@@ -363,6 +331,24 @@ fn post_broadcast_outcome(
         Ok(ReceiptStatus::Success) => SettlementOutcome::Settled(tx),
         Ok(ReceiptStatus::Pending) | Err(_) => SettlementOutcome::Pending { nonce, tx },
         Ok(ReceiptStatus::Failed(message)) => SettlementOutcome::Failed { tx, message },
+    }
+}
+
+fn post_contract_broadcast_outcome(
+    tx: String,
+    nonce: u128,
+    status: Result<ContractReceiptStatus, String>,
+) -> ContractSettlementOutcome {
+    match status {
+        Ok(ContractReceiptStatus::Success { settled_amount }) => {
+            ContractSettlementOutcome::Settled { tx, settled_amount }
+        }
+        Ok(ContractReceiptStatus::Pending) | Err(_) => {
+            ContractSettlementOutcome::Pending { nonce, tx }
+        }
+        Ok(ContractReceiptStatus::Failed(message)) => {
+            ContractSettlementOutcome::Failed { tx, message }
+        }
     }
 }
 
@@ -414,22 +400,22 @@ fn receipt_status_for_contract(
     expectation: &ContractExpectation,
     latest_block: u128,
     min_confirmations: u64,
-) -> ReceiptStatus {
+) -> ContractReceiptStatus {
     match result.get("status").and_then(Value::as_str) {
-        Some("0x0") => return ReceiptStatus::Failed("settlement tx failed".to_string()),
+        Some("0x0") => return ContractReceiptStatus::Failed("settlement tx failed".to_string()),
         Some("0x1") => {}
-        _ => return ReceiptStatus::Pending,
+        _ => return ContractReceiptStatus::Pending,
     }
     let Some(block_number) = result
         .get("blockNumber")
         .and_then(Value::as_str)
         .and_then(|value| parse_hex_quantity("blockNumber", value).ok())
     else {
-        return ReceiptStatus::Pending;
+        return ContractReceiptStatus::Pending;
     };
     let confirmations = latest_block.saturating_sub(block_number).saturating_add(1);
     if confirmations < u128::from(min_confirmations) {
-        return ReceiptStatus::Pending;
+        return ContractReceiptStatus::Pending;
     }
     let expected_to_address = crate::hexutil::address_hex(expected_to);
     if !result
@@ -438,7 +424,7 @@ fn receipt_status_for_contract(
         .map(|to| crate::hexutil::same_address(to, &expected_to_address))
         .unwrap_or(false)
     {
-        return ReceiptStatus::Failed("settlement tx recipient mismatch".to_string());
+        return ContractReceiptStatus::Failed("settlement tx recipient mismatch".to_string());
     }
     if expected_from.is_some_and(|from| {
         !result
@@ -447,260 +433,21 @@ fn receipt_status_for_contract(
             .map(|actual| crate::hexutil::same_address(actual, from))
             .unwrap_or(false)
     }) {
-        return ReceiptStatus::Failed("settlement tx sender mismatch".to_string());
+        return ContractReceiptStatus::Failed("settlement tx sender mismatch".to_string());
     }
-    if let ContractExpectation::Settle {
-        receiver,
-        token,
-        expected_amount,
-        ..
-    } = expectation
-    {
+    let mut settled_amount = None;
+    if let ContractExpectation::Settle { receiver, token } = expectation {
         let Some(amount) = settled_event_amount(result, expected_to, receiver, token) else {
-            return ReceiptStatus::Failed("expected batch Settled event not found".to_string());
+            return ContractReceiptStatus::Failed(
+                "expected batch Settled event not found".to_string(),
+            );
         };
-        if !decimal_greater(&amount, "0")
-            || expected_amount
-                .as_ref()
-                .is_some_and(|expected| !decimal_equal(&amount, expected))
-        {
-            return ReceiptStatus::Failed("batch settled amount mismatch".to_string());
+        if !decimal_greater(&amount, "0") {
+            return ContractReceiptStatus::Failed("batch settled amount mismatch".to_string());
         }
+        settled_amount = Some(amount);
     }
-    ReceiptStatus::Success
-}
-
-fn contract_settle_event_amount(
-    result: &Value,
-    expected_to: &[u8; 20],
-    expectation: &ContractExpectation,
-) -> Option<String> {
-    if let ContractExpectation::Settle {
-        receiver, token, ..
-    } = expectation
-    {
-        return settled_event_amount(result, expected_to, receiver, token);
-    }
-    None
-}
-
-async fn post_state_status(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    expectation: &ContractExpectation,
-    settled_event_amount: Option<&str>,
-) -> Result<ReceiptStatus, String> {
-    match expectation {
-        ContractExpectation::Deposit {
-            channel_id,
-            min_balance,
-            ..
-        } => {
-            let state = batch_channel_state(config, contract, channel_id).await?;
-            if decimal_at_least(&state.balance, min_balance) {
-                Ok(ReceiptStatus::Success)
-            } else {
-                Ok(ReceiptStatus::Failed(
-                    "batch deposit post-state balance mismatch".to_string(),
-                ))
-            }
-        }
-        ContractExpectation::Claim { claims } => {
-            if batch_claims_reached(config, contract, claims).await? {
-                Ok(ReceiptStatus::Success)
-            } else {
-                Ok(ReceiptStatus::Failed(
-                    "batch claim post-state totalClaimed mismatch".to_string(),
-                ))
-            }
-        }
-        ContractExpectation::Settle {
-            receiver,
-            token,
-            min_total_settled,
-            ..
-        } => {
-            let state = batch_receiver_state(config, contract, receiver, token).await?;
-            Ok(settle_post_state_status(
-                &state,
-                min_total_settled.as_ref(),
-                settled_event_amount,
-            ))
-        }
-        ContractExpectation::Refund {
-            channel_id,
-            refund_nonce: _,
-            min_refund_nonce,
-            claims,
-        } => {
-            if !claims.is_empty() && !batch_claims_reached(config, contract, claims).await? {
-                return Ok(ReceiptStatus::Failed(
-                    "batch refund claim post-state totalClaimed mismatch".to_string(),
-                ));
-            }
-            let nonce = batch_refund_nonce(config, contract, channel_id).await?;
-            if decimal_at_least(&nonce, min_refund_nonce) {
-                Ok(ReceiptStatus::Success)
-            } else {
-                Ok(ReceiptStatus::Failed(
-                    "batch refund post-state nonce mismatch".to_string(),
-                ))
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ContractPreflight {
-    Ready(ContractExpectation),
-    Noop,
-}
-
-async fn preflight_contract_expectation(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    expectation: &ContractExpectation,
-) -> Result<ContractPreflight, String> {
-    match expectation {
-        ContractExpectation::Deposit {
-            channel_id,
-            payer,
-            token,
-            deposit_amount,
-            max_claimable_amount,
-            ..
-        } => {
-            let state = batch_channel_state(config, contract, channel_id).await?;
-            let payer_balance = erc20_balance(config, token, payer).await?;
-            let effective_balance = validate_deposit_pre_state(
-                &payer_balance,
-                &state.balance,
-                &state.total_claimed,
-                deposit_amount,
-                max_claimable_amount,
-            )?;
-            Ok(ContractPreflight::Ready(ContractExpectation::Deposit {
-                channel_id: channel_id.clone(),
-                payer: payer.clone(),
-                token: token.clone(),
-                deposit_amount: deposit_amount.clone(),
-                max_claimable_amount: max_claimable_amount.clone(),
-                min_balance: effective_balance,
-            }))
-        }
-        ContractExpectation::Claim { claims } => {
-            preflight_claims(config, contract, claims).await?;
-            Ok(ContractPreflight::Ready(expectation.clone()))
-        }
-        ContractExpectation::Settle {
-            receiver, token, ..
-        } => {
-            let state = batch_receiver_state(config, contract, receiver, token).await?;
-            if !settle_has_unsettled_amount(&state.total_claimed, &state.total_settled) {
-                return Ok(ContractPreflight::Noop);
-            }
-            let expected_amount = decimal_sub(&state.total_claimed, &state.total_settled)?;
-            Ok(ContractPreflight::Ready(ContractExpectation::Settle {
-                receiver: receiver.clone(),
-                token: token.clone(),
-                expected_amount: Some(expected_amount),
-                min_total_settled: Some(state.total_claimed),
-            }))
-        }
-        ContractExpectation::Refund {
-            channel_id,
-            refund_nonce,
-            min_refund_nonce: _,
-            claims,
-        } => {
-            let nonce = batch_refund_nonce(config, contract, channel_id).await?;
-            validate_refund_pre_state(&nonce, refund_nonce)?;
-            if !claims.is_empty() {
-                preflight_claims(config, contract, claims).await?;
-            }
-            Ok(ContractPreflight::Ready(expectation.clone()))
-        }
-    }
-}
-
-async fn preflight_claims(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    claims: &[ExpectedClaimState],
-) -> Result<(), String> {
-    for claim in claims {
-        let state = batch_channel_state(config, contract, &claim.channel_id).await?;
-        validate_claim_pre_state(
-            &state.balance,
-            &state.total_claimed,
-            &claim.min_total_claimed,
-        )?;
-    }
-    Ok(())
-}
-
-async fn batch_claims_reached(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    claims: &[ExpectedClaimState],
-) -> Result<bool, String> {
-    for claim in claims {
-        let state = batch_channel_state(config, contract, &claim.channel_id).await?;
-        if !decimal_at_least(&state.total_claimed, &claim.min_total_claimed) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BatchChannelState {
-    balance: String,
-    total_claimed: String,
-}
-
-async fn batch_channel_state(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    channel_id: &str,
-) -> Result<BatchChannelState, String> {
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&selector("channels(bytes32)"));
-    data.extend_from_slice(&parse_hex(channel_id, Some(32))?);
-    let result = eth_call(config, contract, data).await?;
-    let words = parse_words(&result, 2, "channels")?;
-    Ok(BatchChannelState {
-        balance: uint128_hex_decimal_word(&words[0], "channels.balance")?,
-        total_claimed: uint128_hex_decimal_word(&words[1], "channels.totalClaimed")?,
-    })
-}
-
-async fn batch_refund_nonce(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    channel_id: &str,
-) -> Result<String, String> {
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&selector("refundNonce(bytes32)"));
-    data.extend_from_slice(&parse_hex(channel_id, Some(32))?);
-    let result = eth_call(config, contract, data).await?;
-    let words = parse_words(&result, 1, "refundNonce")?;
-    Ok(uint256_hex_decimal_word(&words[0]))
-}
-
-async fn batch_pending_withdrawal(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    channel_id: &str,
-) -> Result<u64, String> {
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&selector("pendingWithdrawals(bytes32)"));
-    data.extend_from_slice(&parse_hex(channel_id, Some(32))?);
-    let result = eth_call(config, contract, data).await?;
-    let words = parse_words(&result, 2, "pendingWithdrawals")?;
-    uint256_hex_decimal_word(&words[1])
-        .parse::<u64>()
-        .map_err(|_| "pendingWithdrawals.initiatedAt overflow".to_string())
+    ContractReceiptStatus::Success { settled_amount }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -727,17 +474,6 @@ async fn batch_receiver_state(
         total_claimed: uint128_hex_decimal_word(&words[0], "receivers.totalClaimed")?,
         total_settled: uint128_hex_decimal_word(&words[1], "receivers.totalSettled")?,
     })
-}
-
-async fn erc20_balance(config: &RpcConfig, token: &str, owner: &str) -> Result<String, String> {
-    let token = parse_address(token, "token")?;
-    let owner = parse_address(owner, "owner")?;
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&selector("balanceOf(address)"));
-    data.extend_from_slice(&address_word(&owner));
-    let result = eth_call(config, &token, data).await?;
-    let words = parse_words(&result, 1, "balanceOf")?;
-    Ok(uint256_hex_decimal_word(&words[0]))
 }
 
 async fn eth_call(
@@ -1123,10 +859,6 @@ fn decimal_greater(left: &str, right: &str) -> bool {
     decimal_at_least(left, right) && decimal_normalize(left) != decimal_normalize(right)
 }
 
-fn decimal_equal(left: &str, right: &str) -> bool {
-    decimal_normalize(left) == decimal_normalize(right)
-}
-
 fn decimal_normalize(value: &str) -> &str {
     let value = value.trim_start_matches('0');
     if value.is_empty() {
@@ -1198,66 +930,8 @@ fn decimal_sub(left: &str, right: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| "decimal subtraction failed".to_string())
 }
 
-fn validate_deposit_pre_state(
-    payer_balance: &str,
-    channel_balance: &str,
-    total_claimed: &str,
-    deposit_amount: &str,
-    max_claimable_amount: &str,
-) -> Result<String, String> {
-    if !decimal_at_least(payer_balance, deposit_amount) {
-        return Err("invalid_batch_settlement_evm_insufficient_balance".to_string());
-    }
-    let effective_balance = decimal_add(channel_balance, deposit_amount)?;
-    if !decimal_at_least(&effective_balance, max_claimable_amount) {
-        return Err("invalid_batch_settlement_evm_cumulative_exceeds_balance".to_string());
-    }
-    if !decimal_greater(max_claimable_amount, total_claimed) {
-        return Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string());
-    }
-    Ok(effective_balance)
-}
-
-fn validate_claim_pre_state(
-    balance: &str,
-    total_claimed: &str,
-    min_total_claimed: &str,
-) -> Result<(), String> {
-    if !decimal_greater(min_total_claimed, total_claimed) {
-        return Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string());
-    }
-    if !decimal_at_least(balance, min_total_claimed) {
-        return Err("invalid_batch_settlement_evm_cumulative_exceeds_balance".to_string());
-    }
-    Ok(())
-}
-
 fn settle_has_unsettled_amount(total_claimed: &str, total_settled: &str) -> bool {
     decimal_greater(total_claimed, total_settled)
-}
-
-fn settle_post_state_status(
-    state: &BatchReceiverState,
-    min_total_settled: Option<&String>,
-    settled_event_amount: Option<&str>,
-) -> ReceiptStatus {
-    if decimal_greater(&state.total_settled, &state.total_claimed) {
-        return ReceiptStatus::Failed("batch receiver totalClaimed below totalSettled".to_string());
-    }
-    if settled_event_amount.is_some_and(|amount| !decimal_at_least(&state.total_settled, amount)) {
-        return ReceiptStatus::Failed("batch receiver totalSettled below event amount".to_string());
-    }
-    if min_total_settled.is_some_and(|minimum| !decimal_at_least(&state.total_settled, minimum)) {
-        return ReceiptStatus::Failed("batch receiver totalSettled mismatch".to_string());
-    }
-    ReceiptStatus::Success
-}
-
-fn validate_refund_pre_state(onchain_nonce: &str, refund_nonce: &str) -> Result<(), String> {
-    if !decimal_equal(onchain_nonce, refund_nonce) {
-        return Err("invalid_batch_settlement_evm_refund_payload".to_string());
-    }
-    Ok(())
 }
 
 fn decimal_mul_small(value: &str, factor: u16) -> String {
@@ -1482,8 +1156,6 @@ mod tests {
         let expectation = ContractExpectation::Settle {
             receiver: "0x1000000000000000000000000000000000000402".to_string(),
             token: JPYC_POLYGON_ADDRESS.to_string(),
-            expected_amount: Some("100".to_string()),
-            min_total_settled: Some("100".to_string()),
         };
         let success_receipt = json!({
             "status":"0x1",
@@ -1511,7 +1183,9 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Success
+            ContractReceiptStatus::Success {
+                settled_amount: Some("100".to_string())
+            }
         );
 
         let mut split_events = success_receipt.clone();
@@ -1528,7 +1202,9 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Success
+            ContractReceiptStatus::Success {
+                settled_amount: Some("100".to_string())
+            }
         );
 
         let mut receipt_sender_mismatch = success_receipt.clone();
@@ -1542,7 +1218,7 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Failed("settlement tx sender mismatch".to_string())
+            ContractReceiptStatus::Failed("settlement tx sender mismatch".to_string())
         );
 
         let mut removed_event = success_receipt.clone();
@@ -1556,7 +1232,7 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Failed("expected batch Settled event not found".to_string())
+            ContractReceiptStatus::Failed("expected batch Settled event not found".to_string())
         );
 
         let mut missing_event = success_receipt.clone();
@@ -1570,7 +1246,7 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Failed("expected batch Settled event not found".to_string())
+            ContractReceiptStatus::Failed("expected batch Settled event not found".to_string())
         );
 
         let mut sender_mismatch = success_receipt.clone();
@@ -1585,21 +1261,23 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Failed("expected batch Settled event not found".to_string())
+            ContractReceiptStatus::Failed("expected batch Settled event not found".to_string())
         );
 
-        let mut amount_mismatch = success_receipt.clone();
-        amount_mismatch["logs"][0]["data"] = json!("0x63");
+        let mut different_amount = success_receipt.clone();
+        different_amount["logs"][0]["data"] = json!("0x63");
         assert_eq!(
             receipt_status_for_contract(
-                &amount_mismatch,
+                &different_amount,
                 &contract,
                 Some("0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993"),
                 &expectation,
                 102,
                 3
             ),
-            ReceiptStatus::Failed("batch settled amount mismatch".to_string())
+            ContractReceiptStatus::Success {
+                settled_amount: Some("99".to_string())
+            }
         );
 
         let mut zero_amount = success_receipt.clone();
@@ -1613,7 +1291,7 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Failed("batch settled amount mismatch".to_string())
+            ContractReceiptStatus::Failed("batch settled amount mismatch".to_string())
         );
 
         let mut token_mismatch = success_receipt;
@@ -1628,7 +1306,7 @@ mod tests {
                 102,
                 3
             ),
-            ReceiptStatus::Failed("expected batch Settled event not found".to_string())
+            ContractReceiptStatus::Failed("expected batch Settled event not found".to_string())
         );
     }
 
@@ -1661,51 +1339,6 @@ mod tests {
             decimal_sub("1x", "1"),
             Err("decimal value must contain only digits".to_string())
         );
-        assert_eq!(
-            settle_post_state_status(
-                &BatchReceiverState {
-                    total_claimed: "100".to_string(),
-                    total_settled: "100".to_string(),
-                },
-                Some(&"100".to_string()),
-                Some("100")
-            ),
-            ReceiptStatus::Success
-        );
-        assert_eq!(
-            settle_post_state_status(
-                &BatchReceiverState {
-                    total_claimed: "100".to_string(),
-                    total_settled: "99".to_string(),
-                },
-                None,
-                Some("100")
-            ),
-            ReceiptStatus::Failed("batch receiver totalSettled below event amount".to_string())
-        );
-        assert_eq!(
-            settle_post_state_status(
-                &BatchReceiverState {
-                    total_claimed: "100".to_string(),
-                    total_settled: "99".to_string(),
-                },
-                Some(&"100".to_string()),
-                Some("99")
-            ),
-            ReceiptStatus::Failed("batch receiver totalSettled mismatch".to_string())
-        );
-        assert_eq!(
-            settle_post_state_status(
-                &BatchReceiverState {
-                    total_claimed: "99".to_string(),
-                    total_settled: "100".to_string(),
-                },
-                None,
-                None
-            ),
-            ReceiptStatus::Failed("batch receiver totalClaimed below totalSettled".to_string())
-        );
-
         let mut over_uint128 = [0u8; 32];
         over_uint128[15] = 1;
         assert_eq!(
@@ -1738,58 +1371,10 @@ mod tests {
     }
 
     #[test]
-    fn validates_batch_deposit_pre_state() {
-        assert_eq!(
-            validate_deposit_pre_state("1000", "100", "50", "200", "250").unwrap(),
-            "300"
-        );
-        assert_eq!(
-            validate_deposit_pre_state("1000", "100", "250", "200", "250"),
-            Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string())
-        );
-        assert_eq!(
-            validate_deposit_pre_state("199", "100", "50", "200", "250"),
-            Err("invalid_batch_settlement_evm_insufficient_balance".to_string())
-        );
-        assert_eq!(
-            validate_deposit_pre_state("1000", "100", "50", "100", "250"),
-            Err("invalid_batch_settlement_evm_cumulative_exceeds_balance".to_string())
-        );
-        assert_eq!(
-            validate_deposit_pre_state("1000", "100", "251", "200", "250"),
-            Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string())
-        );
-    }
-
-    #[test]
-    fn validates_batch_claim_and_settle_pre_state() {
-        assert!(validate_claim_pre_state("300", "100", "250").is_ok());
-        assert_eq!(
-            validate_claim_pre_state("300", "250", "250"),
-            Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string())
-        );
-        assert_eq!(
-            validate_claim_pre_state("249", "100", "250"),
-            Err("invalid_batch_settlement_evm_cumulative_exceeds_balance".to_string())
-        );
-
+    fn validates_batch_settle_noop_state() {
         assert!(settle_has_unsettled_amount("300", "100"));
         assert!(!settle_has_unsettled_amount("300", "300"));
         assert!(!settle_has_unsettled_amount("299", "300"));
-    }
-
-    #[test]
-    fn validates_batch_refund_nonce_exactly_before_broadcast() {
-        assert!(validate_refund_pre_state("3", "3").is_ok());
-        assert!(validate_refund_pre_state("0003", "3").is_ok());
-        assert_eq!(
-            validate_refund_pre_state("2", "3"),
-            Err("invalid_batch_settlement_evm_refund_payload".to_string())
-        );
-        assert_eq!(
-            validate_refund_pre_state("4", "3"),
-            Err("invalid_batch_settlement_evm_refund_payload".to_string())
-        );
     }
 
     #[test]

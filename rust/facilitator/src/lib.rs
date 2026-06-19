@@ -13,10 +13,16 @@ use std::collections::BTreeMap;
 
 use candid::{CandidType, Deserialize as CandidDeserialize, Principal};
 use ic_cdk::{post_upgrade, pre_upgrade, query, update};
-use ic_stable_structures::{
-    memory_manager::{MemoryId, MemoryManager, VirtualMemory},
-    DefaultMemoryImpl, StableBTreeMap,
+#[cfg(not(test))]
+use ic_sqlite_vfs::db::migrate::Migration;
+use ic_sqlite_vfs::stable::raw_memory::Memory as SqliteRawMemory;
+#[cfg(not(test))]
+use ic_sqlite_vfs::{params, Db as SqliteDb, DbError as SqliteDbError};
+use ic_sqlite_vfs::{
+    DbMemory as SqliteDbMemory, DefaultMemoryImpl as SqliteDefaultMemoryImpl, MemoryId,
+    MemoryManager as SqliteMemoryManager,
 };
+use ic_stable_structures::StableBTreeMap;
 use k256::ecdsa::SigningKey;
 use serde::Serialize;
 
@@ -35,14 +41,13 @@ use crate::facilitator::{
     validate_request_signature,
 };
 use crate::hexutil::{
-    address_hex, keccak256, parse_address, parse_hex, parse_u256_decimal, same_address,
-    JPYC_EIP712_NAME, JPYC_POLYGON_ADDRESS, NETWORK,
+    address_hex, keccak256, parse_address, parse_hex, same_address, JPYC_EIP712_NAME,
+    JPYC_POLYGON_ADDRESS, NETWORK,
 };
 use crate::rpc::{
-    batch_channel_snapshot, batch_settled_amount, pending_nonce, refresh_contract_settlement,
-    refresh_settlement, send_contract_transaction, send_settlement, BatchChannelSnapshot,
-    ContractExpectation, ExpectedClaimState, ExpectedTransfer, RpcConfig, SettlementOutcome,
-    SettlementSendError,
+    batch_unsettled_amount, pending_nonce, refresh_contract_settlement, refresh_settlement,
+    send_contract_transaction, send_settlement, BatchChannelSnapshot, ContractExpectation,
+    ContractSettlementOutcome, ExpectedTransfer, RpcConfig, SettlementOutcome, SettlementSendError,
 };
 use crate::state::SettlementRecord;
 use crate::tx::{
@@ -65,7 +70,7 @@ const DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS: u64 = 86_400;
 const GAS_TOO_EXPENSIVE_MESSAGE: &str = "estimated POL settlement fee exceeds configured cap";
 const SELLER_AUTH_MESSAGE_PREFIX: &str = "IC_JPYC_X402_SELLER_AUTH_V1";
 
-type Memory = VirtualMemory<DefaultMemoryImpl>;
+type Memory = StableMemoryAdapter;
 const ENV_MEM_ID: MemoryId = MemoryId::new(0);
 const SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(1);
 const SELLER_CREDITS_MEM_ID: MemoryId = MemoryId::new(2);
@@ -74,6 +79,57 @@ const ACTIVE_SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(4);
 const NONCES_MEM_ID: MemoryId = MemoryId::new(5);
 const BATCH_CHANNELS_MEM_ID: MemoryId = MemoryId::new(6);
 const BATCH_DELETED_CHANNELS_MEM_ID: MemoryId = MemoryId::new(7);
+#[cfg(not(test))]
+const SQLITE_MEMORY_ID: MemoryId = MemoryId::new(120);
+const BATCH_SQLITE_LIST_LIMIT: u64 = 1_000;
+
+#[cfg(not(test))]
+const BATCH_SQLITE_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    sql: "
+        CREATE TABLE sellers (
+            receiver_address TEXT PRIMARY KEY NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE writer_receiver_scopes (
+            writer_principal TEXT NOT NULL,
+            receiver_address TEXT NOT NULL,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            PRIMARY KEY(writer_principal, receiver_address)
+        );
+        CREATE INDEX writer_receiver_scopes_receiver_idx
+            ON writer_receiver_scopes(receiver_address);
+        CREATE TABLE payment_intents (
+            intent_id TEXT PRIMARY KEY NOT NULL,
+            receiver_address TEXT NOT NULL,
+            payer_address TEXT NOT NULL,
+            resource_url TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX payment_intents_receiver_idx
+            ON payment_intents(receiver_address);
+        CREATE TABLE batch_channel_bindings (
+            channel_id TEXT PRIMARY KEY NOT NULL,
+            receiver_address TEXT NOT NULL,
+            payer_address TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            intent_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX batch_channel_bindings_receiver_idx
+            ON batch_channel_bindings(receiver_address);
+    ",
+}];
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct StableState {
@@ -88,24 +144,84 @@ struct StableState {
 }
 
 thread_local! {
-    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
-        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+    static MEMORY_MANAGER: RefCell<SqliteMemoryManager<SqliteDefaultMemoryImpl>> =
+        RefCell::new(SqliteMemoryManager::init(SqliteDefaultMemoryImpl::default()));
     static ENV: RefCell<StableBTreeMap<String, String, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(ENV_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(ENV_MEM_ID)));
     static SETTLEMENTS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(SETTLEMENTS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(SETTLEMENTS_MEM_ID)));
     static SELLER_CREDITS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(SELLER_CREDITS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_CREDITS_MEM_ID)));
     static CREDITED_SETTLEMENTS: RefCell<StableBTreeMap<String, String, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(CREDITED_SETTLEMENTS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(CREDITED_SETTLEMENTS_MEM_ID)));
     static ACTIVE_SETTLEMENTS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(ACTIVE_SETTLEMENTS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(ACTIVE_SETTLEMENTS_MEM_ID)));
     static NONCES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(NONCES_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(NONCES_MEM_ID)));
     static BATCH_CHANNELS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(BATCH_CHANNELS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(BATCH_CHANNELS_MEM_ID)));
     static BATCH_DELETED_CHANNELS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(BATCH_DELETED_CHANNELS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(BATCH_DELETED_CHANNELS_MEM_ID)));
+}
+
+#[derive(Clone)]
+struct StableMemoryAdapter(SqliteDbMemory);
+
+fn stable_memory(id: MemoryId) -> StableMemoryAdapter {
+    StableMemoryAdapter(MEMORY_MANAGER.with(|manager| manager.borrow().get(id)))
+}
+
+impl ic_stable_structures::Memory for StableMemoryAdapter {
+    fn size(&self) -> u64 {
+        SqliteRawMemory::size(&self.0)
+    }
+
+    fn grow(&self, pages: u64) -> i64 {
+        SqliteRawMemory::grow(&self.0, pages)
+    }
+
+    fn read(&self, offset: u64, dst: &mut [u8]) {
+        SqliteRawMemory::read(&self.0, offset, dst);
+    }
+
+    unsafe fn read_unsafe(&self, offset: u64, dst: *mut u8, count: usize) {
+        SqliteRawMemory::read_unsafe(&self.0, offset, dst, count);
+    }
+
+    fn write(&self, offset: u64, src: &[u8]) {
+        SqliteRawMemory::write(&self.0, offset, src);
+    }
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, PartialEq, Eq)]
+struct BatchSeller {
+    receiver_address: String,
+    status: String,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, PartialEq, Eq)]
+struct BatchWriterReceiverScope {
+    writer_principal: Principal,
+    receiver_address: String,
+    enabled: bool,
+    created_at: u64,
+    updated_at: u64,
+    updated_by: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, PartialEq, Eq)]
+struct BatchPaymentIntent {
+    intent_id: String,
+    receiver_address: String,
+    payer_address: String,
+    resource_url: String,
+    amount: String,
+    nonce: String,
+    status: String,
+    created_at: u64,
+    updated_at: u64,
 }
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
@@ -175,42 +291,19 @@ async fn http_request_update(request: HttpRequest) -> HttpResponse {
 
 #[update]
 fn set_env(name: String, value: String) {
-    let caller = ic_cdk::api::msg_caller();
-    if !ic_cdk::api::is_controller(&caller) {
-        ic_cdk::trap("caller is not a controller");
-    }
+    require_controller_or_trap();
     set_env_value(&name, &value);
 }
 
-fn require_batch_channel_storage_writer() -> Result<(), String> {
-    let caller = ic_cdk::api::msg_caller();
-    authorize_batch_channel_storage_writer(caller, ic_cdk::api::is_controller(&caller))
-}
-
-fn authorize_batch_channel_storage_writer(
-    caller: Principal,
-    is_controller: bool,
-) -> Result<(), String> {
-    if caller == Principal::anonymous() {
-        return Err(
-            "anonymous caller is not authorized to update batch channel storage".to_string(),
-        );
+fn require_controller_or_trap() {
+    if !batch_caller_is_controller() {
+        ic_cdk::trap("caller is not a controller");
     }
-    if is_controller {
-        return Ok(());
-    }
-    if batch_channel_storage_writer_principal()?.is_some_and(|writer| writer == caller) {
-        return Ok(());
-    }
-    Err("caller is not authorized to update batch channel storage".to_string())
 }
 
 #[query]
 fn env_names() -> Vec<String> {
-    let caller = ic_cdk::api::msg_caller();
-    if !ic_cdk::api::is_controller(&caller) {
-        ic_cdk::trap("caller is not a controller");
-    }
+    require_controller_or_trap();
     ENV.with(|env| {
         env.borrow()
             .iter()
@@ -224,12 +317,277 @@ fn pre_upgrade() {}
 
 #[post_upgrade]
 fn post_upgrade() {
+    init_sqlite_db_or_trap();
     if !stable_structures_empty() {
         return;
     }
     if let Ok((state,)) = ic_cdk::storage::stable_restore::<(StableState,)>() {
         migrate_legacy_state(state);
     }
+}
+
+fn init_sqlite_db_or_trap() {
+    if let Err(message) = init_sqlite_db() {
+        ic_cdk::trap(&message);
+    }
+}
+
+#[cfg(not(test))]
+fn init_sqlite_db() -> Result<(), String> {
+    MEMORY_MANAGER.with(|manager| {
+        match SqliteDb::init(manager.borrow().get(SQLITE_MEMORY_ID)) {
+            Ok(()) | Err(SqliteDbError::StableMemoryAlreadyInitialized) => Ok(()),
+            Err(error) => Err(format!("sqlite init failed: {error}")),
+        }
+    })?;
+    SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS)
+        .map_err(|error| format!("sqlite migration failed: {error}"))
+}
+
+#[cfg(test)]
+fn init_sqlite_db() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn batch_update_caller() -> Principal {
+    ic_cdk::api::msg_caller()
+}
+
+#[cfg(test)]
+fn batch_update_caller() -> Principal {
+    TEST_BATCH_CALLER.with(|caller| *caller.borrow())
+}
+
+#[cfg(not(test))]
+fn batch_caller_is_controller() -> bool {
+    ic_cdk::api::is_controller(&batch_update_caller())
+}
+
+#[cfg(test)]
+fn batch_caller_is_controller() -> bool {
+    TEST_BATCH_CALLER_IS_CONTROLLER.with(|is_controller| *is_controller.borrow())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BATCH_CALLER: RefCell<Principal> = RefCell::new(Principal::anonymous());
+    static TEST_BATCH_CALLER_IS_CONTROLLER: RefCell<bool> = const { RefCell::new(true) };
+    static TEST_BATCH_SELLERS: RefCell<BTreeMap<String, BatchSeller>> = const { RefCell::new(BTreeMap::new()) };
+    static TEST_BATCH_WRITER_RECEIVER_SCOPES: RefCell<BTreeMap<String, BatchWriterReceiverScope>> = const { RefCell::new(BTreeMap::new()) };
+    static TEST_BATCH_PAYMENT_INTENTS: RefCell<BTreeMap<String, BatchPaymentIntent>> = const { RefCell::new(BTreeMap::new()) };
+    static TEST_BATCH_CHANNEL_BINDINGS: RefCell<BTreeMap<String, (String, String, String, String)>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+fn set_test_batch_caller(caller: Principal, is_controller: bool) {
+    TEST_BATCH_CALLER.with(|value| *value.borrow_mut() = caller);
+    TEST_BATCH_CALLER_IS_CONTROLLER.with(|value| *value.borrow_mut() = is_controller);
+}
+
+#[cfg(test)]
+fn reset_test_batch_caller() {
+    set_test_batch_caller(Principal::anonymous(), true);
+}
+
+#[cfg(not(test))]
+fn sqlite_error(error: SqliteDbError) -> String {
+    format!("sqlite error: {error}")
+}
+
+#[cfg(not(test))]
+fn sqlite_u64(label: &str, value: i64) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("{label} is out of range"))
+}
+
+fn sqlite_now_seconds() -> i64 {
+    i64::try_from(now_seconds()).unwrap_or(i64::MAX)
+}
+
+fn validate_non_system_principal(label: &str, principal: Principal) -> Result<(), String> {
+    let text = principal.to_text();
+    if text == "2vxsx-fae" || text == "aaaaa-aa" {
+        return Err(format!("{label} must be a non-system IC principal"));
+    }
+    Ok(())
+}
+
+fn require_sqlite_text(label: &str, value: &str, max_bytes: usize) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if trimmed.len() > max_bytes {
+        return Err(format!("{label} exceeds {max_bytes} bytes"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn require_seller_status(status: &str) -> Result<String, String> {
+    let status = require_sqlite_text("status", status, 64)?;
+    match status.as_str() {
+        "active" | "disabled" => Ok(status),
+        _ => Err("seller status must be active or disabled".to_string()),
+    }
+}
+
+fn require_payment_intent_status(status: &str) -> Result<String, String> {
+    let status = require_sqlite_text("status", status, 64)?;
+    match status.as_str() {
+        "created" | "bound" | "paid" | "cancelled" => Ok(status),
+        _ => Err("payment intent status must be created, bound, paid, or cancelled".to_string()),
+    }
+}
+
+fn require_payment_intent_amount(amount: &str) -> Result<String, String> {
+    let amount = require_sqlite_text("amount", amount, 512)?;
+    parse_positive_u128("amount", &amount)?;
+    Ok(amount)
+}
+
+fn require_payment_intent_nonce(nonce: &str) -> Result<String, String> {
+    let nonce = require_sqlite_text("nonce", nonce, 512)?.to_ascii_lowercase();
+    parse_hex(&nonce, Some(32))
+        .map_err(|_| "nonce must be a 32-byte 0x-prefixed hex string".to_string())?;
+    Ok(nonce)
+}
+
+#[cfg(not(test))]
+fn batch_sqlite_scope_count() -> Result<u64, String> {
+    init_sqlite_db()?;
+    let count = SqliteDb::query(|connection| {
+        connection.query_scalar::<i64>(
+            "SELECT COUNT(*)
+             FROM writer_receiver_scopes scopes
+             JOIN sellers ON sellers.receiver_address = scopes.receiver_address
+             WHERE scopes.enabled = 1 AND sellers.status = 'active'",
+            params![],
+        )
+    })
+    .map_err(sqlite_error)?;
+    sqlite_u64("batch writer receiver scope count", count)
+}
+
+#[cfg(test)]
+fn batch_sqlite_scope_count() -> Result<u64, String> {
+    let count = TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+        TEST_BATCH_SELLERS.with(|sellers| {
+            let sellers = sellers.borrow();
+            scopes
+                .borrow()
+                .values()
+                .filter(|scope| {
+                    scope.enabled
+                        && sellers
+                            .get(&scope.receiver_address)
+                            .is_some_and(|seller| seller.status == "active")
+                })
+                .count()
+        })
+    });
+    u64::try_from(count)
+        .map_err(|_| "batch writer receiver scope count is out of range".to_string())
+}
+
+fn require_batch_writer_receiver_scope_configured() -> Result<(), String> {
+    if batch_sqlite_scope_count()? == 0 {
+        return Err("missing enabled batch writer receiver scope".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn batch_writer_scope_enabled(writer: Principal, receiver: &str) -> Result<bool, String> {
+    validate_non_system_principal("writer", writer)?;
+    let receiver = normalize_evm_address("receiver", receiver)?;
+    let writer = writer.to_text();
+    init_sqlite_db()?;
+    SqliteDb::query(|connection| {
+        connection.exists(
+            "SELECT 1
+             FROM writer_receiver_scopes scopes
+             JOIN sellers ON sellers.receiver_address = scopes.receiver_address
+             WHERE scopes.writer_principal = ?1
+               AND scopes.receiver_address = ?2
+               AND scopes.enabled = 1
+               AND sellers.status = 'active'",
+            params![writer, receiver],
+        )
+    })
+    .map_err(sqlite_error)
+}
+
+#[cfg(test)]
+fn batch_writer_scope_enabled(writer: Principal, receiver: &str) -> Result<bool, String> {
+    validate_non_system_principal("writer", writer)?;
+    let receiver = normalize_evm_address("receiver", receiver)?;
+    let key = test_scope_key(&writer.to_text(), &receiver);
+    Ok(TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+        TEST_BATCH_SELLERS.with(|sellers| {
+            scopes.borrow().get(&key).is_some_and(|scope| {
+                scope.enabled
+                    && sellers
+                        .borrow()
+                        .get(&receiver)
+                        .is_some_and(|seller| seller.status == "active")
+            })
+        })
+    }))
+}
+
+#[cfg(test)]
+fn test_scope_key(writer: &str, receiver: &str) -> String {
+    format!("{writer}\n{receiver}")
+}
+
+#[cfg(not(test))]
+fn batch_scope_from_row(
+    row: &ic_sqlite_vfs::db::Row<'_>,
+) -> Result<BatchWriterReceiverScope, SqliteDbError> {
+    let writer_text = row.get::<String>(0)?;
+    let writer_principal = Principal::from_text(&writer_text)
+        .map_err(|_| SqliteDbError::Constraint("invalid writer principal".to_string()))?;
+    Ok(BatchWriterReceiverScope {
+        writer_principal,
+        receiver_address: row.get::<String>(1)?,
+        enabled: row.get::<i64>(2)? != 0,
+        created_at: u64::try_from(row.get::<i64>(3)?)
+            .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
+        updated_at: u64::try_from(row.get::<i64>(4)?)
+            .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
+        updated_by: row.get::<String>(5)?,
+    })
+}
+
+#[cfg(not(test))]
+fn batch_seller_from_row(row: &ic_sqlite_vfs::db::Row<'_>) -> Result<BatchSeller, SqliteDbError> {
+    Ok(BatchSeller {
+        receiver_address: row.get::<String>(0)?,
+        status: row.get::<String>(1)?,
+        created_at: u64::try_from(row.get::<i64>(2)?)
+            .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
+        updated_at: u64::try_from(row.get::<i64>(3)?)
+            .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
+    })
+}
+
+#[cfg(not(test))]
+fn batch_payment_intent_from_row(
+    row: &ic_sqlite_vfs::db::Row<'_>,
+) -> Result<BatchPaymentIntent, SqliteDbError> {
+    Ok(BatchPaymentIntent {
+        intent_id: row.get::<String>(0)?,
+        receiver_address: row.get::<String>(1)?,
+        payer_address: row.get::<String>(2)?,
+        resource_url: row.get::<String>(3)?,
+        amount: row.get::<String>(4)?,
+        nonce: row.get::<String>(5)?,
+        status: row.get::<String>(6)?,
+        created_at: u64::try_from(row.get::<i64>(7)?)
+            .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
+        updated_at: u64::try_from(row.get::<i64>(8)?)
+            .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
+    })
 }
 
 fn encode_stable<T: CandidType>(value: &T) -> Vec<u8> {
@@ -286,28 +644,6 @@ fn optional_env_value(name: &str) -> Option<String> {
     }
 }
 
-fn batch_channel_storage_writer_principal() -> Result<Option<Principal>, String> {
-    optional_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL")
-        .map(|value| {
-            let principal = value.trim();
-            if principal == "2vxsx-fae" || principal == "aaaaa-aa" {
-                return Err(
-                    "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal"
-                        .to_string(),
-                );
-            }
-            Principal::from_text(principal).map_err(|_| {
-                "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal".to_string()
-            })
-        })
-        .transpose()
-}
-
-fn required_batch_channel_storage_writer_principal() -> Result<Principal, String> {
-    batch_channel_storage_writer_principal()?
-        .ok_or_else(|| "missing required env: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL".to_string())
-}
-
 fn clear_env_values_runtime() {
     ENV.with(|env| {
         let keys = env
@@ -332,6 +668,8 @@ fn remove_env_value(name: &str) {
 #[cfg(test)]
 fn clear_env_values() {
     clear_env_values_runtime();
+    clear_batch_sqlite();
+    reset_test_batch_caller();
 }
 
 fn get_settlement(key: &str) -> Option<SettlementRecord> {
@@ -389,6 +727,14 @@ fn put_batch_channel(channel_id: &str, channel: BatchChannel) -> Result<(), Stri
     })
 }
 
+fn can_put_batch_channel(channel_id: &str) -> bool {
+    BATCH_CHANNELS.with(|items| {
+        let items = items.borrow();
+        items.contains_key(&channel_id.to_ascii_lowercase())
+            || items.len() < MAX_BATCH_CHANNELS_STORED
+    })
+}
+
 fn get_batch_channel(channel_id: &str) -> Option<BatchChannel> {
     BATCH_CHANNELS.with(|items| {
         items
@@ -432,12 +778,163 @@ fn get_batch_deleted_channel(channel_id: &str) -> Option<BatchDeletedChannel> {
 
 #[cfg(test)]
 fn batch_channel_update_caller_text() -> String {
-    "test-caller".to_string()
+    batch_update_caller().to_text()
 }
 
 #[cfg(not(test))]
 fn batch_channel_update_caller_text() -> String {
-    ic_cdk::api::msg_caller().to_text()
+    batch_update_caller().to_text()
+}
+
+fn authorize_batch_channel_update(
+    current: Option<&BatchChannel>,
+    next: Option<&BatchChannel>,
+) -> Result<(), String> {
+    if batch_caller_is_controller() {
+        return Ok(());
+    }
+    let caller = batch_update_caller();
+    validate_non_system_principal("caller", caller)?;
+    let mut receivers = Vec::new();
+    if let Some(channel) = current {
+        receivers.push(normalize_evm_address(
+            "current.channelConfig.receiver",
+            &channel.channel_config.receiver,
+        )?);
+    }
+    if let Some(channel) = next {
+        receivers.push(normalize_evm_address(
+            "next.channelConfig.receiver",
+            &channel.channel_config.receiver,
+        )?);
+    }
+    receivers.sort();
+    receivers.dedup();
+    for receiver in receivers {
+        if !batch_writer_scope_enabled(caller, &receiver)? {
+            return Err(format!("caller is not authorized for receiver {receiver}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn insert_batch_channel_binding(channel_id: &str, channel: &BatchChannel) -> Result<(), String> {
+    let receiver =
+        normalize_evm_address("channelConfig.receiver", &channel.channel_config.receiver)?;
+    let payer = normalize_evm_address("channelConfig.payer", &channel.channel_config.payer)?;
+    let token = normalize_evm_address("channelConfig.token", &channel.channel_config.token)?;
+    let pending = channel
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch channel create requires pendingRequest".to_string())?;
+    let intent_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
+    let amount = require_payment_intent_amount(&pending.signed_max_claimable)?;
+    let nonce = require_payment_intent_nonce(&channel.channel_config.salt)?;
+    let now = sqlite_now_seconds();
+    let channel_id = channel_id.to_ascii_lowercase();
+    init_sqlite_db()?;
+    SqliteDb::update(|connection| {
+        let intent = connection
+            .query_optional(
+                "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, status, created_at, updated_at
+                 FROM payment_intents WHERE intent_id = ?1",
+                params![intent_id],
+                batch_payment_intent_from_row,
+            )?
+            .ok_or_else(|| SqliteDbError::Constraint("payment intent not found".to_string()))?;
+        if intent.status != "created" {
+            return Err(SqliteDbError::Constraint(
+                "payment intent status must be created".to_string(),
+            ));
+        }
+        if intent.receiver_address != receiver {
+            return Err(SqliteDbError::Constraint(
+                "payment intent receiver mismatch".to_string(),
+            ));
+        }
+        if intent.payer_address != payer {
+            return Err(SqliteDbError::Constraint(
+                "payment intent payer mismatch".to_string(),
+            ));
+        }
+        if intent.amount != amount {
+            return Err(SqliteDbError::Constraint(
+                "payment intent amount mismatch".to_string(),
+            ));
+        }
+        if intent.nonce != nonce {
+            return Err(SqliteDbError::Constraint(
+                "payment intent nonce mismatch".to_string(),
+            ));
+        }
+        connection.execute(
+            "INSERT INTO batch_channel_bindings(
+                 channel_id, receiver_address, payer_address, token_address,
+                 intent_id, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![channel_id, receiver, payer, token, intent_id, now],
+        )?;
+        connection.execute(
+            "UPDATE payment_intents SET status = 'bound', updated_at = ?2 WHERE intent_id = ?1",
+            params![intent_id, now],
+        )
+    })
+    .map_err(sqlite_error)
+}
+
+#[cfg(test)]
+fn insert_batch_channel_binding(channel_id: &str, channel: &BatchChannel) -> Result<(), String> {
+    let receiver =
+        normalize_evm_address("channelConfig.receiver", &channel.channel_config.receiver)?;
+    let payer = normalize_evm_address("channelConfig.payer", &channel.channel_config.payer)?;
+    let token = normalize_evm_address("channelConfig.token", &channel.channel_config.token)?;
+    let pending = channel
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch channel create requires pendingRequest".to_string())?;
+    let intent_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
+    let amount = require_payment_intent_amount(&pending.signed_max_claimable)?;
+    let nonce = require_payment_intent_nonce(&channel.channel_config.salt)?;
+    TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+        let mut intents = intents.borrow_mut();
+        let intent = intents
+            .get_mut(&intent_id)
+            .ok_or_else(|| "sqlite error: payment intent not found".to_string())?;
+        if intent.status != "created" {
+            return Err("sqlite error: payment intent status must be created".to_string());
+        }
+        if intent.receiver_address != receiver {
+            return Err("sqlite error: payment intent receiver mismatch".to_string());
+        }
+        if intent.payer_address != payer {
+            return Err("sqlite error: payment intent payer mismatch".to_string());
+        }
+        if intent.amount != amount {
+            return Err("sqlite error: payment intent amount mismatch".to_string());
+        }
+        if intent.nonce != nonce {
+            return Err("sqlite error: payment intent nonce mismatch".to_string());
+        }
+        intent.status = "bound".to_string();
+        intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
+        Ok(())
+    })?;
+    TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
+        let mut bindings = bindings.borrow_mut();
+        if bindings
+            .insert(
+                channel_id.to_ascii_lowercase(),
+                (receiver, payer, token, intent_id),
+            )
+            .is_some()
+        {
+            return Err("sqlite error: batch channel binding already exists".to_string());
+        }
+        Ok(())
+    })
 }
 
 fn put_nonce_state(from: &str, state: NonceState) {
@@ -552,6 +1049,14 @@ fn clear_batch_channels() {
             items.remove(&key);
         }
     });
+}
+
+#[cfg(test)]
+fn clear_batch_sqlite() {
+    TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| bindings.borrow_mut().clear());
+    TEST_BATCH_PAYMENT_INTENTS.with(|intents| intents.borrow_mut().clear());
+    TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| scopes.borrow_mut().clear());
+    TEST_BATCH_SELLERS.with(|sellers| sellers.borrow_mut().clear());
 }
 
 fn migrate_legacy_state(state: StableState) {
@@ -670,7 +1175,7 @@ fn supported_batch_config() -> Option<(String, u64)> {
     let withdraw_delay = batch_withdraw_delay_seconds().ok()?;
     configured_batch_settlement_contract().ok()?;
     required_positive_u128("BATCH_SETTLEMENT_FEE_AMOUNT").ok()?;
-    required_batch_channel_storage_writer_principal().ok()?;
+    require_batch_writer_receiver_scope_configured().ok()?;
     validate_batch_key_separation(&receiver_authorizer).ok()?;
     Some((receiver_authorizer, withdraw_delay))
 }
@@ -689,7 +1194,7 @@ fn require_batch_settlement_enabled() -> Result<String, String> {
     batch_withdraw_delay_seconds()?;
     let contract = configured_batch_settlement_contract()?;
     required_positive_u128("BATCH_SETTLEMENT_FEE_AMOUNT")?;
-    required_batch_channel_storage_writer_principal()?;
+    require_batch_writer_receiver_scope_configured()?;
     validate_batch_key_separation(&receiver_authorizer)?;
     Ok(contract)
 }
@@ -698,7 +1203,7 @@ fn require_batch_settlement_enabled_except_fee() -> Result<String, String> {
     let receiver_authorizer = batch_receiver_authorizer_address()?;
     batch_withdraw_delay_seconds()?;
     let contract = configured_batch_settlement_contract()?;
-    required_batch_channel_storage_writer_principal()?;
+    require_batch_writer_receiver_scope_configured()?;
     validate_batch_key_separation(&receiver_authorizer)?;
     Ok(contract)
 }
@@ -1434,6 +1939,56 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
         }
     };
     trace.step("batch_settle.rpc_config", 0);
+    let to = match parse_address(&contract, "BATCH_SETTLEMENT_CONTRACT") {
+        Ok(to) => to,
+        Err(message) => {
+            remove_settlement(&key);
+            refund_seller_credit(&verified.receiver, fee);
+            release_active_settlement(&active_scope, &key);
+            trace.step("batch_settle.contract", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_config", &message, payer),
+                trace,
+            );
+        }
+    };
+    if let ContractExpectation::Settle { receiver, token } = &expectation {
+        match batch_unsettled_amount(&config, &to, receiver, token).await {
+            Ok(None) => {
+                trace.step("batch_settle.noop_check", 1);
+                refund_seller_credit(&verified.receiver, fee);
+                let record = batch_settled_record(BatchSettleRecordInput {
+                    tx: String::new(),
+                    settled_amount: None,
+                    payload: &payload,
+                    requirements: &body.payment_requirements,
+                    payer: payer.clone(),
+                    receiver: verified.receiver,
+                    now: now_seconds(),
+                    ttl,
+                })
+                .await;
+                let record = insert_settlement(&key, record);
+                release_active_settlement(&active_scope, &key);
+                return json_response_with_cost(record.status_code(), &record.response, trace);
+            }
+            Ok(Some(_)) => {
+                trace.step("batch_settle.noop_check", 1);
+            }
+            Err(message) => {
+                remove_settlement(&key);
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.noop_check", 1);
+                return json_response_with_cost(
+                    502,
+                    &settle_error("rpc_error", &message, payer),
+                    trace,
+                );
+            }
+        }
+    }
     let rpc_nonce = match pending_nonce(&config, &from).await {
         Ok(nonce) => nonce,
         Err(message) => {
@@ -1450,51 +2005,26 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
     };
     trace.step("batch_settle.pending_nonce", 1);
     let nonce = reserve_nonce(&from, rpc_nonce);
-    let to = match parse_address(&contract, "BATCH_SETTLEMENT_CONTRACT") {
-        Ok(to) => to,
-        Err(message) => {
-            remove_settlement(&key);
-            rollback_reserved_nonce(&from, nonce);
-            refund_seller_credit(&verified.receiver, fee);
-            release_active_settlement(&active_scope, &key);
-            trace.step("batch_settle.contract", 0);
-            return json_response_with_cost(
-                400,
-                &settle_error("invalid_config", &message, payer),
-                trace,
-            );
-        }
-    };
-    let pre_refund_snapshot = if payload.kind == "refund" {
-        batch_payload_snapshot(&payload, Some((&config, &to))).await
-    } else {
-        None
-    };
     match send_contract_transaction(&config, &private_key, to, calldata, nonce, &expectation).await
     {
-        Ok(SettlementOutcome::Settled(tx)) => {
+        Ok(ContractSettlementOutcome::Settled { tx, settled_amount }) => {
             trace.step("batch_settle.send", 5);
-            if tx.is_empty() {
-                rollback_reserved_nonce(&from, nonce);
-                refund_seller_credit(&verified.receiver, fee);
-            }
             let record = batch_settled_record(BatchSettleRecordInput {
                 tx,
+                settled_amount,
                 payload: &payload,
                 requirements: &body.payment_requirements,
                 payer: payer.clone(),
                 receiver: verified.receiver,
                 now: now_seconds(),
                 ttl,
-                rpc: Some((&config, &to)),
-                pre_refund_snapshot: pre_refund_snapshot.as_ref(),
             })
             .await;
             let record = insert_settlement(&key, record);
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(record.status_code(), &record.response, trace)
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        Ok(ContractSettlementOutcome::Pending { nonce, tx }) => {
             trace.step("batch_settle.send", 5);
             update_active_broadcast(&active_scope, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -1504,12 +2034,11 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
                 body.payment_requirements.amount,
                 now_seconds(),
                 ttl,
-            )
-            .with_batch_pre_refund_snapshot(pre_refund_snapshot.as_ref());
+            );
             let record = insert_settlement(&key, record);
             json_response_with_cost(202, &record.response, trace)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        Ok(ContractSettlementOutcome::Failed { tx, message }) => {
             trace.step("batch_settle.send", 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -1852,27 +2381,26 @@ async fn cached_batch_settlement_response(
     };
     trace.step("batch_settle.cache_ttl", 0);
     match refreshed {
-        SettlementOutcome::Settled(tx) => {
+        ContractSettlementOutcome::Settled { tx, settled_amount } => {
             let record = batch_settled_record(BatchSettleRecordInput {
                 tx,
+                settled_amount,
                 payload,
                 requirements,
                 payer: Some(details.payer.clone()),
                 receiver: details.pay_to.clone(),
                 now: now_seconds(),
                 ttl,
-                rpc: Some((&config, &to)),
-                pre_refund_snapshot: details.batch_pre_refund_snapshot.as_ref(),
             })
             .await;
             let record = insert_settlement(key, record);
             release_active_settlement_by_key(key);
             json_response_with_cost(record.status_code(), &record.response, trace)
         }
-        SettlementOutcome::Pending { .. } => {
+        ContractSettlementOutcome::Pending { .. } => {
             json_response_with_cost(existing.status_code(), &existing.response, trace)
         }
-        SettlementOutcome::Failed { tx, message } => {
+        ContractSettlementOutcome::Failed { tx, message } => {
             let record = SettlementRecord::failed(
                 tx,
                 message,
@@ -2372,14 +2900,13 @@ fn batch_authorizer_private_key_for_refund(
 
 struct BatchSettleRecordInput<'a> {
     tx: String,
+    settled_amount: Option<String>,
     payload: &'a crate::batch::BatchRequestPayload,
     requirements: &'a PaymentRequirements,
     payer: Option<String>,
     receiver: String,
     now: u64,
     ttl: u64,
-    rpc: Option<(&'a RpcConfig, &'a [u8; 20])>,
-    pre_refund_snapshot: Option<&'a BatchChannelSnapshot>,
 }
 
 async fn batch_settled_record(input: BatchSettleRecordInput<'_>) -> SettlementRecord {
@@ -2393,8 +2920,7 @@ async fn batch_settled_record(input: BatchSettleRecordInput<'_>) -> SettlementRe
         input.payload,
         input.requirements,
         input.payer,
-        input.rpc,
-        input.pre_refund_snapshot,
+        input.settled_amount,
     )
     .await
     {
@@ -2417,8 +2943,7 @@ async fn batch_success_response(
     payload: &crate::batch::BatchRequestPayload,
     requirements: &PaymentRequirements,
     payer: Option<String>,
-    rpc: Option<(&RpcConfig, &[u8; 20])>,
-    pre_refund_snapshot: Option<&BatchChannelSnapshot>,
+    settled_amount: Option<String>,
 ) -> Result<SettleResponse, String> {
     let mut response = SettleResponse {
         success: true,
@@ -2437,27 +2962,12 @@ async fn batch_success_response(
                 .deposit
                 .as_ref()
                 .map(|deposit| deposit.amount.clone());
-            response.extra_json = Some(
-                batch_deposit_response_extra(payload, requirements, rpc)
-                    .await
-                    .ok_or_else(|| "batch deposit post-state snapshot unavailable".to_string())?,
-            );
+            response.extra_json = None;
         }
         "claim" => {
             response.payer = None;
             response.amount = Some("0".to_string());
-            let post = batch_payload_snapshot(payload, rpc).await;
-            if batch_claim_requires_response_snapshot(payload) {
-                response.extra_json = Some(
-                    post.as_ref()
-                        .and_then(|snapshot| batch_response_extra_json(snapshot, None, None))
-                        .ok_or_else(|| "batch claim post-state snapshot unavailable".to_string())?,
-                );
-            } else {
-                response.extra_json = post
-                    .as_ref()
-                    .and_then(|snapshot| batch_response_extra_json(snapshot, None, None));
-            }
+            response.extra_json = None;
         }
         "settle" => {
             response.payer = None;
@@ -2465,8 +2975,7 @@ async fn batch_success_response(
                 Some("0".to_string())
             } else {
                 Some(
-                    batch_settle_response_amount(&tx, payload, rpc)
-                        .await
+                    settled_amount
                         .ok_or_else(|| "batch settle event amount unavailable".to_string())?,
                 )
             };
@@ -2477,108 +2986,12 @@ async fn batch_success_response(
                 .as_ref()
                 .map(|config| config.payer.clone())
                 .or(response.payer);
-            let post = batch_payload_snapshot(payload, rpc).await;
-            response.amount =
-                batch_refund_response_amount(payload, pre_refund_snapshot, post.as_ref());
-            response.extra_json = Some(
-                post.as_ref()
-                    .and_then(|snapshot| batch_response_extra_json(snapshot, None, None))
-                    .ok_or_else(|| "batch refund post-state snapshot unavailable".to_string())?,
-            );
+            response.amount = payload.amount.clone();
+            response.extra_json = None;
         }
         _ => {}
     }
     Ok(response)
-}
-
-async fn batch_deposit_response_extra(
-    payload: &crate::batch::BatchRequestPayload,
-    requirements: &PaymentRequirements,
-    rpc: Option<(&RpcConfig, &[u8; 20])>,
-) -> Option<String> {
-    let snapshot = batch_payload_snapshot(payload, rpc).await?;
-    batch_response_extra_json(
-        &snapshot,
-        Some(requirements.amount.clone()),
-        batch_deposit_charged_cumulative_amount(payload),
-    )
-}
-
-fn batch_deposit_charged_cumulative_amount(
-    payload: &crate::batch::BatchRequestPayload,
-) -> Option<String> {
-    if payload.kind != "deposit" {
-        return None;
-    }
-    payload
-        .voucher
-        .as_ref()
-        .map(|voucher| voucher.max_claimable_amount.clone())
-}
-
-async fn batch_payload_snapshot(
-    payload: &crate::batch::BatchRequestPayload,
-    rpc: Option<(&RpcConfig, &[u8; 20])>,
-) -> Option<BatchChannelSnapshot> {
-    let (config, contract) = rpc?;
-    let channel_id = batch_payload_snapshot_channel_id(payload, contract)?;
-    batch_channel_snapshot(config, contract, &channel_id)
-        .await
-        .ok()
-}
-
-fn batch_payload_snapshot_channel_id(
-    payload: &crate::batch::BatchRequestPayload,
-    contract: &[u8; 20],
-) -> Option<String> {
-    match payload.kind.as_str() {
-        "deposit" | "voucher" | "refund" => payload
-            .voucher
-            .as_ref()
-            .map(|voucher| voucher.channel_id.clone()),
-        "claim" => {
-            let claims = payload.claims.as_ref()?;
-            if claims.len() != 1 {
-                return None;
-            }
-            compute_batch_channel_id(&claims[0].voucher.channel, &address_hex(contract)).ok()
-        }
-        _ => None,
-    }
-}
-
-fn batch_claim_requires_response_snapshot(payload: &crate::batch::BatchRequestPayload) -> bool {
-    payload.kind == "claim"
-        && payload
-            .claims
-            .as_ref()
-            .is_some_and(|claims| claims.len() == 1)
-}
-
-async fn batch_settle_response_amount(
-    tx: &str,
-    payload: &crate::batch::BatchRequestPayload,
-    rpc: Option<(&RpcConfig, &[u8; 20])>,
-) -> Option<String> {
-    let (config, contract) = rpc?;
-    let receiver = payload.receiver.as_deref()?;
-    let token = payload.token.as_deref()?;
-    verified_batch_settle_amount(batch_settled_amount(config, tx, contract, receiver, token).await)
-}
-
-fn verified_batch_settle_amount(result: Result<String, String>) -> Option<String> {
-    result.ok()
-}
-
-fn batch_refund_response_amount(
-    _payload: &crate::batch::BatchRequestPayload,
-    pre: Option<&BatchChannelSnapshot>,
-    post: Option<&BatchChannelSnapshot>,
-) -> Option<String> {
-    if let (Some(pre), Some(post)) = (pre, post) {
-        return decimal_sub_floor(&pre.balance, &post.balance);
-    }
-    None
 }
 
 fn validate_batch_verify_snapshot(
@@ -2671,33 +3084,6 @@ fn parse_batch_decimal(label: &str, value: &str) -> Result<u128, String> {
         .map_err(|_| format!("{label}: integer too large"))
 }
 
-fn batch_response_extra_json(
-    snapshot: &BatchChannelSnapshot,
-    charged_amount: Option<String>,
-    charged_cumulative_amount: Option<String>,
-) -> Option<String> {
-    let extra = SettleResponseExtra {
-        settlement_key: None,
-        charged_amount,
-        channel_state: Some(SettleChannelStateExtra {
-            channel_id: snapshot.channel_id.clone(),
-            balance: snapshot.balance.clone(),
-            total_claimed: snapshot.total_claimed.clone(),
-            withdraw_requested_at: snapshot.withdraw_requested_at,
-            refund_nonce: snapshot.refund_nonce.clone(),
-            charged_cumulative_amount,
-        }),
-        voucher_state: None,
-    };
-    serde_json::to_string(&extra).ok()
-}
-
-fn decimal_sub_floor(left: &str, right: &str) -> Option<String> {
-    let left = left.parse::<u128>().ok()?;
-    let right = right.parse::<u128>().ok()?;
-    Some(left.saturating_sub(right).to_string())
-}
-
 fn batch_contract_expectation(
     payload: &crate::batch::BatchRequestPayload,
     contract: &str,
@@ -2713,28 +3099,17 @@ fn batch_contract_expectation(
                 None => compute_batch_channel_id(config, contract)?,
             };
             validate_channel_id(&channel_id)?;
-            let min_balance = payload
+            payload
                 .deposit
                 .as_ref()
-                .map(|deposit| deposit.amount.clone())
                 .ok_or_else(|| "batch deposit payload is required".to_string())?;
-            let max_claimable_amount = payload
+            payload
                 .voucher
                 .as_ref()
-                .map(|voucher| voucher.max_claimable_amount.clone())
                 .ok_or_else(|| "batch voucher is required".to_string())?;
-            Ok(ContractExpectation::Deposit {
-                channel_id,
-                payer: config.payer.clone(),
-                token: config.token.clone(),
-                deposit_amount: min_balance.clone(),
-                max_claimable_amount,
-                min_balance,
-            })
+            Ok(ContractExpectation::Deposit)
         }
-        "claim" => Ok(ContractExpectation::Claim {
-            claims: expected_claim_states(payload.claims.as_deref(), contract)?,
-        }),
+        "claim" => Ok(ContractExpectation::Claim),
         "settle" => Ok(ContractExpectation::Settle {
             receiver: payload
                 .receiver
@@ -2744,77 +3119,21 @@ fn batch_contract_expectation(
                 .token
                 .clone()
                 .ok_or_else(|| "batch settle token is required".to_string())?,
-            expected_amount: None,
-            min_total_settled: None,
         }),
         "refund" => {
             let config = payload
                 .channel_config
                 .as_ref()
                 .ok_or_else(|| "batch refund channelConfig is required".to_string())?;
-            let channel_id = compute_batch_channel_id(config, contract)?;
-            let nonce = payload
+            compute_batch_channel_id(config, contract)?;
+            payload
                 .refund_nonce
                 .as_deref()
                 .ok_or_else(|| "batch refund nonce is required".to_string())?;
-            Ok(ContractExpectation::Refund {
-                channel_id,
-                refund_nonce: nonce.to_string(),
-                min_refund_nonce: increment_decimal(nonce)?,
-                claims: expected_claim_states(payload.claims.as_deref(), contract)?,
-            })
+            Ok(ContractExpectation::Refund)
         }
         other => Err(format!("unsupported batch payload type: {other}")),
     }
-}
-
-fn expected_claim_states(
-    claims: Option<&[crate::batch::BatchVoucherClaim]>,
-    contract: &str,
-) -> Result<Vec<ExpectedClaimState>, String> {
-    claims
-        .unwrap_or_default()
-        .iter()
-        .map(|claim| {
-            Ok(ExpectedClaimState {
-                channel_id: compute_batch_channel_id(&claim.voucher.channel, contract)?,
-                min_total_claimed: claim.total_claimed.clone(),
-            })
-        })
-        .collect()
-}
-
-fn increment_decimal(value: &str) -> Result<String, String> {
-    parse_u256_decimal(value, "batch refund nonce").map_err(|message| {
-        if message.contains("invalid decimal integer") {
-            "batch refund nonce must be a decimal integer".to_string()
-        } else {
-            "batch refund nonce overflow".to_string()
-        }
-    })?;
-    let incremented = decimal_string_add_one(value)?;
-    parse_u256_decimal(&incremented, "batch refund nonce")
-        .map_err(|_| "batch refund nonce overflow".to_string())?;
-    Ok(incremented)
-}
-
-fn decimal_string_add_one(value: &str) -> Result<String, String> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("batch refund nonce must be a decimal integer".to_string());
-    }
-    let mut out = value.as_bytes().to_vec();
-    let mut index = out.len();
-    while index > 0 {
-        index -= 1;
-        if out[index] == b'9' {
-            out[index] = b'0';
-        } else {
-            out[index] += 1;
-            return String::from_utf8(out).map_err(|_| "batch refund nonce overflow".to_string());
-        }
-    }
-    out.insert(0, b'1');
-    String::from_utf8(out).map_err(|_| "batch refund nonce overflow".to_string())
 }
 
 fn verify_error(reason: &str, message: &str, payer: Option<String>) -> VerifyResponse {
@@ -3387,9 +3706,319 @@ fn batch_deleted_channel_count() -> u64 {
     BATCH_DELETED_CHANNELS.with(|items| items.borrow().len())
 }
 
+#[update]
+fn batch_set_seller(receiver: String, status: String) -> Result<BatchSeller, String> {
+    require_controller_or_trap();
+    let receiver = normalize_evm_address("receiver", &receiver)?;
+    let status = require_seller_status(&status)?;
+    let now = sqlite_now_seconds();
+    #[cfg(test)]
+    {
+        let seller = TEST_BATCH_SELLERS.with(|sellers| {
+            let mut sellers = sellers.borrow_mut();
+            let created_at = sellers
+                .get(&receiver)
+                .map(|seller| seller.created_at)
+                .unwrap_or_else(|| u64::try_from(now).unwrap_or(u64::MAX));
+            let seller = BatchSeller {
+                receiver_address: receiver.clone(),
+                status: status.clone(),
+                created_at,
+                updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+            };
+            sellers.insert(receiver.clone(), seller.clone());
+            seller
+        });
+        return Ok(seller);
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| {
+            connection.execute(
+                "INSERT INTO sellers(receiver_address, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(receiver_address) DO UPDATE SET
+                 status = excluded.status,
+                 updated_at = excluded.updated_at",
+                params![receiver, status, now],
+            )?;
+            connection.query_one(
+                "SELECT receiver_address, status, created_at, updated_at
+             FROM sellers WHERE receiver_address = ?1",
+                params![receiver],
+                batch_seller_from_row,
+            )
+        })
+        .map_err(sqlite_error)
+    }
+}
+
+#[update]
+fn batch_set_writer_receiver_scope(
+    writer: Principal,
+    receiver: String,
+    enabled: bool,
+) -> Result<BatchWriterReceiverScope, String> {
+    require_controller_or_trap();
+    validate_non_system_principal("writer", writer)?;
+    let receiver = normalize_evm_address("receiver", &receiver)?;
+    let writer_text = writer.to_text();
+    let now = sqlite_now_seconds();
+    let updated_by = batch_update_caller().to_text();
+    #[cfg(test)]
+    {
+        let scope = TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let key = test_scope_key(&writer_text, &receiver);
+            let created_at = scopes
+                .get(&key)
+                .map(|scope| scope.created_at)
+                .unwrap_or_else(|| u64::try_from(now).unwrap_or(u64::MAX));
+            let scope = BatchWriterReceiverScope {
+                writer_principal: writer,
+                receiver_address: receiver.clone(),
+                enabled,
+                created_at,
+                updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+                updated_by: updated_by.clone(),
+            };
+            scopes.insert(key, scope.clone());
+            scope
+        });
+        return Ok(scope);
+    }
+    #[cfg(not(test))]
+    {
+        let enabled_value = if enabled { 1_i64 } else { 0_i64 };
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| {
+            connection.execute(
+                "INSERT INTO writer_receiver_scopes(
+                 writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             )
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+             ON CONFLICT(writer_principal, receiver_address) DO UPDATE SET
+                 enabled = excluded.enabled,
+                 updated_at = excluded.updated_at,
+                 updated_by = excluded.updated_by",
+                params![writer_text, receiver, enabled_value, now, updated_by],
+            )?;
+            connection.query_one(
+            "SELECT writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             FROM writer_receiver_scopes
+             WHERE writer_principal = ?1 AND receiver_address = ?2",
+            params![writer_text, receiver],
+            batch_scope_from_row,
+        )
+        })
+        .map_err(sqlite_error)
+    }
+}
+
+#[update]
+fn batch_create_payment_intent(
+    intent_id: String,
+    receiver: String,
+    payer: String,
+    resource_url: String,
+    amount: String,
+    nonce: String,
+) -> Result<BatchPaymentIntent, String> {
+    require_controller_or_trap();
+    let intent_id = require_sqlite_text("intent_id", &intent_id, 512)?;
+    let receiver = normalize_evm_address("receiver", &receiver)?;
+    let payer = normalize_evm_address("payer", &payer)?;
+    let resource_url = require_sqlite_text("resource_url", &resource_url, 2_048)?;
+    let amount = require_payment_intent_amount(&amount)?;
+    let nonce = require_payment_intent_nonce(&nonce)?;
+    let status = "created".to_string();
+    let now = sqlite_now_seconds();
+    #[cfg(test)]
+    {
+        let intent = BatchPaymentIntent {
+            intent_id: intent_id.clone(),
+            receiver_address: receiver,
+            payer_address: payer,
+            resource_url,
+            amount,
+            nonce,
+            status,
+            created_at: u64::try_from(now).unwrap_or(u64::MAX),
+            updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+        };
+        TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+            intents.borrow_mut().insert(intent_id, intent.clone());
+        });
+        return Ok(intent);
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| {
+            connection.execute(
+                "INSERT INTO payment_intents(
+                 intent_id, receiver_address, payer_address, resource_url,
+                 amount, nonce, status, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                params![
+                    intent_id,
+                    receiver,
+                    payer,
+                    resource_url,
+                    amount,
+                    nonce,
+                    status,
+                    now
+                ],
+            )?;
+            connection.query_one(
+                "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, status, created_at, updated_at
+             FROM payment_intents WHERE intent_id = ?1",
+                params![intent_id],
+                batch_payment_intent_from_row,
+            )
+        })
+        .map_err(sqlite_error)
+    }
+}
+
+#[update]
+fn batch_mark_payment_intent(
+    intent_id: String,
+    status: String,
+) -> Result<BatchPaymentIntent, String> {
+    require_controller_or_trap();
+    let intent_id = require_sqlite_text("intent_id", &intent_id, 512)?;
+    let status = require_payment_intent_status(&status)?;
+    let now = sqlite_now_seconds();
+    #[cfg(test)]
+    {
+        return TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+            let mut intents = intents.borrow_mut();
+            let Some(intent) = intents.get_mut(&intent_id) else {
+                return Err("sqlite error: row not found".to_string());
+            };
+            intent.status = status;
+            intent.updated_at = u64::try_from(now).unwrap_or(u64::MAX);
+            Ok(intent.clone())
+        });
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| {
+            connection.execute(
+                "UPDATE payment_intents SET status = ?2, updated_at = ?3 WHERE intent_id = ?1",
+                params![intent_id, status, now],
+            )?;
+            connection.query_one(
+                "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, status, created_at, updated_at
+             FROM payment_intents WHERE intent_id = ?1",
+                params![intent_id],
+                batch_payment_intent_from_row,
+            )
+        })
+        .map_err(sqlite_error)
+    }
+}
+
 #[query]
-fn batch_channel_storage_writer() -> Option<Principal> {
-    batch_channel_storage_writer_principal().ok().flatten()
+fn batch_writer_receiver_scope(
+    writer: Principal,
+    receiver: String,
+) -> Option<BatchWriterReceiverScope> {
+    validate_non_system_principal("writer", writer).ok()?;
+    let receiver = normalize_evm_address("receiver", &receiver).ok()?;
+    let writer = writer.to_text();
+    #[cfg(test)]
+    {
+        return TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .get(&test_scope_key(&writer, &receiver))
+                .cloned()
+        });
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db().ok()?;
+        SqliteDb::query(|connection| {
+            connection.query_optional(
+            "SELECT writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             FROM writer_receiver_scopes
+             WHERE writer_principal = ?1 AND receiver_address = ?2",
+            params![writer, receiver],
+            batch_scope_from_row,
+        )
+        })
+        .ok()
+        .flatten()
+    }
+}
+
+#[query]
+fn batch_writer_receiver_scope_count() -> u64 {
+    batch_sqlite_scope_count().unwrap_or(0)
+}
+
+#[query]
+fn batch_writer_receiver_scopes(limit: Option<u64>) -> Vec<BatchWriterReceiverScope> {
+    let limit = limit
+        .unwrap_or(BATCH_SQLITE_LIST_LIMIT)
+        .min(BATCH_SQLITE_LIST_LIMIT);
+    #[cfg(test)]
+    {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        return TEST_BATCH_WRITER_RECEIVER_SCOPES
+            .with(|scopes| scopes.borrow().values().take(limit).cloned().collect());
+    }
+    #[cfg(not(test))]
+    {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        if init_sqlite_db().is_err() {
+            return Vec::new();
+        }
+        SqliteDb::query(|connection| {
+            connection.query_map(
+            "SELECT writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             FROM writer_receiver_scopes
+             ORDER BY receiver_address, writer_principal
+             LIMIT ?1",
+            params![limit_i64],
+            batch_scope_from_row,
+        )
+        })
+        .unwrap_or_default()
+    }
+}
+
+#[query]
+fn batch_payment_intent(intent_id: String) -> Option<BatchPaymentIntent> {
+    let intent_id = require_sqlite_text("intent_id", &intent_id, 512).ok()?;
+    #[cfg(test)]
+    {
+        return TEST_BATCH_PAYMENT_INTENTS
+            .with(|intents| intents.borrow().get(&intent_id).cloned());
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db().ok()?;
+        SqliteDb::query(|connection| {
+            connection.query_optional(
+                "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, status, created_at, updated_at
+             FROM payment_intents WHERE intent_id = ?1",
+                params![intent_id],
+                batch_payment_intent_from_row,
+            )
+        })
+        .ok()
+        .flatten()
+    }
 }
 
 #[query]
@@ -3441,7 +4070,7 @@ fn batch_deleted_channels(limit: Option<u64>) -> Vec<BatchDeletedChannel> {
     })
 }
 
-#[update(guard = "require_batch_channel_storage_writer")]
+#[update]
 fn batch_update_channel(
     channel_id: String,
     expected_revision: Option<u64>,
@@ -3495,6 +4124,32 @@ fn batch_update_channel(
                     message: Some(message),
                 };
             }
+            if let Err(message) = authorize_batch_channel_update(current.as_ref(), Some(&channel)) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            if !can_put_batch_channel(&key) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some("batch channel storage limit reached".to_string()),
+                };
+            }
+            if current.is_none() {
+                if let Err(message) = insert_batch_channel_binding(&key, &channel) {
+                    return BatchChannelUpdateResult {
+                        status: "invalid".to_string(),
+                        channel: current,
+                        current_revision,
+                        message: Some(message),
+                    };
+                }
+            }
             channel.channel_id = key.clone();
             channel.revision = current_revision.unwrap_or(0).saturating_add(1);
             if let Err(message) = put_batch_channel(&key, channel.clone()) {
@@ -3514,6 +4169,14 @@ fn batch_update_channel(
         }
         None => {
             if let Some(channel) = current.as_ref() {
+                if let Err(message) = authorize_batch_channel_update(Some(channel), None) {
+                    return BatchChannelUpdateResult {
+                        status: "invalid".to_string(),
+                        channel: current,
+                        current_revision,
+                        message: Some(message),
+                    };
+                }
                 let now_ms = now_seconds().saturating_mul(1_000);
                 if channel
                     .pending_request
@@ -4442,10 +5105,13 @@ mod hardening_tests {
         set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
         set_default_batch_contract();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
-        set_env_value(
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
-            "ryjl3-tyaaa-aaaaa-aaaba-cai",
-        );
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
     }
 
     fn request_json() -> serde_json::Value {
@@ -4784,6 +5450,19 @@ mod hardening_tests {
         channel
     }
 
+    fn register_payment_intent_for_channel(channel: &BatchChannel) {
+        let pending = channel.pending_request.as_ref().unwrap();
+        batch_create_payment_intent(
+            pending.pending_id.clone(),
+            channel.channel_config.receiver.clone(),
+            channel.channel_config.payer.clone(),
+            "https://example.test/report".to_string(),
+            pending.signed_max_claimable.clone(),
+            channel.channel_config.salt.clone(),
+        )
+        .unwrap();
+    }
+
     fn test_batch_channel_config() -> crate::batch::BatchChannelConfig {
         crate::batch::BatchChannelConfig {
             payer: PAYER.to_string(),
@@ -4815,88 +5494,7 @@ mod hardening_tests {
     }
 
     #[test]
-    fn batch_refund_amount_requires_post_state_delta() {
-        let config = test_batch_channel_config();
-        let channel_id =
-            compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
-        let payload = crate::batch::BatchRequestPayload {
-            kind: "refund".to_string(),
-            channel_config: Some(config.clone()),
-            voucher: None,
-            deposit: None,
-            amount: Some("1000".to_string()),
-            refund_nonce: Some("0".to_string()),
-            claims: Some(vec![crate::batch::BatchVoucherClaim {
-                voucher: crate::batch::BatchClaimVoucher {
-                    channel: config,
-                    max_claimable_amount: "700".to_string(),
-                },
-                signature: format!("0x{}", "11".repeat(65)),
-                total_claimed: "700".to_string(),
-            }]),
-            refund_authorizer_signature: None,
-            claim_authorizer_signature: None,
-            receiver: None,
-            token: None,
-        };
-        let pre = BatchChannelSnapshot {
-            channel_id: channel_id.clone(),
-            balance: "900".to_string(),
-            total_claimed: "300".to_string(),
-            withdraw_requested_at: 0,
-            refund_nonce: "0".to_string(),
-        };
-        let post = BatchChannelSnapshot {
-            channel_id,
-            balance: "700".to_string(),
-            total_claimed: "700".to_string(),
-            withdraw_requested_at: 0,
-            refund_nonce: "1".to_string(),
-        };
-
-        assert_eq!(
-            batch_refund_response_amount(&payload, Some(&pre), None),
-            None
-        );
-        assert_eq!(
-            batch_refund_response_amount(&payload, Some(&pre), Some(&post)),
-            Some("200".to_string())
-        );
-    }
-
-    #[test]
-    fn batch_deposit_response_extra_uses_voucher_cumulative_amount() {
-        let channel_id = format!("0x{}", "11".repeat(32));
-        let payload = crate::batch::BatchRequestPayload {
-            kind: "deposit".to_string(),
-            channel_config: None,
-            voucher: Some(crate::batch::BatchVoucher {
-                channel_id,
-                max_claimable_amount: "3900".to_string(),
-                signature: format!("0x{}", "11".repeat(65)),
-            }),
-            deposit: None,
-            amount: None,
-            refund_nonce: None,
-            claims: None,
-            refund_authorizer_signature: None,
-            claim_authorizer_signature: None,
-            receiver: None,
-            token: None,
-        };
-
-        assert_eq!(
-            batch_deposit_charged_cumulative_amount(&payload),
-            Some("3900".to_string())
-        );
-
-        let mut voucher = payload;
-        voucher.kind = "voucher".to_string();
-        assert_eq!(batch_deposit_charged_cumulative_amount(&voucher), None);
-    }
-
-    #[test]
-    fn batch_deposit_and_refund_success_response_require_post_state_snapshot() {
+    fn batch_deposit_claim_and_refund_success_response_do_not_require_post_state_snapshot() {
         let channel_id = format!("0x{}", "11".repeat(32));
         let mut payload = crate::batch::BatchRequestPayload {
             kind: "deposit".to_string(),
@@ -4906,7 +5504,12 @@ mod hardening_tests {
                 max_claimable_amount: "3900".to_string(),
                 signature: format!("0x{}", "11".repeat(65)),
             }),
-            deposit: None,
+            deposit: Some(crate::batch::BatchDeposit {
+                amount: "100".to_string(),
+                authorization: crate::batch::BatchDepositAuthorization {
+                    erc3009_authorization: None,
+                },
+            }),
             amount: Some("100".to_string()),
             refund_nonce: Some("0".to_string()),
             claims: None,
@@ -4918,36 +5521,46 @@ mod hardening_tests {
         let requirements: PaymentRequirements =
             serde_json::from_value(batch_requirements_json()).unwrap();
 
-        assert_eq!(
-            run_ready(batch_success_response(
-                "0xtx".to_string(),
-                &payload,
-                &requirements,
-                Some(PAYER.to_string()),
-                None,
-                None,
-            ))
-            .unwrap_err(),
-            "batch deposit post-state snapshot unavailable"
-        );
+        let deposit = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            Some(PAYER.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(deposit.amount, Some("100".to_string()));
+        assert_eq!(deposit.extra_json, None);
+
+        payload.kind = "claim".to_string();
+        let claim = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            Some(PAYER.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(claim.payer, None);
+        assert_eq!(claim.amount, Some("0".to_string()));
+        assert_eq!(claim.extra_json, None);
 
         payload.kind = "refund".to_string();
-        assert_eq!(
-            run_ready(batch_success_response(
-                "0xtx".to_string(),
-                &payload,
-                &requirements,
-                Some(PAYER.to_string()),
-                None,
-                None,
-            ))
-            .unwrap_err(),
-            "batch refund post-state snapshot unavailable"
-        );
+        let refund = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            Some(PAYER.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(refund.payer, Some(test_batch_channel_config().payer));
+        assert_eq!(refund.amount, Some("100".to_string()));
+        assert_eq!(refund.extra_json, None);
     }
 
     #[test]
-    fn batch_settled_record_uses_failed_status_when_success_evidence_is_missing() {
+    fn batch_settled_record_uses_success_status_without_post_state_evidence() {
         let payload = crate::batch::BatchRequestPayload {
             kind: "deposit".to_string(),
             channel_config: Some(test_batch_channel_config()),
@@ -4970,22 +5583,18 @@ mod hardening_tests {
 
         let record = run_ready(batch_settled_record(BatchSettleRecordInput {
             tx: "0xtx".to_string(),
+            settled_amount: None,
             payload: &payload,
             requirements: &requirements,
             payer: Some(PAYER.to_string()),
             receiver: PAY_TO.to_string(),
             now: 1,
             ttl: 60,
-            rpc: None,
-            pre_refund_snapshot: None,
         }));
 
-        assert_eq!(record.status_code(), 502);
-        assert!(!record.response.success);
-        assert_eq!(
-            record.response.error_message,
-            Some("batch deposit post-state snapshot unavailable".to_string())
-        );
+        assert_eq!(record.status_code(), 200);
+        assert!(record.response.success);
+        assert_eq!(record.response.extra_json, None);
     }
 
     #[test]
@@ -5015,7 +5624,6 @@ mod hardening_tests {
             &requirements,
             None,
             None,
-            None,
         ))
         .unwrap();
 
@@ -5031,80 +5639,20 @@ mod hardening_tests {
                 &requirements,
                 None,
                 None,
-                None,
             ))
             .unwrap_err(),
             "batch settle event amount unavailable"
         );
-    }
 
-    #[test]
-    fn batch_claim_response_snapshot_is_limited_to_single_channel() {
-        let contract = parse_address(
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-            "BATCH_SETTLEMENT_CONTRACT",
-        )
-        .unwrap();
-        let config = test_batch_channel_config();
-        let channel_id =
-            compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
-        let claim = crate::batch::BatchVoucherClaim {
-            voucher: crate::batch::BatchClaimVoucher {
-                channel: config.clone(),
-                max_claimable_amount: "100".to_string(),
-            },
-            signature: format!("0x{}", "11".repeat(65)),
-            total_claimed: "100".to_string(),
-        };
-        let payload = crate::batch::BatchRequestPayload {
-            kind: "claim".to_string(),
-            channel_config: None,
-            voucher: None,
-            deposit: None,
-            amount: None,
-            refund_nonce: None,
-            claims: Some(vec![claim.clone()]),
-            refund_authorizer_signature: None,
-            claim_authorizer_signature: None,
-            receiver: None,
-            token: None,
-        };
-
-        assert_eq!(
-            batch_payload_snapshot_channel_id(&payload, &contract),
-            Some(channel_id)
-        );
-        assert!(batch_claim_requires_response_snapshot(&payload));
-        let requirements: PaymentRequirements =
-            serde_json::from_value(batch_requirements_json()).unwrap();
-        assert_eq!(
-            run_ready(batch_success_response(
-                "0xtx".to_string(),
-                &payload,
-                &requirements,
-                None,
-                None,
-                None,
-            ))
-            .unwrap_err(),
-            "batch claim post-state snapshot unavailable"
-        );
-
-        let mut multi = payload.clone();
-        multi.claims = Some(vec![claim.clone(), claim]);
-        assert_eq!(batch_payload_snapshot_channel_id(&multi, &contract), None);
-        assert!(!batch_claim_requires_response_snapshot(&multi));
         let response = run_ready(batch_success_response(
             "0xtx".to_string(),
-            &multi,
+            &payload,
             &requirements,
             None,
-            None,
-            None,
+            Some("42".to_string()),
         ))
         .unwrap();
-        assert_eq!(response.amount, Some("0".to_string()));
-        assert_eq!(response.extra_json, None);
+        assert_eq!(response.amount, Some("42".to_string()));
     }
 
     #[test]
@@ -5292,26 +5840,6 @@ mod hardening_tests {
         assert_eq!(extra["totalClaimed"], "300");
         assert_eq!(extra["withdrawRequestedAt"], 42);
         assert_eq!(extra["refundNonce"], "2");
-    }
-
-    #[test]
-    fn batch_refund_nonce_increment_uses_uint256_width() {
-        assert_eq!(increment_decimal("0").unwrap(), "1");
-        assert_eq!(
-            increment_decimal("340282366920938463463374607431768211456").unwrap(),
-            "340282366920938463463374607431768211457"
-        );
-
-        let uint256_max =
-            "115792089237316195423570985008687907853269984665640564039457584007913129639935";
-        assert_eq!(
-            increment_decimal(uint256_max),
-            Err("batch refund nonce overflow".to_string())
-        );
-        assert_eq!(
-            increment_decimal("1.5"),
-            Err("batch refund nonce must be a decimal integer".to_string())
-        );
     }
 
     #[test]
@@ -5562,18 +6090,6 @@ mod hardening_tests {
     }
 
     #[test]
-    fn batch_settle_amount_helper_requires_verified_event_amount() {
-        assert_eq!(
-            verified_batch_settle_amount(Err("expected batch Settled event not found".to_string())),
-            None
-        );
-        assert_eq!(
-            verified_batch_settle_amount(Ok("0".to_string())),
-            Some("0".to_string())
-        );
-    }
-
-    #[test]
     fn supported_omits_batch_for_invalid_partial_batch_config() {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
@@ -5665,16 +6181,6 @@ mod hardening_tests {
             .unwrap()
             .iter()
             .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
-
-        set_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "2vxsx-fae");
-        let invalid_writer = supported_response();
-        let invalid_writer_value: Value = serde_json::from_slice(&invalid_writer.body).unwrap();
-        assert_eq!(invalid_writer.status_code, 200);
-        assert!(!invalid_writer_value["kinds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
     }
 
     #[test]
@@ -5684,10 +6190,13 @@ mod hardening_tests {
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
         set_default_batch_contract();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
-        set_env_value(
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
-            "ryjl3-tyaaa-aaaaa-aaaba-cai",
-        );
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
 
         let response = supported_response();
         let value: Value = serde_json::from_slice(&response.body).unwrap();
@@ -5782,6 +6291,28 @@ mod hardening_tests {
     }
 
     #[test]
+    fn stable_memory_adapter_shares_sqlite_memory_manager_without_corruption() {
+        let manager = SqliteMemoryManager::init(SqliteDefaultMemoryImpl::default());
+        let stable_memory = StableMemoryAdapter(manager.get(MemoryId::new(0)));
+        let sqlite_memory = manager.get(MemoryId::new(120));
+        let mut map: StableBTreeMap<String, String, StableMemoryAdapter> =
+            StableBTreeMap::init(stable_memory);
+
+        map.insert("alpha".to_string(), "one".to_string());
+        assert_eq!(map.get(&"alpha".to_string()), Some("one".to_string()));
+
+        assert!(SqliteRawMemory::grow(&sqlite_memory, 1) >= 0);
+        SqliteRawMemory::write(&sqlite_memory, 0, b"sqlite");
+        let mut sqlite_bytes = [0_u8; 6];
+        SqliteRawMemory::read(&sqlite_memory, 0, &mut sqlite_bytes);
+        assert_eq!(&sqlite_bytes, b"sqlite");
+
+        map.insert("beta".to_string(), "two".to_string());
+        assert_eq!(map.get(&"alpha".to_string()), Some("one".to_string()));
+        assert_eq!(map.get(&"beta".to_string()), Some("two".to_string()));
+    }
+
+    #[test]
     fn legacy_restore_is_attempted_only_when_stable_structures_are_empty() {
         clear_settlement_state();
         clear_seller_credits();
@@ -5868,12 +6399,12 @@ mod hardening_tests {
         );
 
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
-        let missing_writer = run_ready(verify_http(request()));
-        let missing_writer_value: Value = serde_json::from_slice(&missing_writer.body).unwrap();
-        assert_eq!(missing_writer.status_code, 500);
+        let missing_scope = run_ready(verify_http(request()));
+        let missing_scope_value: Value = serde_json::from_slice(&missing_scope.body).unwrap();
+        assert_eq!(missing_scope.status_code, 500);
         assert_eq!(
-            missing_writer_value["invalidMessage"],
-            "missing required env: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
+            missing_scope_value["invalidMessage"],
+            "missing enabled batch writer receiver scope"
         );
     }
 
@@ -5907,20 +6438,20 @@ mod hardening_tests {
         set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
         set_default_batch_contract();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
-        let missing_writer = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
-        let missing_writer_value: Value = serde_json::from_slice(&missing_writer.body).unwrap();
-        assert_eq!(missing_writer.status_code, 400);
+        let missing_scope = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+        let missing_scope_value: Value = serde_json::from_slice(&missing_scope.body).unwrap();
+        assert_eq!(missing_scope.status_code, 400);
         assert_eq!(
-            missing_writer_value["result"]["errorReason"],
+            missing_scope_value["result"]["errorReason"],
             "invalid_config"
         );
         assert_eq!(
-            missing_writer_value["result"]["errorMessage"],
-            "missing required env: BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL"
+            missing_scope_value["result"]["errorMessage"],
+            "missing enabled batch writer receiver scope"
         );
         assert_eq!(seller_credit_balance_for(&seller), 100);
-        assert_eq!(missing_writer_value["cost"]["rpcCalls"], 0);
-        assert!(missing_writer_value["cost"]["steps"]
+        assert_eq!(missing_scope_value["cost"]["rpcCalls"], 0);
+        assert!(missing_scope_value["cost"]["steps"]
             .as_array()
             .unwrap()
             .iter()
@@ -6217,6 +6748,7 @@ mod hardening_tests {
         assert_eq!(missing_delete.status, "unchanged");
         assert_eq!(missing_delete.current_revision, None);
 
+        register_payment_intent_for_channel(&channel);
         let created = batch_update_channel(
             channel_id.clone(),
             None,
@@ -6405,6 +6937,7 @@ mod hardening_tests {
         )
         .unwrap();
         let channel = test_initial_batch_channel(&channel_id, "100");
+        register_payment_intent_for_channel(&channel);
 
         let created = batch_update_channel(
             channel_id.clone(),
@@ -6641,6 +7174,7 @@ mod hardening_tests {
             config.salt = format!("0x{}", salt.repeat(32));
             let id = compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
             let channel = test_initial_batch_channel_for_config(&id, config, "100");
+            register_payment_intent_for_channel(&channel);
             let created = batch_update_channel(
                 id.clone(),
                 None,
@@ -6702,75 +7236,239 @@ mod hardening_tests {
             replacement_id.clone(),
             None,
             BatchChannelUpdate {
-                channel: Some(test_initial_batch_channel_for_config(
-                    &replacement_id,
-                    replacement_config,
-                    "100",
-                )),
+                channel: Some({
+                    let channel = test_initial_batch_channel_for_config(
+                        &replacement_id,
+                        replacement_config,
+                        "100",
+                    );
+                    register_payment_intent_for_channel(&channel);
+                    channel
+                }),
             },
         );
         assert_eq!(replacement.status, "updated");
     }
 
     #[test]
-    fn batch_channel_storage_writer_principal_must_be_valid() {
+    fn batch_sqlite_admin_apis_manage_scope_seller_and_intent() {
         clear_env_values();
-        assert_eq!(batch_channel_storage_writer_principal().unwrap(), None);
+        let writer = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
 
-        set_env_value(
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
-            "ryjl3-tyaaa-aaaaa-aaaba-cai",
-        );
-        assert_eq!(
-            batch_channel_storage_writer_principal().unwrap(),
-            Some(Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap())
-        );
-        assert_eq!(
-            batch_channel_storage_writer(),
-            Some(Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap())
-        );
+        let seller = batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        assert_eq!(seller.receiver_address, PAY_TO.to_ascii_lowercase());
+        assert_eq!(seller.status, "active");
 
-        set_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "2vxsx-fae");
+        let scope = batch_set_writer_receiver_scope(writer, PAY_TO.to_string(), true).unwrap();
+        assert_eq!(scope.writer_principal, writer);
+        assert_eq!(scope.receiver_address, PAY_TO.to_ascii_lowercase());
+        assert!(scope.enabled);
+        assert_eq!(batch_writer_receiver_scope_count(), 1);
+        let disabled = batch_set_seller(PAY_TO.to_string(), "disabled".to_string()).unwrap();
+        assert_eq!(disabled.status, "disabled");
+        assert_eq!(batch_writer_receiver_scope_count(), 0);
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        assert_eq!(batch_writer_receiver_scope_count(), 1);
         assert_eq!(
-            batch_channel_storage_writer_principal().unwrap_err(),
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be a non-system IC principal"
+            batch_writer_receiver_scope(writer, PAY_TO.to_string()).unwrap(),
+            scope
         );
-        assert_eq!(batch_channel_storage_writer(), None);
+        assert_eq!(batch_writer_receiver_scopes(Some(10)).len(), 1);
 
-        set_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "not a principal");
+        let intent = batch_create_payment_intent(
+            "intent-1".to_string(),
+            PAY_TO.to_string(),
+            PAYER.to_string(),
+            "https://example.test/report".to_string(),
+            "100".to_string(),
+            format!("0x{}", "33".repeat(32)),
+        )
+        .unwrap();
+        assert_eq!(intent.receiver_address, PAY_TO.to_ascii_lowercase());
+        assert_eq!(intent.payer_address, PAYER.to_ascii_lowercase());
+        assert_eq!(intent.nonce, format!("0x{}", "33".repeat(32)));
+        assert_eq!(intent.status, "created");
+
+        let marked = batch_mark_payment_intent("intent-1".to_string(), "paid".to_string()).unwrap();
+        assert_eq!(marked.status, "paid");
         assert_eq!(
-            batch_channel_storage_writer_principal().unwrap_err(),
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal"
+            batch_payment_intent("intent-1".to_string()).unwrap().status,
+            "paid"
+        );
+        assert_eq!(
+            batch_set_seller(PAY_TO.to_string(), "suspended".to_string()).unwrap_err(),
+            "seller status must be active or disabled"
+        );
+        assert_eq!(
+            batch_mark_payment_intent("intent-1".to_string(), "unknown".to_string()).unwrap_err(),
+            "payment intent status must be created, bound, paid, or cancelled"
+        );
+        assert_eq!(
+            batch_create_payment_intent(
+                "intent-bad".to_string(),
+                PAY_TO.to_string(),
+                PAYER.to_string(),
+                "https://example.test/report".to_string(),
+                "0".to_string(),
+                format!("0x{}", "33".repeat(32)),
+            )
+            .unwrap_err(),
+            "amount must be a positive integer"
         );
     }
 
     #[test]
-    fn batch_channel_storage_writer_guard_authorizes_only_controller_or_configured_writer() {
+    fn batch_channel_create_requires_matching_created_payment_intent() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_contract();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+
+        let missing = test_initial_batch_channel(&channel_id, "100");
+        let result = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(missing),
+            },
+        );
+        assert_eq!(result.status, "invalid");
+        assert_eq!(
+            result.message,
+            Some("sqlite error: payment intent not found".to_string())
+        );
+
+        let intent_mismatch_cases: [(&str, fn(&mut BatchPaymentIntent), &str); 5] = [
+            (
+                "101",
+                |intent: &mut BatchPaymentIntent| intent.status = "cancelled".to_string(),
+                "sqlite error: payment intent status must be created",
+            ),
+            (
+                "102",
+                |intent: &mut BatchPaymentIntent| {
+                    intent.receiver_address = PAYER.to_ascii_lowercase()
+                },
+                "sqlite error: payment intent receiver mismatch",
+            ),
+            (
+                "103",
+                |intent: &mut BatchPaymentIntent| {
+                    intent.payer_address = PAY_TO.to_ascii_lowercase()
+                },
+                "sqlite error: payment intent payer mismatch",
+            ),
+            (
+                "104",
+                |intent: &mut BatchPaymentIntent| intent.amount = "999".to_string(),
+                "sqlite error: payment intent amount mismatch",
+            ),
+            (
+                "105",
+                |intent: &mut BatchPaymentIntent| intent.nonce = format!("0x{}", "44".repeat(32)),
+                "sqlite error: payment intent nonce mismatch",
+            ),
+        ];
+        for (amount, mutate, expected) in intent_mismatch_cases {
+            let channel = test_initial_batch_channel(&channel_id, amount);
+            register_payment_intent_for_channel(&channel);
+            let intent_id = channel.pending_request.as_ref().unwrap().pending_id.clone();
+            TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+                mutate(intents.borrow_mut().get_mut(&intent_id).unwrap());
+            });
+            let result = batch_update_channel(
+                channel_id.clone(),
+                None,
+                BatchChannelUpdate {
+                    channel: Some(channel),
+                },
+            );
+            assert_eq!(result.status, "invalid");
+            assert_eq!(result.message, Some(expected.to_string()));
+        }
+
+        let channel = test_initial_batch_channel(&channel_id, "200");
+        let intent_id = channel.pending_request.as_ref().unwrap().pending_id.clone();
+        register_payment_intent_for_channel(&channel);
+        let created = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(channel),
+            },
+        );
+        assert_eq!(created.status, "updated");
+        assert_eq!(
+            batch_payment_intent(intent_id.clone()).unwrap().status,
+            "bound"
+        );
+        TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
+            let binding = bindings.borrow().get(&channel_id).cloned().unwrap();
+            assert_eq!(binding.0, PAY_TO.to_ascii_lowercase());
+            assert_eq!(binding.1, PAYER.to_ascii_lowercase());
+            assert_eq!(binding.3, intent_id);
+        });
+    }
+
+    #[test]
+    fn batch_channel_update_authorizes_by_receiver_scope() {
         clear_env_values();
         let writer = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
         let other = Principal::from_text("r7inp-6aaaa-aaaaa-aaabq-cai").unwrap();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_initial_batch_channel(&channel_id, "100");
 
+        set_test_batch_caller(Principal::anonymous(), false);
         assert_eq!(
-            authorize_batch_channel_storage_writer(Principal::anonymous(), false).unwrap_err(),
-            "anonymous caller is not authorized to update batch channel storage"
-        );
-        assert!(authorize_batch_channel_storage_writer(other, true).is_ok());
-        assert_eq!(
-            authorize_batch_channel_storage_writer(other, false).unwrap_err(),
-            "caller is not authorized to update batch channel storage"
-        );
-
-        set_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", &writer.to_text());
-        assert!(authorize_batch_channel_storage_writer(writer, false).is_ok());
-        assert_eq!(
-            authorize_batch_channel_storage_writer(other, false).unwrap_err(),
-            "caller is not authorized to update batch channel storage"
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            "caller must be a non-system IC principal"
         );
 
-        set_env_value("BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL", "not a principal");
+        set_test_batch_caller(other, true);
+        assert!(authorize_batch_channel_update(None, Some(&channel)).is_ok());
+
+        set_test_batch_caller(other, false);
         assert_eq!(
-            authorize_batch_channel_storage_writer(writer, false).unwrap_err(),
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL must be an IC principal"
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            format!(
+                "caller is not authorized for receiver {}",
+                PAY_TO.to_ascii_lowercase()
+            )
+        );
+
+        set_test_batch_caller(writer, true);
+        batch_set_writer_receiver_scope(writer, PAY_TO.to_string(), true).unwrap();
+        set_test_batch_caller(writer, false);
+        assert_eq!(
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            format!(
+                "caller is not authorized for receiver {}",
+                PAY_TO.to_ascii_lowercase()
+            )
+        );
+
+        set_test_batch_caller(writer, true);
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        set_test_batch_caller(writer, false);
+        assert!(authorize_batch_channel_update(None, Some(&channel)).is_ok());
+
+        set_test_batch_caller(writer, true);
+        batch_set_writer_receiver_scope(writer, PAY_TO.to_string(), false).unwrap();
+        set_test_batch_caller(writer, false);
+        assert_eq!(
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            format!(
+                "caller is not authorized for receiver {}",
+                PAY_TO.to_ascii_lowercase()
+            )
         );
     }
 
@@ -7200,10 +7898,13 @@ mod hardening_tests {
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
         set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
-        set_env_value(
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
-            "ryjl3-tyaaa-aaaaa-aaaba-cai",
-        );
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
         let seller = normalize_evm_address("seller", PAY_TO).unwrap();
         add_seller_credit(&seller, 100);
 
@@ -7238,10 +7939,13 @@ mod hardening_tests {
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
         set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
-        set_env_value(
-            "BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
-            "ryjl3-tyaaa-aaaaa-aaaba-cai",
-        );
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
         let seller = normalize_evm_address("seller", PAY_TO).unwrap();
         add_seller_credit(&seller, 100);
 

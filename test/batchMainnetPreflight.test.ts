@@ -86,7 +86,6 @@ class CountingReader extends FakeReader {
 
 function baseEnv(): NodeJS.ProcessEnv {
   return {
-    BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "ryjl3-tyaaa-aaaaa-aaaba-cai",
     BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: "0x2222222222222222222222222222222222222222222222222222222222222222",
     BATCH_SETTLEMENT_CONTRACT: batchContract,
     BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -174,7 +173,6 @@ describe("batch mainnet preflight", () => {
       .toBe("未設定");
     expect(report.checks.find((check) => check.name === "env:BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY")?.status).toBe("fail");
     expect(report.checks.find((check) => check.name === "env:BATCH_SETTLEMENT_FEE_AMOUNT")?.status).toBe("fail");
-    expect(report.checks.find((check) => check.name === "env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL")?.status).toBe("fail");
   });
 
   it("rejects a non-JPYC EIP-712 version and unsafe withdraw delay", async () => {
@@ -291,30 +289,6 @@ describe("batch mainnet preflight", () => {
     expect(report.checks).toContainEqual({
       detail: `official @x402/evm BATCH_SETTLEMENT_ADDRESS ${batchContract} と不一致`,
       name: "env:BATCH_SETTLEMENT_CONTRACT",
-      status: "fail"
-    });
-  });
-
-  it("rejects invalid batch channel storage writer principal", async () => {
-    const invalid = await checkBatchMainnetPreflight({
-      env: { ...baseEnv(), BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "not a principal" },
-      reader: new FakeReader({ batchCode: contractCode })
-    });
-    expect(invalid.ready).toBe(false);
-    expect(invalid.checks).toContainEqual({
-      detail: "IC principal ではない",
-      name: "env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
-      status: "fail"
-    });
-
-    const system = await checkBatchMainnetPreflight({
-      env: { ...baseEnv(), BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL: "2vxsx-fae" },
-      reader: new FakeReader({ batchCode: contractCode })
-    });
-    expect(system.ready).toBe(false);
-    expect(system.checks).toContainEqual({
-      detail: "system principal は不可",
-      name: "env:BATCH_CHANNEL_STORAGE_WRITER_PRINCIPAL",
       status: "fail"
     });
   });

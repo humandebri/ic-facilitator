@@ -71,6 +71,7 @@ const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_LIST_LIMIT = 1000;
 const MAX_LIST_LIMIT = 1000;
 const MAX_BATCH_STRING_BYTES = 512;
+const UTF8_ENCODER = new TextEncoder();
 const UINT128_MAX = (1n << 128n) - 1n;
 const MIN_BATCH_WITHDRAW_DELAY_SECONDS = 900;
 const MAX_BATCH_WITHDRAW_DELAY_SECONDS = 2_592_000;
@@ -202,20 +203,20 @@ function fromIcChannel(channel: IcBatchChannel): BatchChannel {
     signature: requireHexBytes(channel.signature, "signature", 65),
     balance,
     totalClaimed,
-    withdrawRequestedAt: safeNumber(channel.withdraw_requested_at, "withdrawRequestedAt"),
+    withdrawRequestedAt: safeEpochMs(channel.withdraw_requested_at, "withdrawRequestedAt"),
     refundNonce: safeDecimalNumber(channel.refund_nonce, "refundNonce"),
-    lastRequestTimestamp: safeNumber(channel.last_request_timestamp, "lastRequestTimestamp")
+    lastRequestTimestamp: safeEpochMs(channel.last_request_timestamp, "lastRequestTimestamp")
   };
   const onchainSyncedAt = optionalValue(channel.onchain_synced_at);
   if (onchainSyncedAt !== undefined) {
-    out.onchainSyncedAt = safeNumber(onchainSyncedAt, "onchainSyncedAt");
+    out.onchainSyncedAt = safeEpochMs(onchainSyncedAt, "onchainSyncedAt");
   }
   const pendingRequest = optionalValue(channel.pending_request);
   if (pendingRequest !== undefined) {
     out.pendingRequest = {
       pendingId: requireLimitedNonEmptyString(pendingRequest.pending_id, "pendingRequest.pendingId"),
       signedMaxClaimable: requirePendingSignedMaxClaimable(pendingRequest.signed_max_claimable, chargedCumulativeAmount),
-      expiresAt: safePositiveNumber(pendingRequest.expires_at, "pendingRequest.expiresAt")
+      expiresAt: safePositiveEpochMs(pendingRequest.expires_at, "pendingRequest.expiresAt")
     };
   }
   return out;
@@ -243,21 +244,21 @@ function toIcChannel(channel: BatchChannel, revision: bigint): IcBatchChannel {
     signature: requireHexBytes(channel.signature, "signature", 65),
     balance,
     total_claimed: totalClaimed,
-    withdraw_requested_at: BigInt(nonNegativeSafeInteger(channel.withdrawRequestedAt, "withdrawRequestedAt")),
+    withdraw_requested_at: BigInt(nonNegativeSafeInteger(channel.withdrawRequestedAt, "withdrawRequestedAtMs")),
     refund_nonce: String(nonNegativeSafeInteger(channel.refundNonce, "refundNonce")),
     onchain_synced_at: [],
-    last_request_timestamp: BigInt(nonNegativeSafeInteger(channel.lastRequestTimestamp, "lastRequestTimestamp")),
+    last_request_timestamp: BigInt(nonNegativeSafeInteger(channel.lastRequestTimestamp, "lastRequestTimestampMs")),
     pending_request: [],
     revision
   };
   if (channel.onchainSyncedAt !== undefined) {
-    out.onchain_synced_at = [BigInt(nonNegativeSafeInteger(channel.onchainSyncedAt, "onchainSyncedAt"))];
+    out.onchain_synced_at = [BigInt(nonNegativeSafeInteger(channel.onchainSyncedAt, "onchainSyncedAtMs"))];
   }
   if (channel.pendingRequest !== undefined) {
     out.pending_request = [{
       pending_id: requireLimitedNonEmptyString(channel.pendingRequest.pendingId, "pendingRequest.pendingId"),
       signed_max_claimable: requirePendingSignedMaxClaimable(channel.pendingRequest.signedMaxClaimable, chargedCumulativeAmount),
-      expires_at: BigInt(positiveSafeInteger(channel.pendingRequest.expiresAt, "pendingRequest.expiresAt"))
+      expires_at: BigInt(positiveSafeInteger(channel.pendingRequest.expiresAt, "pendingRequest.expiresAtMs"))
     }];
   }
   return out;
@@ -321,7 +322,7 @@ function requireMonotonicChannelUpdate(current: BatchChannel | undefined, next: 
   requireMonotonicDecimal("signedMaxClaimable", current.signedMaxClaimable, next.signedMaxClaimable);
   requireMonotonicDecimal("totalClaimed", current.totalClaimed, next.totalClaimed);
   requireMonotonicDecimal("refundNonce", String(current.refundNonce), String(next.refundNonce));
-  requireMonotonicNumber("lastRequestTimestamp", current.lastRequestTimestamp, next.lastRequestTimestamp);
+  requireMonotonicNumber("lastRequestTimestampMs", current.lastRequestTimestamp, next.lastRequestTimestamp);
   return next;
 }
 
@@ -473,6 +474,14 @@ function safePositiveNumber(value: bigint, label: string): number {
   return checked;
 }
 
+function safeEpochMs(value: bigint, label: string): number {
+  return safeNumber(value, `${label}Ms`);
+}
+
+function safePositiveEpochMs(value: bigint, label: string): number {
+  return safePositiveNumber(value, `${label}Ms`);
+}
+
 function safeDecimalNumber(value: string, label: string): number {
   requireDecimalString(value, label);
   return safeNumber(BigInt(value), label);
@@ -486,7 +495,7 @@ function requireBatchWithdrawDelay(value: number): number {
 }
 
 function requireDecimalString(value: string, label: string): string {
-  if (value.length > MAX_BATCH_STRING_BYTES) {
+  if (utf8ByteLength(value) > MAX_BATCH_STRING_BYTES) {
     throw new Error(`${label} exceeds ${MAX_BATCH_STRING_BYTES} bytes`);
   }
   if (!/^[0-9]+$/.test(value)) {
@@ -504,7 +513,7 @@ function requireUint128DecimalString(value: string, label: string): string {
 }
 
 function requireLimitedNonEmptyString(value: string, label: string): string {
-  if (value.length > MAX_BATCH_STRING_BYTES) {
+  if (utf8ByteLength(value) > MAX_BATCH_STRING_BYTES) {
     throw new Error(`${label} exceeds ${MAX_BATCH_STRING_BYTES} bytes`);
   }
   if (value.trim() === "") {
@@ -562,4 +571,8 @@ function optionalValue<T>(value: CandidOpt<T>): T | undefined {
 
 function isHexString(value: string): value is HexString {
   return /^0x[0-9a-fA-F]*$/.test(value);
+}
+
+function utf8ByteLength(value: string): number {
+  return UTF8_ENCODER.encode(value).length;
 }

@@ -391,7 +391,7 @@ describe("IcBatchChannelStorage", () => {
       ["signedMaxClaimable", (channel: BatchChannel) => ({ ...channel, signedMaxClaimable: "150" }), "signedMaxClaimable must not decrease"],
       ["totalClaimed", (channel: BatchChannel) => ({ ...channel, totalClaimed: "49" }), "totalClaimed must not decrease"],
       ["refundNonce", (channel: BatchChannel) => ({ ...channel, refundNonce: 2 }), "refundNonce must not decrease"],
-      ["lastRequestTimestamp", (channel: BatchChannel) => ({ ...channel, lastRequestTimestamp: 0 }), "lastRequestTimestamp must not decrease"]
+      ["lastRequestTimestamp", (channel: BatchChannel) => ({ ...channel, lastRequestTimestamp: 0 }), "lastRequestTimestampMs must not decrease"]
     ] as const) {
       await expect(storage.updateChannel(channelId, (channel) => {
         if (channel === undefined) {
@@ -610,6 +610,14 @@ describe("IcBatchChannelStorage", () => {
     const readClient = new FakeBatchChannelClient([unsafe]);
     await expect(new IcBatchChannelStorage(readClient).get(channelId)).rejects.toThrow("refundNonce exceeds MAX_SAFE_INTEGER");
 
+    const unsafeExpiresAt = icChannel(channelId, 1, "100");
+    unsafeExpiresAt.pending_request = [{
+      pending_id: "request-1",
+      signed_max_claimable: "125",
+      expires_at: BigInt(Number.MAX_SAFE_INTEGER) + 1n
+    }];
+    await expect(new IcBatchChannelStorage(new FakeBatchChannelClient([unsafeExpiresAt])).get(channelId)).rejects.toThrow("pendingRequest.expiresAtMs exceeds MAX_SAFE_INTEGER");
+
     const writeClient = new FakeBatchChannelClient([icChannel(channelId, 1, "100")]);
     const storage = new IcBatchChannelStorage(writeClient);
     await expect(storage.updateChannel(channelId, (current) => {
@@ -618,6 +626,76 @@ describe("IcBatchChannelStorage", () => {
       }
       return { ...current, refundNonce: Number.MAX_SAFE_INTEGER + 1 };
     })).rejects.toThrow("refundNonce must be a non-negative safe integer");
+
+    await expect(storage.updateChannel(channelId, (current) => {
+      if (current === undefined) {
+        throw new Error("expected current channel");
+      }
+      return { ...current, lastRequestTimestamp: Number.MAX_SAFE_INTEGER + 1 };
+    })).rejects.toThrow("lastRequestTimestampMs must be a non-negative safe integer");
+  });
+
+  it("treats pendingRequest.expiresAt as millisecond epoch for live request checks", async () => {
+    const channelId = "0x" + "78".repeat(32);
+    const secondsEpoch = icChannel(channelId, 1, "100");
+    secondsEpoch.pending_request = [{
+      pending_id: "request-seconds",
+      signed_max_claimable: "125",
+      expires_at: BigInt(Math.floor(Date.now() / 1_000) + 60)
+    }];
+    const secondsStorage = new IcBatchChannelStorage(new FakeBatchChannelClient([secondsEpoch]));
+    await expect(secondsStorage.updateChannel(channelId, (current) => {
+      if (current === undefined) {
+        throw new Error("expected current channel");
+      }
+      return { ...omitPendingRequest(current), chargedCumulativeAmount: "125", signedMaxClaimable: "125" };
+    })).rejects.toThrow("chargedCumulativeAmount increase requires live pendingRequest");
+
+    const millisEpoch = icChannel(channelId, 1, "100");
+    millisEpoch.pending_request = [{
+      pending_id: "request-ms",
+      signed_max_claimable: "125",
+      expires_at: BigInt(Date.now() + 60_000)
+    }];
+    const millisStorage = new IcBatchChannelStorage(new FakeBatchChannelClient([millisEpoch]));
+    await expect(millisStorage.updateChannel(channelId, (current) => {
+      if (current === undefined) {
+        throw new Error("expected current channel");
+      }
+      return { ...omitPendingRequest(current), chargedCumulativeAmount: "125", signedMaxClaimable: "125" };
+    })).resolves.toMatchObject({
+      channel: {
+        chargedCumulativeAmount: "125"
+      },
+      status: "updated"
+    });
+  });
+
+  it("enforces batch string limits by UTF-8 byte length", async () => {
+    const channelId = "0x" + "79".repeat(32);
+    const ascii512 = icChannel(channelId, 1, "100");
+    ascii512.pending_request = [{
+      pending_id: "a".repeat(512),
+      signed_max_claimable: "125",
+      expires_at: BigInt(Date.now() + 60_000)
+    }];
+    await expect(new IcBatchChannelStorage(new FakeBatchChannelClient([ascii512])).get(channelId)).resolves.toMatchObject({
+      pendingRequest: {
+        pendingId: "a".repeat(512)
+      }
+    });
+
+    const utf8OverLimit = icChannel(channelId, 1, "100");
+    utf8OverLimit.pending_request = [{
+      pending_id: "あ".repeat(171),
+      signed_max_claimable: "125",
+      expires_at: BigInt(Date.now() + 60_000)
+    }];
+    await expect(new IcBatchChannelStorage(new FakeBatchChannelClient([utf8OverLimit])).get(channelId)).rejects.toThrow("pendingRequest.pendingId exceeds 512 bytes");
+
+    const decimalOverLimit = icChannel(channelId, 1, "100");
+    decimalOverLimit.charged_cumulative_amount = `${"１".repeat(171)}`;
+    await expect(new IcBatchChannelStorage(new FakeBatchChannelClient([decimalOverLimit])).get(channelId)).rejects.toThrow("chargedCumulativeAmount exceeds 512 bytes");
   });
 
   it("rejects channel fields that would fail canister storage validation", async () => {
@@ -680,7 +758,7 @@ describe("IcBatchChannelStorage", () => {
       signed_max_claimable: "125",
       expires_at: 0n
     }];
-    await expect(new IcBatchChannelStorage(new FakeBatchChannelClient([expiredPending])).get(channelId)).rejects.toThrow("pendingRequest.expiresAt must be positive");
+    await expect(new IcBatchChannelStorage(new FakeBatchChannelClient([expiredPending])).get(channelId)).rejects.toThrow("pendingRequest.expiresAtMs must be positive");
 
     const writeClient = new FakeBatchChannelClient([icChannel(channelId, 1, "100")]);
     const storage = new IcBatchChannelStorage(writeClient);

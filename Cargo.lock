@@ -587,6 +587,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ic-sqlite-vfs"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a6bc33e70e071a359f0c3669fe770262561b4c5700a39ac82a4ad827a2f3d2c"
+dependencies = [
+ "candid",
+ "cc",
+ "ic-cdk",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ic-stable-structures"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,6 +752,7 @@ dependencies = [
  "hex",
  "ic-canister-runtime",
  "ic-cdk",
+ "ic-sqlite-vfs",
  "ic-stable-structures",
  "k256",
  "rlp",
