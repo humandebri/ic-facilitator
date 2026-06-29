@@ -11,7 +11,7 @@
     "doctor": "node --import tsx scripts/doctor.ts",
     "ic:clean:local": "scripts/clean_local_ic.sh --yes",
     "ic:deploy:local": "icp deploy edge --yes",
-    "ic:deploy:mainnet": "icp deploy -e ic edge --yes",
+    "ic:deploy:mainnet": "icp deploy -e ic edge --subnet re2t4-faa75-v3vhk-kdmdr-uyrkl-aik2l-ixd6u-p3fyr-zlfkc-6c5af-zae --yes",
     "ic:env:local": "scripts/set_canister_env.sh local",
     "ic:env:mainnet": "scripts/set_canister_env.sh ic",
     "lint:hidden-unicode": "node scripts/check_hidden_unicode.mjs",

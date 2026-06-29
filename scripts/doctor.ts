@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 
 import { positiveDecimalToAtomicUnits } from "../src/amount";
 import { loadDotenv } from "./env_file";
+import { isPolygonRpcUrl } from "./rpc_url";
 
 export type DoctorMode = "all" | "buyer" | "canister";
 export type DoctorStatus = "fail" | "ok" | "warn";
@@ -216,8 +217,8 @@ function buyerEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   if (privateKey && !isPrivateKey(privateKey)) {
     checks.push(fail(`env-format:${BUYER_SIGNER_ENV}`, "0x-prefixed 32-byte private key ではない"));
   }
-  if (rpcUrl && !isHttpUrl(rpcUrl)) {
-    checks.push(fail("env-format:POLYGON_RPC_URL", "http(s) URL ではない"));
+  if (rpcUrl && !isPolygonRpcUrl(rpcUrl)) {
+    checks.push(fail("env-format:POLYGON_RPC_URL", "userinfo/fragment なしの HTTPS URL ではない"));
   }
   if (targetUrl && !isHttpUrl(targetUrl)) {
     checks.push(fail("env-format:X402_TARGET_URL", "http(s) URL ではない"));

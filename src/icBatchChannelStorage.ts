@@ -318,6 +318,7 @@ function requireMonotonicChannelUpdate(current: BatchChannel | undefined, next: 
   }
   requireStableChannelConfig(current, next);
   requirePendingChargeCommit(current, next);
+  requireStablePendingRequest(current, next);
   requireMonotonicDecimal("chargedCumulativeAmount", current.chargedCumulativeAmount, next.chargedCumulativeAmount);
   requireMonotonicDecimal("signedMaxClaimable", current.signedMaxClaimable, next.signedMaxClaimable);
   requireMonotonicDecimal("totalClaimed", current.totalClaimed, next.totalClaimed);
@@ -375,6 +376,24 @@ function requireInitialChannelCreate(next: BatchChannel): void {
   }
 }
 
+function requireStablePendingRequest(current: BatchChannel, next: BatchChannel): void {
+  const currentPending = current.pendingRequest;
+  const nextPending = next.pendingRequest;
+  if (nextPending === undefined) {
+    return;
+  }
+  if (currentPending === undefined || currentPending.pendingId !== nextPending.pendingId) {
+    return;
+  }
+  if (
+    currentPending.signedMaxClaimable !== nextPending.signedMaxClaimable ||
+    currentPending.expiresAt !== nextPending.expiresAt ||
+    current.signedMaxClaimable !== next.signedMaxClaimable
+  ) {
+    throw new Error("batch channel pendingRequest must not change for the same pendingId");
+  }
+}
+
 function requirePendingChargeCommit(current: BatchChannel, next: BatchChannel): void {
   const currentCharged = BigInt(requireDecimalString(current.chargedCumulativeAmount, "chargedCumulativeAmount"));
   const nextCharged = BigInt(requireDecimalString(next.chargedCumulativeAmount, "chargedCumulativeAmount"));
@@ -393,6 +412,9 @@ function requirePendingChargeCommit(current: BatchChannel, next: BatchChannel): 
   }
   if (next.signedMaxClaimable !== pending.signedMaxClaimable) {
     throw new Error("signedMaxClaimable must match pendingRequest.signedMaxClaimable when charge increases");
+  }
+  if (next.chargedCumulativeAmount !== pending.signedMaxClaimable) {
+    throw new Error("chargedCumulativeAmount must match pendingRequest.signedMaxClaimable when charge increases");
   }
 }
 

@@ -152,6 +152,27 @@ describe("doctor helpers", () => {
     expect(checks.some((check) => check.name === "env-format:SELLER_EVM_ADDRESS")).toBe(true);
   });
 
+  it("rejects non-HTTPS Polygon RPC URLs for buyer env", () => {
+    for (const value of [
+      "http://polygon.example",
+      "https://trusted.example@evil.example",
+      "https://polygon.example/#x",
+      "https://polygon.example/v2/key#x"
+    ]) {
+      const checks = collectChecks(".", {
+        BUYER_EVM_PRIVATE_KEY: privateKey,
+        POLYGON_RPC_URL: value,
+        X402_TARGET_URL: "https://example.test/jpyc/report"
+      }, "buyer");
+
+      expect(checks).toContainEqual(expect.objectContaining({
+        detail: "userinfo/fragment なしの HTTPS URL ではない",
+        name: "env-format:POLYGON_RPC_URL",
+        status: "fail"
+      }));
+    }
+  });
+
   it("keeps buyer checks independent from canister toolchain", () => {
     const checks = collectChecks(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,

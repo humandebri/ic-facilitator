@@ -8,6 +8,7 @@ import { polygon } from "viem/chains";
 
 import { positiveDecimalToAtomicUnits } from "../src/amount";
 import { loadDotenv } from "./env_file";
+import { normalizePolygonRpcUrl } from "./rpc_url";
 
 const DEFAULT_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const DEFAULT_JPYC_PRICE = "1";
@@ -98,7 +99,7 @@ type WalletState = {
 };
 
 async function loadWalletState(privateKey: Hex): Promise<WalletState> {
-  const rpcUrl = requireEnv("POLYGON_RPC_URL");
+  const rpcUrl = normalizePolygonRpcUrl(requireEnv("POLYGON_RPC_URL"));
   const account = privateKeyToAccount(privateKey);
   const jpyc = readAddress("JPYC_POLYGON_ADDRESS", DEFAULT_JPYC_POLYGON_ADDRESS);
   const requiredAmount = readAmount("JPYC_PRICE", DEFAULT_JPYC_PRICE);

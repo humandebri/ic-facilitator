@@ -1,4 +1,6 @@
 // test/icBatchChannelStorage.test.ts: ICP-backed x402 batch ChannelStorage の CAS retry を確認する。
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 import { computeChannelId } from "@x402/evm/batch-settlement/client";
 import { BatchSettlementEvmScheme } from "@x402/evm/batch-settlement/server";
@@ -24,6 +26,61 @@ import {
 } from "../src/icBatchChannelStorage";
 
 describe("IcBatchChannelStorage", () => {
+  it("matches the generated DID batch channel storage shape", () => {
+    const did = readFileSync(new URL("../dist/facilitator.did", import.meta.url), "utf8");
+
+    expect(recordFields(did, "BatchChannel")).toEqual({
+      balance: "text",
+      channel_config: "BatchChannelConfig",
+      channel_id: "text",
+      charged_cumulative_amount: "text",
+      last_request_timestamp: "nat64",
+      onchain_synced_at: "opt nat64",
+      pending_request: "opt BatchPendingRequest",
+      refund_nonce: "text",
+      revision: "nat64",
+      signature: "text",
+      signed_max_claimable: "text",
+      total_claimed: "text",
+      withdraw_requested_at: "nat64"
+    });
+    expect(recordFields(did, "BatchChannelConfig")).toEqual({
+      payer: "text",
+      payer_authorizer: "text",
+      receiver: "text",
+      receiver_authorizer: "text",
+      salt: "text",
+      token: "text",
+      withdraw_delay: "nat64"
+    });
+    expect(recordFields(did, "BatchChannelUpdate")).toEqual({
+      channel: "opt BatchChannel"
+    });
+    expect(recordFields(did, "BatchChannelUpdateResult")).toEqual({
+      channel: "opt BatchChannel",
+      current_revision: "opt nat64",
+      message: "opt text",
+      status: "text"
+    });
+    expect(recordFields(did, "BatchPendingRequest")).toEqual({
+      expires_at: "nat64",
+      pending_id: "text",
+      signed_max_claimable: "text"
+    });
+    expect(recordFields(did, "BatchPaymentIntent")).toEqual({
+      amount: "text",
+      created_at: "nat64",
+      intent_id: "text",
+      nonce: "text",
+      payer_address: "text",
+      pending_id: "opt text",
+      receiver_address: "text",
+      resource_url: "text",
+      status: "text",
+      updated_at: "nat64"
+    });
+  });
+
   it("implements get/list/updateChannel over the canister CAS API", async () => {
     const channel = icChannel("0x" + "11".repeat(32), 1, "100");
     channel.pending_request = livePending("200");
@@ -500,6 +557,43 @@ describe("IcBatchChannelStorage", () => {
       }
       return { ...current, chargedCumulativeAmount: "125", pendingRequest, signedMaxClaimable: "125" };
     })).rejects.toThrow("chargedCumulativeAmount increase must consume pendingRequest");
+  });
+
+  it("rejects same pendingId amount and expiry mutation before update", async () => {
+    const channelId = "0x" + "49".repeat(32);
+    const current = icChannel(channelId, 1, "100");
+    current.pending_request = livePending("125");
+
+    const amountClient = new FakeBatchChannelClient([current]);
+    await expect(new IcBatchChannelStorage(amountClient).updateChannel(channelId, (channel) => {
+      if (channel === undefined || channel.pendingRequest === undefined) {
+        throw new Error("expected current pending request");
+      }
+      return {
+        ...channel,
+        pendingRequest: {
+          ...channel.pendingRequest,
+          signedMaxClaimable: "150"
+        },
+        signedMaxClaimable: "150"
+      };
+    })).rejects.toThrow("batch channel pendingRequest must not change for the same pendingId");
+    expect(amountClient.updateCalls).toBe(0);
+
+    const expiryClient = new FakeBatchChannelClient([current]);
+    await expect(new IcBatchChannelStorage(expiryClient).updateChannel(channelId, (channel) => {
+      if (channel === undefined || channel.pendingRequest === undefined) {
+        throw new Error("expected current pending request");
+      }
+      return {
+        ...channel,
+        pendingRequest: {
+          ...channel.pendingRequest,
+          expiresAt: channel.pendingRequest.expiresAt + 1_000
+        }
+      };
+    })).rejects.toThrow("batch channel pendingRequest must not change for the same pendingId");
+    expect(expiryClient.updateCalls).toBe(0);
   });
 
   it("rejects list truncation before returning partial batch settlement state", async () => {
@@ -1072,6 +1166,36 @@ function cloneIc(channel: IcBatchChannel): IcBatchChannel {
   out.onchain_synced_at = channel.onchain_synced_at[0] === undefined ? [] : [channel.onchain_synced_at[0]];
   out.pending_request = channel.pending_request[0] === undefined ? [] : [{ ...channel.pending_request[0] }];
   return out;
+}
+
+function recordFields(did: string, typeName: string): Record<string, string> {
+  const pattern = new RegExp(`type ${typeName} = record \\{([\\s\\S]*?)\\};`);
+  const match = did.match(pattern);
+  if (!match) {
+    throw new Error(`missing DID record ${typeName}`);
+  }
+  const body = match[1];
+  if (body === undefined) {
+    throw new Error(`missing DID record body ${typeName}`);
+  }
+  const fields: Record<string, string> = {};
+  for (const rawLine of body.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+    const field = line.match(/^([a-z_]+) : (.+?);?$/);
+    if (!field) {
+      throw new Error(`invalid DID field in ${typeName}: ${line}`);
+    }
+    const name = field[1];
+    const type = field[2];
+    if (name === undefined || type === undefined) {
+      throw new Error(`invalid DID field in ${typeName}: ${line}`);
+    }
+    fields[name] = type;
+  }
+  return fields;
 }
 
 function hex(value: string): HexString {

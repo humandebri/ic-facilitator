@@ -851,6 +851,12 @@ fn validate_charge_increase_consumes_pending(
                 .to_string(),
         );
     }
+    if next.charged_cumulative_amount != pending.signed_max_claimable {
+        return Err(
+            "batch channel chargedCumulativeAmount must match pendingRequest.signedMaxClaimable when charge increases"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 

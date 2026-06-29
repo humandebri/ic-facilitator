@@ -45,6 +45,12 @@ pub enum ContractSettlementOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastedTransaction {
+    pub nonce: u128,
+    pub tx: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettlementSendError {
     GasTooExpensive,
     Other(String),
@@ -111,12 +117,12 @@ pub async fn batch_unsettled_amount(
     decimal_sub(&state.total_claimed, &state.total_settled).map(Some)
 }
 
-pub async fn send_settlement(
+pub async fn broadcast_settlement(
     config: &RpcConfig,
     private_key: &str,
     request: &FacilitatorRequest,
     nonce: u128,
-) -> Result<SettlementOutcome, SettlementSendError> {
+) -> Result<BroadcastedTransaction, SettlementSendError> {
     let data = encode_settle_calldata(&request.payment_payload.payload)?;
     let from = crate::private_key_address(private_key)?;
     let fees = fee_quote(config).await?;
@@ -156,18 +162,25 @@ pub async fn send_settlement(
         private_key,
     )?;
     let tx = send_raw_transaction(config, &raw).await?;
-    let status = receipt_status_for_tx(config, &tx, &expected_transfer(request)).await;
-    Ok(post_broadcast_outcome(tx, nonce, status))
+    Ok(BroadcastedTransaction { nonce, tx })
 }
 
-pub async fn send_contract_transaction(
+pub async fn confirm_settlement_broadcast(
+    config: &RpcConfig,
+    request: &FacilitatorRequest,
+    broadcast: &BroadcastedTransaction,
+) -> SettlementOutcome {
+    let status = receipt_status_for_tx(config, &broadcast.tx, &expected_transfer(request)).await;
+    post_broadcast_outcome(broadcast.tx.clone(), broadcast.nonce, status)
+}
+
+pub async fn broadcast_contract_transaction(
     config: &RpcConfig,
     private_key: &str,
     to: [u8; 20],
     data: Vec<u8>,
     nonce: u128,
-    expectation: &ContractExpectation,
-) -> Result<ContractSettlementOutcome, SettlementSendError> {
+) -> Result<BroadcastedTransaction, SettlementSendError> {
     let from = crate::private_key_address(private_key)?;
     let fees = fee_quote(config).await?;
     let estimate = rpc_hex_u128(
@@ -205,8 +218,19 @@ pub async fn send_contract_transaction(
         private_key,
     )?;
     let tx = send_raw_transaction(config, &raw).await?;
-    let status = receipt_status_for_contract_tx(config, &tx, &to, Some(&from), expectation).await;
-    Ok(post_contract_broadcast_outcome(tx, nonce, status))
+    Ok(BroadcastedTransaction { nonce, tx })
+}
+
+pub async fn confirm_contract_broadcast(
+    config: &RpcConfig,
+    broadcast: &BroadcastedTransaction,
+    to: &[u8; 20],
+    expected_from: Option<&str>,
+    expectation: &ContractExpectation,
+) -> ContractSettlementOutcome {
+    let status =
+        receipt_status_for_contract_tx(config, &broadcast.tx, to, expected_from, expectation).await;
+    post_contract_broadcast_outcome(broadcast.tx.clone(), broadcast.nonce, status)
 }
 
 fn ensure_settlement_fee_cap(

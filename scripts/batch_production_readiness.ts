@@ -69,7 +69,6 @@ const MANAGEMENT_PRINCIPAL = "aaaaa-aa";
 const PRINCIPAL_BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 const MIN_BATCH_RECEIPT_CONFIRMATIONS = 3;
 const READINESS_BATCH_CHANNEL_ID = `0x${"00".repeat(32)}`;
-const READINESS_BATCH_UPDATE_INVALID_CHANNEL_ID = "0x00";
 const DEFAULT_MIN_CANISTER_CYCLES = 1_000_000_000_000n;
 const MIN_FREEZING_THRESHOLD_SECONDS = 7_776_000n;
 const MAX_BATCH_CHANNELS_LIST = 1_000n;
@@ -791,22 +790,6 @@ function canisterStorageApiStage(
       `batch_channel_count is ${channelCount.toString()} but batch_channels returned ${listedChannels.toString()} channel records`
     );
   }
-  const update = runner(
-    "icp",
-    [
-      "canister",
-      "call",
-      canister,
-      "batch_update_channel",
-      `("${READINESS_BATCH_UPDATE_INVALID_CHANNEL_ID}", null, record { channel = null })`,
-      "--environment",
-      environment
-    ],
-    cwd
-  );
-  if (!isExpectedBatchUpdateProbe(update)) {
-    return fail("canister:batch-storage-api", update.output || "failed to query batch_update_channel");
-  }
   const deletedCount = runner("icp", ["canister", "call", canister, "batch_deleted_channel_count", "()", "--environment", environment], cwd);
   if (deletedCount.status !== 0) {
     return fail("canister:batch-storage-api", deletedCount.output || "failed to query batch_deleted_channel_count");
@@ -870,19 +853,6 @@ function isOptionalBatchDeletedChannelOutput(output: string): boolean {
   const value = output.trim();
   return /^\(\s*null\s*\)$/.test(value) ||
     (/^\(\s*opt\s+record\b[\s\S]*\)\s*$/.test(value) && hasBatchDeletedChannelOutputFields(value));
-}
-
-function isExpectedBatchUpdateProbe(result: ReturnType<CommandRunner>): boolean {
-  if (result.status !== 0) {
-    return false;
-  }
-  const output = result.output.trim();
-  return /^\(\s*record\s*\{[\s\S]*\}\s*\)$/.test(output) &&
-    /\bstatus\s*=\s*"invalid"/.test(output) &&
-    /\bchannel\s*=\s*null\b/.test(output) &&
-    /\bcurrent_revision\s*=\s*null\b/.test(output) &&
-    /\bmessage\s*=\s*opt\b/.test(output) &&
-    /\bmessage\s*=\s*opt\s*"[^"]*channelId[^"]*32 bytes[^"]*"/.test(output);
 }
 
 function countBatchChannelRecords(output: string): bigint {

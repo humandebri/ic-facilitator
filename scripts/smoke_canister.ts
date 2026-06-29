@@ -211,7 +211,11 @@ function checkBatchSupport(kinds: readonly unknown[], env: NodeJS.ProcessEnv): v
   }
 }
 
-async function checkVerifyEndpoint(baseUrl: string, fetchFn: typeof fetch): Promise<number> {
+async function checkVerifyEndpoint(
+  baseUrl: string,
+  fetchFn: typeof fetch,
+  env: NodeJS.ProcessEnv
+): Promise<number> {
   const response = await fetchFn(`${baseUrl}/verify`, {
     body: JSON.stringify({
       paymentPayload: {},
@@ -225,6 +229,26 @@ async function checkVerifyEndpoint(baseUrl: string, fetchFn: typeof fetch): Prom
   const value = requireRecord(await json(response, 400), "verify");
   if (value.invalidReason !== "unsupported_verify_scheme") {
     throw new Error("verify must reject exact scheme with unsupported_verify_scheme");
+  }
+  const fixture = readEnv(env, "X402_BATCH_VERIFY_FIXTURE");
+  if (!fixture || fixture.trim() === "") {
+    return response.status;
+  }
+  const positiveResponse = await fetchFn(`${baseUrl}/verify`, {
+    body: fixture,
+    headers: { "content-type": "application/json" },
+    method: "POST"
+  });
+  const positive = requireRecord(await json(positiveResponse, 200), "batch verify");
+  if (positive.isValid !== true) {
+    throw new Error("batch verify fixture must return isValid=true");
+  }
+  const extra = requireRecord(positive.extra, "batch verify.extra");
+  const channelState = requireRecord(extra.channelState, "batch verify.extra.channelState");
+  for (const field of ["channelId", "balance", "totalClaimed", "withdrawRequestedAt", "refundNonce"]) {
+    if (extra[field] !== channelState[field]) {
+      throw new Error(`batch verify extra.${field} must match extra.channelState.${field}`);
+    }
   }
   return response.status;
 }
@@ -274,7 +298,7 @@ export async function checkCanisterSmoke(options: CanisterSmokeOptions = {}): Pr
   if (options.requireBatch && !wildcardSignerList.includes(facilitatorAddress)) {
     throw new Error("supported.signers lacks eip155:* batch facilitator address");
   }
-  const verifyStatus = options.requireBatch ? await checkVerifyEndpoint(baseUrl, fetchFn) : undefined;
+  const verifyStatus = options.requireBatch ? await checkVerifyEndpoint(baseUrl, fetchFn, env) : undefined;
 
   return {
     baseUrl,

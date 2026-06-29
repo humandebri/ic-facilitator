@@ -45,8 +45,9 @@ use crate::hexutil::{
     JPYC_POLYGON_ADDRESS, NETWORK,
 };
 use crate::rpc::{
-    batch_unsettled_amount, pending_nonce, refresh_contract_settlement, refresh_settlement,
-    send_contract_transaction, send_settlement, BatchChannelSnapshot, ContractExpectation,
+    batch_unsettled_amount, broadcast_contract_transaction, broadcast_settlement,
+    confirm_contract_broadcast, confirm_settlement_broadcast, pending_nonce,
+    refresh_contract_settlement, refresh_settlement, BatchChannelSnapshot, ContractExpectation,
     ContractSettlementOutcome, ExpectedTransfer, RpcConfig, SettlementOutcome, SettlementSendError,
 };
 use crate::state::SettlementRecord;
@@ -130,6 +131,16 @@ const BATCH_SQLITE_MIGRATIONS: &[Migration] = &[Migration {
             ON batch_channel_bindings(receiver_address);
     ",
 }];
+#[cfg(not(test))]
+const BATCH_SQLITE_MIGRATIONS_V2: &[Migration] = &[Migration {
+    version: 2,
+    sql: "
+        ALTER TABLE payment_intents ADD COLUMN pending_id TEXT;
+        CREATE UNIQUE INDEX payment_intents_pending_id_idx
+            ON payment_intents(pending_id)
+            WHERE pending_id IS NOT NULL;
+    ",
+}];
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct StableState {
@@ -141,6 +152,14 @@ struct StableState {
     nonces: Option<BTreeMap<String, NonceState>>,
     batch_channels: Option<BTreeMap<String, BatchChannel>>,
     batch_deleted_channels: Option<BTreeMap<String, BatchDeletedChannel>>,
+}
+
+const STABLE_VALUE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct VersionedStableValue {
+    version: u32,
+    payload: Vec<u8>,
 }
 
 thread_local! {
@@ -219,6 +238,7 @@ struct BatchPaymentIntent {
     resource_url: String,
     amount: String,
     nonce: String,
+    pending_id: Option<String>,
     status: String,
     created_at: u64,
     updated_at: u64,
@@ -341,6 +361,8 @@ fn init_sqlite_db() -> Result<(), String> {
         }
     })?;
     SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS)
+        .map_err(|error| format!("sqlite migration failed: {error}"))?;
+    SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS_V2)
         .map_err(|error| format!("sqlite migration failed: {error}"))
 }
 
@@ -437,6 +459,17 @@ fn require_payment_intent_status(status: &str) -> Result<String, String> {
         "created" | "bound" | "paid" | "cancelled" => Ok(status),
         _ => Err("payment intent status must be created, bound, paid, or cancelled".to_string()),
     }
+}
+
+fn can_transition_payment_intent_status(current: &str, next: &str) -> bool {
+    current == next
+        || matches!(
+            (current, next),
+            ("created", "bound")
+                | ("bound", "paid")
+                | ("created", "cancelled")
+                | ("bound", "cancelled")
+        )
 }
 
 fn require_payment_intent_amount(amount: &str) -> Result<String, String> {
@@ -582,20 +615,46 @@ fn batch_payment_intent_from_row(
         resource_url: row.get::<String>(3)?,
         amount: row.get::<String>(4)?,
         nonce: row.get::<String>(5)?,
-        status: row.get::<String>(6)?,
-        created_at: u64::try_from(row.get::<i64>(7)?)
+        pending_id: row.get::<Option<String>>(6)?,
+        status: row.get::<String>(7)?,
+        created_at: u64::try_from(row.get::<i64>(8)?)
             .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
-        updated_at: u64::try_from(row.get::<i64>(8)?)
+        updated_at: u64::try_from(row.get::<i64>(9)?)
             .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
     })
 }
 
 fn encode_stable<T: CandidType>(value: &T) -> Vec<u8> {
-    candid::encode_one(value).expect("stable value must encode")
+    let payload = candid::encode_one(value).expect("stable value must encode");
+    candid::encode_one(VersionedStableValue {
+        version: STABLE_VALUE_VERSION,
+        payload,
+    })
+    .expect("stable wrapper must encode")
 }
 
 fn decode_stable<T: CandidType + for<'de> CandidDeserialize<'de>>(bytes: Vec<u8>) -> T {
-    candid::decode_one(&bytes).expect("stable value must decode")
+    decode_stable_result(bytes).expect("stable value must decode")
+}
+
+fn decode_stable_result<T: CandidType + for<'de> CandidDeserialize<'de>>(
+    bytes: Vec<u8>,
+) -> Result<T, String> {
+    match candid::decode_one::<VersionedStableValue>(&bytes) {
+        Ok(wrapper) => {
+            if wrapper.version != STABLE_VALUE_VERSION {
+                return Err(format!(
+                    "unsupported stable value version {}",
+                    wrapper.version
+                ));
+            }
+            candid::decode_one(&wrapper.payload)
+                .map_err(|error| format!("stable value payload decode failed: {error}"))
+        }
+        Err(wrapper_error) => candid::decode_one(&bytes).map_err(|legacy_error| {
+            format!("stable value decode failed: wrapper={wrapper_error}; legacy={legacy_error}")
+        }),
+    }
 }
 
 fn stable_structures_empty() -> bool {
@@ -818,57 +877,217 @@ fn authorize_batch_channel_update(
     Ok(())
 }
 
+fn validate_batch_channel_runtime_config(channel: &BatchChannel) -> Result<(), String> {
+    if !same_address(&channel.channel_config.token, JPYC_POLYGON_ADDRESS) {
+        return Err("batch channel token must be JPYC on Polygon".to_string());
+    }
+    let receiver_authorizer = batch_receiver_authorizer_address()?;
+    if !same_address(
+        &channel.channel_config.receiver_authorizer,
+        &receiver_authorizer,
+    ) {
+        return Err(
+            "batch channel receiverAuthorizer must match BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
+                .to_string(),
+        );
+    }
+    let withdraw_delay = batch_withdraw_delay_seconds()?;
+    if channel.channel_config.withdraw_delay != withdraw_delay {
+        return Err(
+            "batch channel withdrawDelay must match BATCH_WITHDRAW_DELAY_SECONDS".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn batch_pending_delta_amount(
+    current: Option<&BatchChannel>,
+    next: &BatchChannel,
+) -> Result<Option<String>, String> {
+    let Some(pending) = next.pending_request.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(current) = current {
+        if let Some(current_pending) = current.pending_request.as_ref() {
+            if current_pending.pending_id == pending.pending_id {
+                if current_pending.signed_max_claimable != pending.signed_max_claimable
+                    || current_pending.expires_at != pending.expires_at
+                    || current.signed_max_claimable != next.signed_max_claimable
+                {
+                    return Err(
+                        "batch channel pendingRequest must not change for the same pendingId"
+                            .to_string(),
+                    );
+                }
+                return Ok(None);
+            }
+        }
+    }
+    if pending.expires_at <= now_seconds().saturating_mul(1_000) {
+        return Err("batch payment intent bind requires live pendingRequest".to_string());
+    }
+    if next.signed_max_claimable != pending.signed_max_claimable {
+        return Err(
+            "batch channel signedMaxClaimable must match pendingRequest.signedMaxClaimable when binding"
+                .to_string(),
+        );
+    }
+    let pending_signed = pending
+        .signed_max_claimable
+        .parse::<u128>()
+        .map_err(|_| "pending signedMaxClaimable must be a uint128 integer".to_string())?;
+    let current_charged = current
+        .map(|channel| channel.charged_cumulative_amount.as_str())
+        .unwrap_or("0")
+        .parse::<u128>()
+        .map_err(|_| "current chargedCumulativeAmount must be a uint128 integer".to_string())?;
+    if pending_signed <= current_charged {
+        return Err(
+            "batch payment intent amount must increase chargedCumulativeAmount".to_string(),
+        );
+    }
+    Ok(Some((pending_signed - current_charged).to_string()))
+}
+
 #[cfg(not(test))]
-fn insert_batch_channel_binding(channel_id: &str, channel: &BatchChannel) -> Result<(), String> {
+fn bind_batch_payment_intent_for_pending(
+    current: Option<&BatchChannel>,
+    next: &BatchChannel,
+) -> Result<Option<String>, String> {
+    let Some(amount) = batch_pending_delta_amount(current, next)? else {
+        return Ok(None);
+    };
+    let pending = next
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
+    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
+    let receiver = normalize_evm_address("channelConfig.receiver", &next.channel_config.receiver)?;
+    let payer = normalize_evm_address("channelConfig.payer", &next.channel_config.payer)?;
+    let nonce = require_payment_intent_nonce(&next.channel_config.salt)?;
+    let now = sqlite_now_seconds();
+    init_sqlite_db()?;
+    SqliteDb::update(|connection| {
+        let intents = connection.query_map(
+            "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, pending_id, status, created_at, updated_at
+             FROM payment_intents
+             WHERE receiver_address = ?1
+               AND payer_address = ?2
+               AND amount = ?3
+               AND nonce = ?4
+               AND status = 'created'
+               AND pending_id IS NULL",
+            params![receiver, payer, amount, nonce],
+            batch_payment_intent_from_row,
+        )?;
+        if intents.len() != 1 {
+            return Err(SqliteDbError::Constraint(
+                "batch payment intent match must be unique".to_string(),
+            ));
+        }
+        let intent_id = intents[0].intent_id.clone();
+        connection.execute(
+            "UPDATE payment_intents
+             SET status = 'bound', pending_id = ?2, updated_at = ?3
+             WHERE intent_id = ?1",
+            params![intent_id, pending_id, now],
+        )?;
+        Ok(intent_id)
+    })
+    .map_err(sqlite_error)
+    .map(Some)
+}
+
+#[cfg(test)]
+fn bind_batch_payment_intent_for_pending(
+    current: Option<&BatchChannel>,
+    next: &BatchChannel,
+) -> Result<Option<String>, String> {
+    let Some(amount) = batch_pending_delta_amount(current, next)? else {
+        return Ok(None);
+    };
+    let pending = next
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
+    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
+    let receiver = normalize_evm_address("channelConfig.receiver", &next.channel_config.receiver)?;
+    let payer = normalize_evm_address("channelConfig.payer", &next.channel_config.payer)?;
+    let nonce = require_payment_intent_nonce(&next.channel_config.salt)?;
+    let matches = TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+        intents
+            .borrow()
+            .values()
+            .filter(|intent| {
+                intent.receiver_address == receiver
+                    && intent.payer_address == payer
+                    && intent.amount == amount
+                    && intent.nonce == nonce
+                    && intent.status == "created"
+                    && intent.pending_id.is_none()
+            })
+            .map(|intent| intent.intent_id.clone())
+            .collect::<Vec<_>>()
+    });
+    if matches.len() != 1 {
+        return Err("sqlite error: batch payment intent match must be unique".to_string());
+    }
+    let intent_id = matches[0].clone();
+    TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+        let mut intents = intents.borrow_mut();
+        let intent = intents
+            .get_mut(&intent_id)
+            .ok_or_else(|| "sqlite error: payment intent not found".to_string())?;
+        intent.status = "bound".to_string();
+        intent.pending_id = Some(pending_id);
+        intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
+        Ok::<_, String>(())
+    })?;
+    Ok(Some(intent_id))
+}
+
+#[cfg(not(test))]
+fn bind_batch_payment_intent_and_insert_channel_binding(
+    channel_id: &str,
+    channel: &BatchChannel,
+) -> Result<String, String> {
+    let Some(amount) = batch_pending_delta_amount(None, channel)? else {
+        return Err("batch channel create requires pendingRequest".to_string());
+    };
+    let pending = channel
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
+    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
     let receiver =
         normalize_evm_address("channelConfig.receiver", &channel.channel_config.receiver)?;
     let payer = normalize_evm_address("channelConfig.payer", &channel.channel_config.payer)?;
     let token = normalize_evm_address("channelConfig.token", &channel.channel_config.token)?;
-    let pending = channel
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch channel create requires pendingRequest".to_string())?;
-    let intent_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let amount = require_payment_intent_amount(&pending.signed_max_claimable)?;
     let nonce = require_payment_intent_nonce(&channel.channel_config.salt)?;
     let now = sqlite_now_seconds();
     let channel_id = channel_id.to_ascii_lowercase();
     init_sqlite_db()?;
     SqliteDb::update(|connection| {
-        let intent = connection
-            .query_optional(
-                "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, status, created_at, updated_at
-                 FROM payment_intents WHERE intent_id = ?1",
-                params![intent_id],
-                batch_payment_intent_from_row,
-            )?
-            .ok_or_else(|| SqliteDbError::Constraint("payment intent not found".to_string()))?;
-        if intent.status != "created" {
+        let intents = connection.query_map(
+            "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, pending_id, status, created_at, updated_at
+             FROM payment_intents
+             WHERE receiver_address = ?1
+               AND payer_address = ?2
+               AND amount = ?3
+               AND nonce = ?4
+               AND status = 'created'
+               AND pending_id IS NULL",
+            params![receiver, payer, amount, nonce],
+            batch_payment_intent_from_row,
+        )?;
+        if intents.len() != 1 {
             return Err(SqliteDbError::Constraint(
-                "payment intent status must be created".to_string(),
+                "batch payment intent match must be unique".to_string(),
             ));
         }
-        if intent.receiver_address != receiver {
-            return Err(SqliteDbError::Constraint(
-                "payment intent receiver mismatch".to_string(),
-            ));
-        }
-        if intent.payer_address != payer {
-            return Err(SqliteDbError::Constraint(
-                "payment intent payer mismatch".to_string(),
-            ));
-        }
-        if intent.amount != amount {
-            return Err(SqliteDbError::Constraint(
-                "payment intent amount mismatch".to_string(),
-            ));
-        }
-        if intent.nonce != nonce {
-            return Err(SqliteDbError::Constraint(
-                "payment intent nonce mismatch".to_string(),
-            ));
-        }
+        let intent_id = intents[0].intent_id.clone();
         connection.execute(
             "INSERT INTO batch_channel_bindings(
                  channel_id, receiver_address, payer_address, token_address,
@@ -878,61 +1097,167 @@ fn insert_batch_channel_binding(channel_id: &str, channel: &BatchChannel) -> Res
             params![channel_id, receiver, payer, token, intent_id, now],
         )?;
         connection.execute(
-            "UPDATE payment_intents SET status = 'bound', updated_at = ?2 WHERE intent_id = ?1",
-            params![intent_id, now],
-        )
+            "UPDATE payment_intents
+             SET status = 'bound', pending_id = ?2, updated_at = ?3
+             WHERE intent_id = ?1",
+            params![intent_id, pending_id, now],
+        )?;
+        Ok(intent_id)
     })
     .map_err(sqlite_error)
 }
 
 #[cfg(test)]
-fn insert_batch_channel_binding(channel_id: &str, channel: &BatchChannel) -> Result<(), String> {
+fn bind_batch_payment_intent_and_insert_channel_binding(
+    channel_id: &str,
+    channel: &BatchChannel,
+) -> Result<String, String> {
+    let Some(amount) = batch_pending_delta_amount(None, channel)? else {
+        return Err("batch channel create requires pendingRequest".to_string());
+    };
+    let pending = channel
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
+    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
     let receiver =
         normalize_evm_address("channelConfig.receiver", &channel.channel_config.receiver)?;
     let payer = normalize_evm_address("channelConfig.payer", &channel.channel_config.payer)?;
     let token = normalize_evm_address("channelConfig.token", &channel.channel_config.token)?;
-    let pending = channel
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch channel create requires pendingRequest".to_string())?;
-    let intent_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let amount = require_payment_intent_amount(&pending.signed_max_claimable)?;
     let nonce = require_payment_intent_nonce(&channel.channel_config.salt)?;
+    let intent_id = TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+        let intents = intents.borrow();
+        let matches = intents
+            .values()
+            .filter(|intent| {
+                intent.receiver_address == receiver
+                    && intent.payer_address == payer
+                    && intent.amount == amount
+                    && intent.nonce == nonce
+                    && intent.status == "created"
+                    && intent.pending_id.is_none()
+            })
+            .map(|intent| intent.intent_id.clone())
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err("sqlite error: batch payment intent match must be unique".to_string());
+        }
+        Ok::<_, String>(matches[0].clone())
+    })?;
+    TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
+        let mut bindings = bindings.borrow_mut();
+        let channel_id = channel_id.to_ascii_lowercase();
+        if bindings.contains_key(&channel_id) {
+            return Err("sqlite error: batch channel binding already exists".to_string());
+        }
+        bindings.insert(channel_id, (receiver, payer, token, intent_id.clone()));
+        Ok(())
+    })?;
     TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
         let mut intents = intents.borrow_mut();
         let intent = intents
             .get_mut(&intent_id)
             .ok_or_else(|| "sqlite error: payment intent not found".to_string())?;
-        if intent.status != "created" {
-            return Err("sqlite error: payment intent status must be created".to_string());
-        }
-        if intent.receiver_address != receiver {
-            return Err("sqlite error: payment intent receiver mismatch".to_string());
-        }
-        if intent.payer_address != payer {
-            return Err("sqlite error: payment intent payer mismatch".to_string());
-        }
-        if intent.amount != amount {
-            return Err("sqlite error: payment intent amount mismatch".to_string());
-        }
-        if intent.nonce != nonce {
-            return Err("sqlite error: payment intent nonce mismatch".to_string());
-        }
         intent.status = "bound".to_string();
+        intent.pending_id = Some(pending_id);
         intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
-        Ok(())
+        Ok::<_, String>(())
     })?;
-    TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
-        let mut bindings = bindings.borrow_mut();
-        if bindings
-            .insert(
-                channel_id.to_ascii_lowercase(),
-                (receiver, payer, token, intent_id),
-            )
-            .is_some()
-        {
-            return Err("sqlite error: batch channel binding already exists".to_string());
+    Ok(intent_id)
+}
+
+#[cfg(not(test))]
+fn mark_bound_payment_intent_paid_for_pending(
+    current: Option<&BatchChannel>,
+    next: &BatchChannel,
+) -> Result<(), String> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let current_charged = current
+        .charged_cumulative_amount
+        .parse::<u128>()
+        .map_err(|_| "current chargedCumulativeAmount must be a uint128 integer".to_string())?;
+    let next_charged = next
+        .charged_cumulative_amount
+        .parse::<u128>()
+        .map_err(|_| "next chargedCumulativeAmount must be a uint128 integer".to_string())?;
+    if next_charged <= current_charged {
+        return Ok(());
+    }
+    let pending = current
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch channel charge increase requires pendingRequest".to_string())?;
+    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
+    let now = sqlite_now_seconds();
+    init_sqlite_db()?;
+    SqliteDb::update(|connection| {
+        let intent = connection.query_optional(
+            "SELECT intent_id, receiver_address, payer_address, resource_url,
+                    amount, nonce, pending_id, status, created_at, updated_at
+             FROM payment_intents
+             WHERE pending_id = ?1 AND status = 'bound'",
+            params![pending_id.clone()],
+            batch_payment_intent_from_row,
+        )?;
+        let Some(intent) = intent else {
+            return Err(SqliteDbError::Constraint(
+                "bound payment intent not found for pendingRequest".to_string(),
+            ));
+        };
+        connection.execute(
+            "UPDATE payment_intents
+             SET status = 'paid', updated_at = ?2
+             WHERE intent_id = ?1",
+            params![intent.intent_id, now],
+        )?;
+        Ok(())
+    })
+    .map_err(sqlite_error)
+}
+
+#[cfg(test)]
+fn mark_bound_payment_intent_paid_for_pending(
+    current: Option<&BatchChannel>,
+    next: &BatchChannel,
+) -> Result<(), String> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let current_charged = current
+        .charged_cumulative_amount
+        .parse::<u128>()
+        .map_err(|_| "current chargedCumulativeAmount must be a uint128 integer".to_string())?;
+    let next_charged = next
+        .charged_cumulative_amount
+        .parse::<u128>()
+        .map_err(|_| "next chargedCumulativeAmount must be a uint128 integer".to_string())?;
+    if next_charged <= current_charged {
+        return Ok(());
+    }
+    let pending = current
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "batch channel charge increase requires pendingRequest".to_string())?;
+    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
+    TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
+        let mut intents = intents.borrow_mut();
+        let matches = intents
+            .values_mut()
+            .filter(|intent| {
+                intent.pending_id.as_deref() == Some(pending_id.as_str())
+                    && intent.status == "bound"
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(
+                "sqlite error: bound payment intent not found for pendingRequest".to_string(),
+            );
         }
+        let intent = matches.into_iter().next().expect("one intent");
+        intent.status = "paid".to_string();
+        intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
         Ok(())
     })
 }
@@ -1589,8 +1914,49 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     };
     trace.step("settle.pending_nonce", 1);
     let nonce = reserve_nonce(&from, rpc_nonce);
-    match send_settlement(&config, &private_key, &body, nonce).await {
-        Ok(SettlementOutcome::Settled(tx)) => {
+    let broadcast = match broadcast_settlement(&config, &private_key, &body, nonce).await {
+        Ok(broadcast) => {
+            update_active_broadcast(&active_scope, &key, broadcast.nonce, &broadcast.tx);
+            insert_settlement(
+                &key,
+                SettlementRecord::broadcast(
+                    broadcast.tx.clone(),
+                    payer.clone(),
+                    body.payment_requirements.pay_to.clone(),
+                    body.payment_requirements.amount.clone(),
+                    now_seconds(),
+                    ttl,
+                ),
+            );
+            broadcast
+        }
+        Err(SettlementSendError::GasTooExpensive) => {
+            trace.step("settle.send_settlement", 2);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
+            release_active_settlement(&active_scope, &key);
+            return json_response_with_cost(
+                503,
+                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
+                &trace,
+            );
+        }
+        Err(SettlementSendError::Other(message)) => {
+            trace.step("settle.send_settlement", 5);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
+            release_active_settlement(&active_scope, &key);
+            return json_response_with_cost(
+                502,
+                &settle_error("settlement_failed", &message, Some(payer)),
+                &trace,
+            );
+        }
+    };
+    match confirm_settlement_broadcast(&config, &body, &broadcast).await {
+        SettlementOutcome::Settled(tx) => {
             trace.step("settle.send_settlement", 5);
             let record = SettlementRecord::settled(
                 tx,
@@ -1604,7 +1970,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(200, &record.response, &trace)
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        SettlementOutcome::Pending { nonce, tx } => {
             trace.step("settle.send_settlement", 5);
             update_active_broadcast(&active_scope, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -1618,7 +1984,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             let record = insert_settlement(&key, record);
             json_response_with_cost(202, &record.response, &trace)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        SettlementOutcome::Failed { tx, message } => {
             trace.step("settle.send_settlement", 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -1631,30 +1997,6 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             let record = insert_settlement(&key, record);
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(502, &record.response, &trace)
-        }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step("settle.send_settlement", 2);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&active_scope, &key);
-            json_response_with_cost(
-                503,
-                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
-                &trace,
-            )
-        }
-        Err(SettlementSendError::Other(message)) => {
-            trace.step("settle.send_settlement", 5);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&active_scope, &key);
-            json_response_with_cost(
-                502,
-                &settle_error("settlement_failed", &message, Some(payer)),
-                &trace,
-            )
         }
     }
 }
@@ -2005,9 +2347,48 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
     };
     trace.step("batch_settle.pending_nonce", 1);
     let nonce = reserve_nonce(&from, rpc_nonce);
-    match send_contract_transaction(&config, &private_key, to, calldata, nonce, &expectation).await
-    {
-        Ok(ContractSettlementOutcome::Settled { tx, settled_amount }) => {
+    let broadcast =
+        match broadcast_contract_transaction(&config, &private_key, to, calldata, nonce).await {
+            Ok(broadcast) => {
+                update_active_broadcast(&active_scope, &key, broadcast.nonce, &broadcast.tx);
+                let record = SettlementRecord::broadcast(
+                    broadcast.tx.clone(),
+                    payer.clone().unwrap_or_else(|| verified.receiver.clone()),
+                    verified.receiver.clone(),
+                    body.payment_requirements.amount.clone(),
+                    now_seconds(),
+                    ttl,
+                );
+                insert_settlement(&key, record);
+                broadcast
+            }
+            Err(SettlementSendError::GasTooExpensive) => {
+                trace.step("batch_settle.send", 2);
+                remove_settlement(&key);
+                rollback_reserved_nonce(&from, nonce);
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                return json_response_with_cost(
+                    503,
+                    &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, payer),
+                    trace,
+                );
+            }
+            Err(SettlementSendError::Other(message)) => {
+                trace.step("batch_settle.send", 5);
+                remove_settlement(&key);
+                rollback_reserved_nonce(&from, nonce);
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                return json_response_with_cost(
+                    502,
+                    &settle_error("settlement_failed", &message, payer),
+                    trace,
+                );
+            }
+        };
+    match confirm_contract_broadcast(&config, &broadcast, &to, Some(&from), &expectation).await {
+        ContractSettlementOutcome::Settled { tx, settled_amount } => {
             trace.step("batch_settle.send", 5);
             let record = batch_settled_record(BatchSettleRecordInput {
                 tx,
@@ -2024,7 +2405,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(record.status_code(), &record.response, trace)
         }
-        Ok(ContractSettlementOutcome::Pending { nonce, tx }) => {
+        ContractSettlementOutcome::Pending { nonce, tx } => {
             trace.step("batch_settle.send", 5);
             update_active_broadcast(&active_scope, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -2038,7 +2419,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
             let record = insert_settlement(&key, record);
             json_response_with_cost(202, &record.response, trace)
         }
-        Ok(ContractSettlementOutcome::Failed { tx, message }) => {
+        ContractSettlementOutcome::Failed { tx, message } => {
             trace.step("batch_settle.send", 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -2051,30 +2432,6 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
             let record = insert_settlement(&key, record);
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(502, &record.response, trace)
-        }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step("batch_settle.send", 2);
-            remove_settlement(&key);
-            rollback_reserved_nonce(&from, nonce);
-            refund_seller_credit(&verified.receiver, fee);
-            release_active_settlement(&active_scope, &key);
-            json_response_with_cost(
-                503,
-                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, payer),
-                trace,
-            )
-        }
-        Err(SettlementSendError::Other(message)) => {
-            trace.step("batch_settle.send", 5);
-            remove_settlement(&key);
-            rollback_reserved_nonce(&from, nonce);
-            refund_seller_credit(&verified.receiver, fee);
-            release_active_settlement(&active_scope, &key);
-            json_response_with_cost(
-                502,
-                &settle_error("settlement_failed", &message, payer),
-                trace,
-            )
         }
     }
 }
@@ -2628,8 +2985,47 @@ async fn settle_seller_credit_payment(
     };
     trace.step("seller_credit.pending_nonce", 1);
     let nonce = reserve_nonce(&from, rpc_nonce);
-    match send_settlement(&config, &private_key, &body, nonce).await {
-        Ok(SettlementOutcome::Settled(tx)) => {
+    let broadcast = match broadcast_settlement(&config, &private_key, &body, nonce).await {
+        Ok(broadcast) => {
+            update_active_broadcast(&from, &key, broadcast.nonce, &broadcast.tx);
+            insert_settlement(
+                &key,
+                SettlementRecord::broadcast(
+                    broadcast.tx.clone(),
+                    payer.clone(),
+                    body.payment_requirements.pay_to.clone(),
+                    body.payment_requirements.amount.clone(),
+                    now_seconds(),
+                    ttl,
+                ),
+            );
+            broadcast
+        }
+        Err(SettlementSendError::GasTooExpensive) => {
+            trace.step("seller_credit.send_settlement", 2);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            release_active_settlement(&from, &key);
+            return json_response_with_cost(
+                503,
+                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
+                trace,
+            );
+        }
+        Err(SettlementSendError::Other(message)) => {
+            trace.step("seller_credit.send_settlement", 5);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            release_active_settlement(&from, &key);
+            return json_response_with_cost(
+                502,
+                &settle_error("settlement_failed", &message, Some(payer)),
+                trace,
+            );
+        }
+    };
+    match confirm_settlement_broadcast(&config, &body, &broadcast).await {
+        SettlementOutcome::Settled(tx) => {
             trace.step("seller_credit.send_settlement", 5);
             let record = SettlementRecord::settled(
                 tx,
@@ -2650,7 +3046,7 @@ async fn settle_seller_credit_payment(
             }
             seller_credit_paid_response(200, &seller, &record, trace)
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        SettlementOutcome::Pending { nonce, tx } => {
             trace.step("seller_credit.send_settlement", 5);
             update_active_broadcast(&from, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -2664,7 +3060,7 @@ async fn settle_seller_credit_payment(
             let record = insert_settlement(&key, record);
             seller_credit_paid_response(202, &seller, &record, trace)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        SettlementOutcome::Failed { tx, message } => {
             trace.step("seller_credit.send_settlement", 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -2677,28 +3073,6 @@ async fn settle_seller_credit_payment(
             let record = insert_settlement(&key, record);
             release_active_settlement(&from, &key);
             seller_credit_paid_response(502, &seller, &record, trace)
-        }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step("seller_credit.send_settlement", 2);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            release_active_settlement(&from, &key);
-            json_response_with_cost(
-                503,
-                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
-                trace,
-            )
-        }
-        Err(SettlementSendError::Other(message)) => {
-            trace.step("seller_credit.send_settlement", 5);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            release_active_settlement(&from, &key);
-            json_response_with_cost(
-                502,
-                &settle_error("settlement_failed", &message, Some(payer)),
-                trace,
-            )
         }
     }
 }
@@ -3843,6 +4217,7 @@ fn batch_create_payment_intent(
             resource_url,
             amount,
             nonce,
+            pending_id: None,
             status,
             created_at: u64::try_from(now).unwrap_or(u64::MAX),
             updated_at: u64::try_from(now).unwrap_or(u64::MAX),
@@ -3875,8 +4250,8 @@ fn batch_create_payment_intent(
             )?;
             connection.query_one(
                 "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, status, created_at, updated_at
-             FROM payment_intents WHERE intent_id = ?1",
+	                    amount, nonce, pending_id, status, created_at, updated_at
+	             FROM payment_intents WHERE intent_id = ?1",
                 params![intent_id],
                 batch_payment_intent_from_row,
             )
@@ -3901,6 +4276,9 @@ fn batch_mark_payment_intent(
             let Some(intent) = intents.get_mut(&intent_id) else {
                 return Err("sqlite error: row not found".to_string());
             };
+            if !can_transition_payment_intent_status(&intent.status, &status) {
+                return Err("payment intent status transition is not allowed".to_string());
+            }
             intent.status = status;
             intent.updated_at = u64::try_from(now).unwrap_or(u64::MAX);
             Ok(intent.clone())
@@ -3910,14 +4288,28 @@ fn batch_mark_payment_intent(
     {
         init_sqlite_db()?;
         SqliteDb::update(|connection| {
+            let current = connection
+                .query_optional(
+                    "SELECT intent_id, receiver_address, payer_address, resource_url,
+                        amount, nonce, pending_id, status, created_at, updated_at
+                     FROM payment_intents WHERE intent_id = ?1",
+                    params![intent_id.clone()],
+                    batch_payment_intent_from_row,
+                )?
+                .ok_or_else(|| SqliteDbError::Constraint("row not found".to_string()))?;
+            if !can_transition_payment_intent_status(&current.status, &status) {
+                return Err(SqliteDbError::Constraint(
+                    "payment intent status transition is not allowed".to_string(),
+                ));
+            }
             connection.execute(
                 "UPDATE payment_intents SET status = ?2, updated_at = ?3 WHERE intent_id = ?1",
                 params![intent_id, status, now],
             )?;
             connection.query_one(
                 "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, status, created_at, updated_at
-             FROM payment_intents WHERE intent_id = ?1",
+                    amount, nonce, pending_id, status, created_at, updated_at
+                 FROM payment_intents WHERE intent_id = ?1",
                 params![intent_id],
                 batch_payment_intent_from_row,
             )
@@ -4010,8 +4402,8 @@ fn batch_payment_intent(intent_id: String) -> Option<BatchPaymentIntent> {
         SqliteDb::query(|connection| {
             connection.query_optional(
                 "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, status, created_at, updated_at
-             FROM payment_intents WHERE intent_id = ?1",
+	                    amount, nonce, pending_id, status, created_at, updated_at
+	             FROM payment_intents WHERE intent_id = ?1",
                 params![intent_id],
                 batch_payment_intent_from_row,
             )
@@ -4116,6 +4508,14 @@ fn batch_update_channel(
                     message: Some(message),
                 };
             }
+            if let Err(message) = validate_batch_channel_runtime_config(&channel) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
             if let Err(message) = validate_batch_channel_transition(current.as_ref(), &channel) {
                 return BatchChannelUpdateResult {
                     status: "invalid".to_string(),
@@ -4141,7 +4541,9 @@ fn batch_update_channel(
                 };
             }
             if current.is_none() {
-                if let Err(message) = insert_batch_channel_binding(&key, &channel) {
+                if let Err(message) =
+                    bind_batch_payment_intent_and_insert_channel_binding(&key, &channel)
+                {
                     return BatchChannelUpdateResult {
                         status: "invalid".to_string(),
                         channel: current,
@@ -4149,6 +4551,25 @@ fn batch_update_channel(
                         message: Some(message),
                     };
                 }
+            } else if let Err(message) =
+                bind_batch_payment_intent_for_pending(current.as_ref(), &channel)
+            {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            if let Err(message) =
+                mark_bound_payment_intent_paid_for_pending(current.as_ref(), &channel)
+            {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
             }
             channel.channel_id = key.clone();
             channel.revision = current_revision.unwrap_or(0).saturating_add(1);
@@ -4684,8 +5105,31 @@ async fn maybe_replace_pending_settlement_record(
         return existing;
     }
     trace.step(labels.retry_window, 0);
-    match send_settlement(&config, &private_key, body, nonce).await {
-        Ok(SettlementOutcome::Settled(tx)) => {
+    let broadcast = match broadcast_settlement(&config, &private_key, body, nonce).await {
+        Ok(broadcast) => {
+            update_active_broadcast_by_key(key, broadcast.nonce, &broadcast.tx);
+            let record = SettlementRecord::broadcast(
+                broadcast.tx.clone(),
+                details.payer.clone(),
+                details.pay_to.clone(),
+                details.amount.clone(),
+                now_seconds(),
+                ttl,
+            );
+            insert_settlement(key, record);
+            broadcast
+        }
+        Err(SettlementSendError::GasTooExpensive) => {
+            trace.step(labels.send, 2);
+            return existing;
+        }
+        Err(SettlementSendError::Other(_)) => {
+            trace.step(labels.send, 5);
+            return existing;
+        }
+    };
+    match confirm_settlement_broadcast(&config, body, &broadcast).await {
+        SettlementOutcome::Settled(tx) => {
             trace.step(labels.send, 5);
             let record = SettlementRecord::settled(
                 tx,
@@ -4699,7 +5143,7 @@ async fn maybe_replace_pending_settlement_record(
             release_active_settlement_by_key(key);
             record
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        SettlementOutcome::Pending { nonce, tx } => {
             trace.step(labels.send, 5);
             update_active_broadcast_by_key(key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -4712,7 +5156,7 @@ async fn maybe_replace_pending_settlement_record(
             );
             insert_settlement(key, record)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        SettlementOutcome::Failed { tx, message } => {
             trace.step(labels.send, 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -4725,14 +5169,6 @@ async fn maybe_replace_pending_settlement_record(
             let record = insert_settlement(key, record);
             release_active_settlement_by_key(key);
             record
-        }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step(labels.send, 2);
-            existing
-        }
-        Err(SettlementSendError::Other(_)) => {
-            trace.step(labels.send, 5);
-            existing
         }
     }
 }
@@ -5092,6 +5528,8 @@ mod hardening_tests {
         "0x1111111111111111111111111111111111111111111111111111111111111111";
     const OTHER_PRIVATE_KEY: &str =
         "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const THIRD_PRIVATE_KEY: &str =
+        "0x3333333333333333333333333333333333333333333333333333333333333333";
 
     fn set_default_batch_contract() {
         set_env_value(
@@ -5100,10 +5538,18 @@ mod hardening_tests {
         );
     }
 
+    fn set_default_batch_channel_runtime_config() {
+        set_default_batch_contract();
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value(
+            "BATCH_WITHDRAW_DELAY_SECONDS",
+            &DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS.to_string(),
+        );
+    }
+
     fn set_full_batch_config() {
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
         batch_set_writer_receiver_scope(
@@ -5162,7 +5608,7 @@ mod hardening_tests {
             "payTo": PAY_TO,
             "maxTimeoutSeconds": 60,
             "extra": {
-                "receiverAuthorizer": "0x2000000000000000000000000000000000000402",
+                "receiverAuthorizer": private_key_address(OTHER_PRIVATE_KEY).unwrap(),
                 "withdrawDelay": DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS,
                 "assetTransferMethod": "eip3009",
                 "name": JPYC_EIP712_NAME,
@@ -5450,17 +5896,24 @@ mod hardening_tests {
         channel
     }
 
-    fn register_payment_intent_for_channel(channel: &BatchChannel) {
+    fn register_payment_intent_for_channel(channel: &BatchChannel) -> String {
         let pending = channel.pending_request.as_ref().unwrap();
+        register_payment_intent_for_channel_amount(channel, &pending.signed_max_claimable)
+    }
+
+    fn register_payment_intent_for_channel_amount(channel: &BatchChannel, amount: &str) -> String {
+        let pending = channel.pending_request.as_ref().unwrap();
+        let intent_id = format!("intent-{}", pending.pending_id);
         batch_create_payment_intent(
-            pending.pending_id.clone(),
+            intent_id.clone(),
             channel.channel_config.receiver.clone(),
             channel.channel_config.payer.clone(),
             "https://example.test/report".to_string(),
-            pending.signed_max_claimable.clone(),
+            amount.to_string(),
             channel.channel_config.salt.clone(),
         )
         .unwrap();
+        intent_id
     }
 
     fn test_batch_channel_config() -> crate::batch::BatchChannelConfig {
@@ -5468,7 +5921,7 @@ mod hardening_tests {
             payer: PAYER.to_string(),
             payer_authorizer: PAYER.to_string(),
             receiver: PAY_TO.to_string(),
-            receiver_authorizer: "0x2000000000000000000000000000000000000402".to_string(),
+            receiver_authorizer: private_key_address(OTHER_PRIVATE_KEY).unwrap(),
             token: JPYC_POLYGON_ADDRESS.to_string(),
             withdraw_delay: DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS,
             salt: format!("0x{}", "33".repeat(32)),
@@ -6094,7 +6547,7 @@ mod hardening_tests {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("BATCH_WITHDRAW_DELAY_SECONDS", "2592001");
 
@@ -6116,7 +6569,7 @@ mod hardening_tests {
         clear_env_values();
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
         set_env_value("BATCH_WITHDRAW_DELAY_SECONDS", "900");
 
         let missing_contract = supported_response();
@@ -6291,6 +6744,29 @@ mod hardening_tests {
     }
 
     #[test]
+    fn stable_value_wrapper_decodes_versioned_and_legacy_blobs() {
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_batch_channel(&channel_id, "100");
+
+        let versioned = encode_stable(&channel);
+        let decoded: BatchChannel = decode_stable_result(versioned).unwrap();
+        assert_eq!(decoded.channel_id, channel_id);
+
+        let legacy = candid::encode_one(&channel).unwrap();
+        let legacy_decoded: BatchChannel = decode_stable_result(legacy).unwrap();
+        assert_eq!(legacy_decoded.channel_id, channel_id);
+
+        let broken = decode_stable_result::<BatchChannel>(b"not candid".to_vec()).unwrap_err();
+        assert!(broken.contains("stable value decode failed"));
+    }
+
+    #[test]
     fn stable_memory_adapter_shares_sqlite_memory_manager_without_corruption() {
         let manager = SqliteMemoryManager::init(SqliteDefaultMemoryImpl::default());
         let stable_memory = StableMemoryAdapter(manager.get(MemoryId::new(0)));
@@ -6380,7 +6856,7 @@ mod hardening_tests {
             .unwrap()
             .contains("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"));
 
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
         let missing_contract = run_ready(verify_http(request()));
         let missing_contract_value: Value = serde_json::from_slice(&missing_contract.body).unwrap();
         assert_eq!(missing_contract.status_code, 500);
@@ -6435,7 +6911,7 @@ mod hardening_tests {
             .iter()
             .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
 
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
         set_default_batch_contract();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         let missing_scope = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
@@ -6621,7 +7097,7 @@ mod hardening_tests {
     fn batch_channel_update_uses_revision_cas() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -6812,7 +7288,7 @@ mod hardening_tests {
     fn batch_channel_update_allows_official_manager_delete() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -6842,7 +7318,7 @@ mod hardening_tests {
     fn batch_deleted_channel_audit_retention_keeps_existing_key_updates() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
 
         let deleted = |channel_id: &str, deleted_at: u64| BatchDeletedChannel {
             channel: test_batch_channel(channel_id, "100"),
@@ -6880,7 +7356,7 @@ mod hardening_tests {
     fn batch_channel_update_rejects_delete_with_live_pending_request() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -6930,7 +7406,7 @@ mod hardening_tests {
     fn batch_channel_update_allows_delete_of_pending_only_provisional_channel() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -6961,7 +7437,7 @@ mod hardening_tests {
     fn batch_channel_update_rejects_monotonic_state_rollbacks() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -7049,7 +7525,7 @@ mod hardening_tests {
     fn batch_channel_update_requires_pending_request_for_charge_increase() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -7118,6 +7594,38 @@ mod hardening_tests {
             )
         );
 
+        let mut under_record_current = test_batch_channel(&channel_id, "100");
+        under_record_current.revision = 1;
+        under_record_current.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-under-record".to_string(),
+            signed_max_claimable: "130".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, under_record_current).unwrap();
+        let mut under_record_next = test_batch_channel(&channel_id, "125");
+        under_record_next.signed_max_claimable = "130".to_string();
+        under_record_next.signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            "130",
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        let under_record = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(under_record_next),
+            },
+        );
+        assert_eq!(under_record.status, "invalid");
+        assert_eq!(
+            under_record.message,
+            Some(
+                "batch channel chargedCumulativeAmount must match pendingRequest.signedMaxClaimable when charge increases"
+                    .to_string()
+            )
+        );
+
         let mut unconsumed_current = test_batch_channel(&channel_id, "100");
         unconsumed_current.revision = 1;
         unconsumed_current.pending_request = Some(crate::batch::BatchPendingRequest {
@@ -7146,7 +7654,7 @@ mod hardening_tests {
     fn batch_channel_update_rejects_config_mismatch_and_storage_limit() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -7289,11 +7797,21 @@ mod hardening_tests {
         assert_eq!(intent.nonce, format!("0x{}", "33".repeat(32)));
         assert_eq!(intent.status, "created");
 
+        let bound = batch_mark_payment_intent("intent-1".to_string(), "bound".to_string()).unwrap();
+        assert_eq!(bound.status, "bound");
         let marked = batch_mark_payment_intent("intent-1".to_string(), "paid".to_string()).unwrap();
         assert_eq!(marked.status, "paid");
         assert_eq!(
             batch_payment_intent("intent-1".to_string()).unwrap().status,
             "paid"
+        );
+        assert_eq!(
+            batch_mark_payment_intent("intent-1".to_string(), "bound".to_string()).unwrap_err(),
+            "payment intent status transition is not allowed"
+        );
+        assert_eq!(
+            batch_mark_payment_intent("intent-1".to_string(), "cancelled".to_string()).unwrap_err(),
+            "payment intent status transition is not allowed"
         );
         assert_eq!(
             batch_set_seller(PAY_TO.to_string(), "suspended".to_string()).unwrap_err(),
@@ -7321,7 +7839,7 @@ mod hardening_tests {
     fn batch_channel_create_requires_matching_created_payment_intent() {
         clear_batch_channels();
         clear_env_values();
-        set_default_batch_contract();
+        set_default_batch_channel_runtime_config();
         let channel_id = compute_batch_channel_id(
             &test_batch_channel_config(),
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
@@ -7339,44 +7857,43 @@ mod hardening_tests {
         assert_eq!(result.status, "invalid");
         assert_eq!(
             result.message,
-            Some("sqlite error: payment intent not found".to_string())
+            Some("sqlite error: batch payment intent match must be unique".to_string())
         );
 
         let intent_mismatch_cases: [(&str, fn(&mut BatchPaymentIntent), &str); 5] = [
             (
                 "101",
                 |intent: &mut BatchPaymentIntent| intent.status = "cancelled".to_string(),
-                "sqlite error: payment intent status must be created",
+                "sqlite error: batch payment intent match must be unique",
             ),
             (
                 "102",
                 |intent: &mut BatchPaymentIntent| {
                     intent.receiver_address = PAYER.to_ascii_lowercase()
                 },
-                "sqlite error: payment intent receiver mismatch",
+                "sqlite error: batch payment intent match must be unique",
             ),
             (
                 "103",
                 |intent: &mut BatchPaymentIntent| {
                     intent.payer_address = PAY_TO.to_ascii_lowercase()
                 },
-                "sqlite error: payment intent payer mismatch",
+                "sqlite error: batch payment intent match must be unique",
             ),
             (
                 "104",
                 |intent: &mut BatchPaymentIntent| intent.amount = "999".to_string(),
-                "sqlite error: payment intent amount mismatch",
+                "sqlite error: batch payment intent match must be unique",
             ),
             (
                 "105",
                 |intent: &mut BatchPaymentIntent| intent.nonce = format!("0x{}", "44".repeat(32)),
-                "sqlite error: payment intent nonce mismatch",
+                "sqlite error: batch payment intent match must be unique",
             ),
         ];
         for (amount, mutate, expected) in intent_mismatch_cases {
             let channel = test_initial_batch_channel(&channel_id, amount);
-            register_payment_intent_for_channel(&channel);
-            let intent_id = channel.pending_request.as_ref().unwrap().pending_id.clone();
+            let intent_id = register_payment_intent_for_channel(&channel);
             TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
                 mutate(intents.borrow_mut().get_mut(&intent_id).unwrap());
             });
@@ -7392,8 +7909,8 @@ mod hardening_tests {
         }
 
         let channel = test_initial_batch_channel(&channel_id, "200");
-        let intent_id = channel.pending_request.as_ref().unwrap().pending_id.clone();
-        register_payment_intent_for_channel(&channel);
+        let pending_id = channel.pending_request.as_ref().unwrap().pending_id.clone();
+        let intent_id = register_payment_intent_for_channel(&channel);
         let created = batch_update_channel(
             channel_id.clone(),
             None,
@@ -7406,12 +7923,255 @@ mod hardening_tests {
             batch_payment_intent(intent_id.clone()).unwrap().status,
             "bound"
         );
+        assert_eq!(
+            batch_payment_intent(intent_id.clone()).unwrap().pending_id,
+            Some(pending_id)
+        );
         TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
             let binding = bindings.borrow().get(&channel_id).cloned().unwrap();
             assert_eq!(binding.0, PAY_TO.to_ascii_lowercase());
             assert_eq!(binding.1, PAYER.to_ascii_lowercase());
             assert_eq!(binding.3, intent_id);
         });
+    }
+
+    #[test]
+    fn batch_channel_create_binding_conflict_leaves_intent_created() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_initial_batch_channel(&channel_id, "200");
+        let intent_id = register_payment_intent_for_channel(&channel);
+        TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
+            bindings.borrow_mut().insert(
+                channel_id.clone(),
+                (
+                    PAY_TO.to_ascii_lowercase(),
+                    PAYER.to_ascii_lowercase(),
+                    JPYC_POLYGON_ADDRESS.to_ascii_lowercase(),
+                    "intent-existing".to_string(),
+                ),
+            );
+        });
+
+        let created = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(channel),
+            },
+        );
+        assert_eq!(created.status, "invalid");
+        assert_eq!(
+            created.message,
+            Some("sqlite error: batch channel binding already exists".to_string())
+        );
+        let intent = batch_payment_intent(intent_id).unwrap();
+        assert_eq!(intent.status, "created");
+        assert_eq!(intent.pending_id, None);
+        TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
+            let binding = bindings.borrow().get(&channel_id).cloned().unwrap();
+            assert_eq!(binding.3, "intent-existing");
+        });
+    }
+
+    #[test]
+    fn batch_channel_existing_pending_binds_and_consumption_marks_intent_paid() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+
+        let initial = test_initial_batch_channel(&channel_id, "100");
+        let initial_intent_id = register_payment_intent_for_channel(&initial);
+        let created = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(initial),
+            },
+        );
+        assert_eq!(created.status, "updated");
+        assert_eq!(
+            batch_payment_intent(initial_intent_id.clone())
+                .unwrap()
+                .pending_id,
+            Some("request-100".to_string())
+        );
+
+        let consumed = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "100")),
+            },
+        );
+        assert_eq!(consumed.status, "updated");
+        assert_eq!(
+            batch_payment_intent(initial_intent_id).unwrap().status,
+            "paid"
+        );
+
+        let mut reserved = test_batch_channel(&channel_id, "100");
+        reserved.signed_max_claimable = "150".to_string();
+        reserved.signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            "150",
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        reserved.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-150".to_string(),
+            signed_max_claimable: "150".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        let reserved_intent_id = register_payment_intent_for_channel_amount(&reserved, "50");
+        let reserved_update = batch_update_channel(
+            channel_id.clone(),
+            Some(2),
+            BatchChannelUpdate {
+                channel: Some(reserved),
+            },
+        );
+        assert_eq!(reserved_update.status, "updated");
+        let reserved_intent = batch_payment_intent(reserved_intent_id).unwrap();
+        assert_eq!(reserved_intent.status, "bound");
+        assert_eq!(reserved_intent.pending_id, Some("request-150".to_string()));
+    }
+
+    #[test]
+    fn batch_channel_existing_pending_rejects_same_pending_mutation() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let initial = test_initial_batch_channel(&channel_id, "100");
+        let intent_id = register_payment_intent_for_channel(&initial);
+        let created = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(initial),
+            },
+        );
+        assert_eq!(created.status, "updated");
+
+        let mut amount_mutation = batch_channel(channel_id.clone()).unwrap();
+        amount_mutation.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-100".to_string(),
+            signed_max_claimable: "150".to_string(),
+            expires_at: amount_mutation.pending_request.as_ref().unwrap().expires_at,
+        });
+        amount_mutation.signed_max_claimable = "150".to_string();
+        amount_mutation.signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            "150",
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        let rejected_amount = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(amount_mutation),
+            },
+        );
+        assert_eq!(rejected_amount.status, "invalid");
+        assert_eq!(
+            rejected_amount.message,
+            Some("batch channel pendingRequest must not change for the same pendingId".to_string())
+        );
+
+        let mut expiry_mutation = batch_channel(channel_id.clone()).unwrap();
+        let pending = expiry_mutation.pending_request.as_mut().unwrap();
+        pending.expires_at = pending.expires_at.saturating_add(1_000);
+        let rejected_expiry = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(expiry_mutation),
+            },
+        );
+        assert_eq!(rejected_expiry.status, "invalid");
+        assert_eq!(
+            rejected_expiry.message,
+            Some("batch channel pendingRequest must not change for the same pendingId".to_string())
+        );
+
+        let intent = batch_payment_intent(intent_id).unwrap();
+        assert_eq!(intent.status, "bound");
+        assert_eq!(intent.pending_id, Some("request-100".to_string()));
+        assert_eq!(
+            batch_channel(channel_id)
+                .unwrap()
+                .pending_request
+                .unwrap()
+                .signed_max_claimable,
+            "100"
+        );
+    }
+
+    #[test]
+    fn batch_channel_update_rejects_runtime_config_mismatch() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+
+        let cases: [(&str, fn(&mut crate::batch::BatchChannelConfig), &str); 3] = [
+            (
+                "wrong token",
+                |config: &mut crate::batch::BatchChannelConfig| {
+                    config.token = "0x0000000000000000000000000000000000000001".to_string();
+                },
+                "batch channel token must be JPYC on Polygon",
+            ),
+            (
+                "wrong receiverAuthorizer",
+                |config: &mut crate::batch::BatchChannelConfig| {
+                    config.receiver_authorizer =
+                        "0x0000000000000000000000000000000000000002".to_string();
+                },
+                "batch channel receiverAuthorizer must match BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY",
+            ),
+            (
+                "wrong withdrawDelay",
+                |config: &mut crate::batch::BatchChannelConfig| {
+                    config.withdraw_delay = DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS + 1;
+                },
+                "batch channel withdrawDelay must match BATCH_WITHDRAW_DELAY_SECONDS",
+            ),
+        ];
+
+        for (_name, mutate, expected) in cases {
+            let mut config = test_batch_channel_config();
+            mutate(&mut config);
+            let channel_id =
+                compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+            let channel = test_initial_batch_channel_for_config(&channel_id, config, "100");
+            register_payment_intent_for_channel(&channel);
+            let result = batch_update_channel(
+                channel_id,
+                None,
+                BatchChannelUpdate {
+                    channel: Some(channel),
+                },
+            );
+            assert_eq!(result.status, "invalid");
+            assert_eq!(result.message, Some(expected.to_string()));
+        }
     }
 
     #[test]
@@ -7897,7 +8657,7 @@ mod hardening_tests {
         set_default_batch_contract();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
         batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
         batch_set_writer_receiver_scope(
             Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
@@ -7938,7 +8698,7 @@ mod hardening_tests {
         set_default_batch_contract();
         set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
-        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
         batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
         batch_set_writer_receiver_scope(
             Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
@@ -8018,7 +8778,7 @@ mod hardening_tests {
         let claim_payload = batch_payload(&claim_body["paymentPayload"]["payload"]).unwrap();
         let claim_signature = crate::tx::sign_batch_claims(
             claim_payload.claims.as_deref().unwrap(),
-            OTHER_PRIVATE_KEY,
+            PAYER_PRIVATE_KEY,
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
         )
         .unwrap();
@@ -8077,7 +8837,7 @@ mod hardening_tests {
             &channel_id,
             payload.amount.as_deref().unwrap(),
             payload.refund_nonce.as_deref().unwrap(),
-            OTHER_PRIVATE_KEY,
+            PAYER_PRIVATE_KEY,
             DEFAULT_BATCH_SETTLEMENT_CONTRACT,
         )
         .unwrap();

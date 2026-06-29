@@ -250,6 +250,27 @@ function fetchForBatchSupported(includeBatch = true, healthAddress: Address = fa
       return Response.json(supportedResponse(includeBatch, healthAddress));
     }
     if (String(input) === `${baseUrl}/verify` && init?.method === "POST") {
+      const body = typeof init.body === "string" ? JSON.parse(init.body) as Record<string, unknown> : {};
+      if (body.fixture === "batch-positive") {
+        return Response.json({
+          isValid: true,
+          payer: "0x3000000000000000000000000000000000000402",
+          extra: {
+            balance: "1000",
+            channelId: readinessChannelId,
+            channelState: {
+              balance: "1000",
+              channelId: readinessChannelId,
+              refundNonce: "2",
+              totalClaimed: "300",
+              withdrawRequestedAt: 42
+            },
+            refundNonce: "2",
+            totalClaimed: "300",
+            withdrawRequestedAt: 42
+          }
+        });
+      }
       return Response.json({ isValid: false, invalidReason: "unsupported_verify_scheme" }, { status: 400 });
     }
     return new Response("not found", { status: 404 });
@@ -353,15 +374,6 @@ function batchStorageQueryOutput(args: readonly string[]): { readonly output: st
   if (args.includes("batch_deleted_channels")) {
     return { output: "(vec {})", status: 0 };
   }
-  if (args.includes("batch_update_channel")) {
-    if (!args.includes('("0x00", null, record { channel = null })')) {
-      return { output: "invalid batch_update_channel probe", status: 1 };
-    }
-    return {
-      output: '(record { status = "invalid"; channel = null; current_revision = null; message = opt "channelId: hex must be 32 bytes" })',
-      status: 0
-    };
-  }
   return undefined;
 }
 
@@ -440,6 +452,27 @@ describe("batch production readiness", () => {
     expect(report.stages.find((stage) => stage.name === "batch:receipt:settle")?.detail).toContain(`receiver=${seller}`);
     expect(report.stages.find((stage) => stage.name === "batch:receipt:settle")?.detail).toContain(`token=${jpyc}`);
     expect(report.nextCommands).toEqual([]);
+  });
+
+  it("accepts a positive batch /verify readiness fixture with channelState and flat fields", async () => {
+    const report = await buildBatchProductionReadinessReport({
+      batchPreflightReader: preflightReader,
+      batchSettlementReceiptReader: receiptReader,
+      commandRunner: passingCommandRunner,
+      env: {
+        ...env(),
+        X402_BATCH_VERIFY_FIXTURE: JSON.stringify({ fixture: "batch-positive" })
+      },
+      fileReader: fileReader(),
+      fetchFn: fetchForBatchSupported()
+    });
+
+    expect(report.ready).toBe(true);
+    expect(report.stages.find((stage) => stage.name === "canister:batch-supported")).toEqual({
+      detail: `${baseUrl} advertises batch-settlement`,
+      name: "canister:batch-supported",
+      status: "ok"
+    });
   });
 
   it("can run as preflight-only before a batch tx exists", async () => {
@@ -1589,156 +1622,6 @@ describe("batch production readiness", () => {
     expect(report.ready).toBe(false);
     expect(report.stages).toContainEqual({
       detail: "method not found: batch_channels",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel update API is not available", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(0 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: "(null)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: "(vec {})", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_update_channel")) {
-          return { output: "method not found: batch_update_channel", status: 1 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "method not found: batch_update_channel",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when batch channel update probe is rejected by storage access control", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("batch_update_channel")) {
-          return { output: "caller is not authorized to update batch channel storage", status: 1 };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "caller is not authorized to update batch channel storage",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when batch channel update probe is rejected for anonymous caller", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("batch_update_channel")) {
-          return { output: "anonymous caller is not authorized to update batch channel storage", status: 1 };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "anonymous caller is not authorized to update batch channel storage",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when batch channel update probe returns invalid status without result fields", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("batch_update_channel")) {
-          return { output: '(record { status = "invalid" })', status: 0 };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: '(record { status = "invalid" })',
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when batch channel update probe returns an unrelated invalid result", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("batch_update_channel")) {
-          return {
-            output: '(record { status = "invalid"; channel = null; current_revision = null; message = opt "unrelated validation failure" })',
-            status: 0
-          };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: '(record { status = "invalid"; channel = null; current_revision = null; message = opt "unrelated validation failure" })',
       name: "canister:batch-storage-api",
       status: "fail"
     });

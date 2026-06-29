@@ -8,6 +8,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 
 import { loadDotenv } from "./env_file";
+import { normalizePolygonRpcUrl } from "./rpc_url";
 
 const DEFAULT_JPYC_POLYGON_ADDRESS: Address = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 
@@ -196,30 +197,6 @@ function normalizeBatchSettlementContract(value: string, name: string): Address 
     throw new Error(`${name} must equal official @x402/evm BATCH_SETTLEMENT_ADDRESS ${BATCH_SETTLEMENT_ADDRESS}`);
   }
   return contract;
-}
-
-function normalizePolygonRpcUrl(value: string, name: string): string {
-  if (!value.startsWith("https://") || /\s/.test(value)) {
-    throw new Error(`${name} must be a HTTPS RPC URL without userinfo or fragment`);
-  }
-  try {
-    const url = new URL(value);
-    if (
-      url.protocol !== "https:" ||
-      url.username !== "" ||
-      url.password !== "" ||
-      url.hostname === "" ||
-      url.hash !== ""
-    ) {
-      throw new Error(`${name} must be a HTTPS RPC URL without userinfo or fragment`);
-    }
-    return value;
-  } catch (error: unknown) {
-    if (error instanceof Error && error.message === `${name} must be a HTTPS RPC URL without userinfo or fragment`) {
-      throw error;
-    }
-    throw new Error(`${name} must be a HTTPS RPC URL without userinfo or fragment`);
-  }
 }
 
 function normalizeBytes32(value: string, name: string): Hex {

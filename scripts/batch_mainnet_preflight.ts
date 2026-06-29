@@ -8,6 +8,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 
 import { loadDotenv } from "./env_file";
+import { isPolygonRpcUrl } from "./rpc_url";
 
 const DEFAULT_JPYC_POLYGON_ADDRESS: Address = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const EXPECTED_CHAIN_ID = 137;
@@ -74,24 +75,6 @@ function fail(name: string, detail: string): BatchMainnetPreflightCheck {
 
 function isAddress(value: string): value is Address {
   return /^0x[0-9a-fA-F]{40}$/.test(value);
-}
-
-function isHttpsRpcUrl(value: string): boolean {
-  if (!value.startsWith("https://") || /\s/.test(value)) {
-    return false;
-  }
-  try {
-    const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      url.username === "" &&
-      url.password === "" &&
-      url.hostname !== "" &&
-      url.hash === ""
-    );
-  } catch {
-    return false;
-  }
 }
 
 function batchSettlementContractCheck(env: NodeJS.ProcessEnv): {
@@ -248,7 +231,7 @@ function rpcUrlCheck(env: NodeJS.ProcessEnv): BatchMainnetPreflightCheck {
   if (!value || value.trim() === "") {
     return fail("env:POLYGON_RPC_URL", "未設定");
   }
-  if (!isHttpsRpcUrl(value)) {
+  if (!isPolygonRpcUrl(value)) {
     return fail("env:POLYGON_RPC_URL", "userinfo/fragment なしの HTTPS URL ではない");
   }
   return ok("env:POLYGON_RPC_URL", "設定済み");

@@ -48,6 +48,7 @@ type BatchPaymentIntent = record {
   created_at : nat64;
   resource_url : text;
   nonce : text;
+  pending_id : opt text;
   amount : text;
   intent_id : text;
   payer_address : text;

@@ -8,6 +8,7 @@ import { polygon } from "viem/chains";
 
 import { positiveDecimalToAtomicUnits } from "../src/amount";
 import { loadDotenv } from "./env_file";
+import { normalizePolygonRpcUrl } from "./rpc_url";
 
 export type ReceiptReader = {
   getBlockNumber(): Promise<bigint>;
@@ -216,7 +217,7 @@ export async function verifySettlementReceipt(
 ): Promise<SettlementReceiptResult> {
   const reader = options.reader ?? createPublicClient({
     chain: polygon,
-    transport: http(options.rpcUrl ?? requireEnv("POLYGON_RPC_URL"))
+    transport: http(normalizePolygonRpcUrl(options.rpcUrl ?? requireEnv("POLYGON_RPC_URL")))
   });
   const [receipt, latestBlock] = await Promise.all([
     reader.getTransactionReceipt({ hash: options.hash }),
@@ -269,7 +270,7 @@ async function main(): Promise<void> {
   const expectedTransfer = expectedTransferFromEnv(process.env);
   const result = await verifySettlementReceipt({
     hash: parseTxHash(tx),
-    ...(rpcUrl ? { rpcUrl } : {}),
+    ...(rpcUrl ? { rpcUrl: normalizePolygonRpcUrl(rpcUrl) } : {}),
     expectedFrom: expectedSettlementSenderFromEnv(process.env),
     expectedTo: readEnv("JPYC_POLYGON_ADDRESS") ?? DEFAULT_JPYC_POLYGON_ADDRESS,
     expectedTransfer,
