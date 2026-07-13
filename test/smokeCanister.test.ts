@@ -97,6 +97,29 @@ describe("canister smoke", () => {
     });
   });
 
+  it("requires deployed RPC and normal fee to match local production config", async () => {
+    const fetchFn: typeof fetch = async (input) => {
+      if (String(input) === `${baseUrl}/health`) {
+        return Response.json({
+          ok: true,
+          network: "eip155:137",
+          facilitatorAddress,
+          polygonRpcConfigured: true,
+          sellerSettlementFeeAmount: "1000000000000000000"
+        });
+      }
+      return responseFor()(input);
+    };
+    await expect(checkCanisterSmoke({
+      env: env({ SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000" }),
+      fetchFn
+    })).resolves.toMatchObject({ facilitatorAddress });
+    await expect(checkCanisterSmoke({
+      env: env({ SELLER_SETTLEMENT_FEE_AMOUNT: "2000000000000000000" }),
+      fetchFn
+    })).rejects.toThrow("health.sellerSettlementFeeAmount mismatch");
+  });
+
   it("rejects invalid facilitator addresses", async () => {
     await expect(
       checkCanisterSmoke({

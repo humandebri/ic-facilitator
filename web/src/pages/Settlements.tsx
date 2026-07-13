@@ -1,0 +1,10 @@
+import { useState } from "react";
+import { api } from "../api";
+import { Address, Notice, PageHeader, SellerNav } from "../components";
+import { config } from "../env";
+import { formatDate, formatJpyc } from "../format";
+import { connectWallet } from "../wallet";
+import type { SettlementItem } from "../types";
+
+export function Settlements(){const [seller,setSeller]=useState("");const [items,setItems]=useState<SettlementItem[]>([]);const [cursor,setCursor]=useState<string>();const [error,setError]=useState("");async function load(next?:string){try{const address=seller|| (await connectWallet()).address;setSeller(address);const page=await api.settlements(address,next);setItems(v=>next?[...v,...page.items]:page.items);setCursor(page.nextCursor??undefined);}catch(e){setError(e instanceof Error?e.message:String(e));}}
+return <section className="page"><SellerNav/><PageHeader eyebrow="SETTLEMENTS" title="決済の履歴" lead="sellerに紐づくExactとBatchの結果を、新しい順に確認できます。"/>{!seller&&<button className="button" onClick={()=>void load()}>Seller walletを接続</button>}{error&&<Notice tone="warning">{error}</Notice>}{seller&&<div className="table-wrap"><table><thead><tr><th>状態</th><th>区分</th><th>Payer</th><th>金額 / fee</th><th>Transaction</th><th>更新</th></tr></thead><tbody>{items.map(x=><tr key={x.key}><td><span className={`status ${x.status}`}>{x.status}</span>{x.failureReason&&<small>{x.failureReason}</small>}</td><td>{x.kind}</td><td><Address value={x.payer}/></td><td><b>{formatJpyc(x.amount)}</b><small>fee {formatJpyc(x.fee)}</small></td><td>{x.transaction?<a href={`${config.explorerUrl}/tx/${x.transaction}`} target="_blank" rel="noreferrer">Explorer ↗</a>:"—"}<small>{x.confirmations} confirmations</small></td><td>{formatDate(x.updatedAt)}<small title={x.key}>{x.key.slice(0,10)}…</small></td></tr>)}</tbody></table>{items.length===0&&<p className="empty">このsellerのsettlementはまだありません。</p>}</div>}{cursor&&<button className="button secondary" onClick={()=>void load(cursor)}>さらに読み込む</button>}</section>}

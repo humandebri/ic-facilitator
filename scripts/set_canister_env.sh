@@ -5,6 +5,7 @@ set -euo pipefail
 readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ENVIRONMENT="${1:-local}"
 readonly CANISTER="${2:-edge}"
+readonly MODE="${3:---sync}"
 readonly DEFAULT_FACILITATOR_MAX_GAS="500000"
 readonly DEFAULT_FACILITATOR_MAX_SETTLEMENT_FEE_WEI="30000000000000000"
 readonly DEFAULT_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="60"
@@ -109,6 +110,22 @@ NODE
   fi
 }
 
+require_uint_minimum() {
+  local name="$1"
+  local value="$2"
+  local minimum="$3"
+  require_uint128_integer "$name" "$value"
+  if ! UINT_VALUE="$value" UINT_MIN="$minimum" node <<'NODE'
+const value = BigInt(process.env.UINT_VALUE || "0");
+const minimum = BigInt(process.env.UINT_MIN || "0");
+process.exit(value >= minimum ? 0 : 1);
+NODE
+  then
+    echo "$name must be at least $minimum" >&2
+    exit 1
+  fi
+}
+
 require_integer_range() {
   local name="$1"
   local value="$2"
@@ -156,15 +173,11 @@ require_batch_key_separation() {
   fi
 }
 
-require_single_https_rpc_url() {
+require_polygon_rpc_url() {
   local name="$1"
   local value="$2"
-  if [[ "$value" == *","* ]]; then
-    echo "$name must contain exactly one HTTPS RPC origin" >&2
-    exit 1
-  fi
-  if [[ ! "$value" =~ ^https://[^/:@?#[:space:]]+(:[0-9]+)?$ ]]; then
-    echo "$name must be a single https://host[:port] RPC origin" >&2
+  if [[ ! "$value" =~ ^https://[^/@?#[:space:]]+(/[^#[:space:]]*)?(\?[^#[:space:]]*)?$ ]] || [[ "$value" == *"@"* ]]; then
+    echo "$name must be a HTTPS RPC URL without userinfo or fragment" >&2
     exit 1
   fi
 }
@@ -297,51 +310,136 @@ set_env() {
   icp canister call --environment "$ENVIRONMENT" "$CANISTER" set_env "(\"$escaped_name\", \"$escaped_value\")"
 }
 
+set_runtime_profile() {
+  local profile="$1"
+  local token="$2"
+  local contract="$3"
+  local seller_fee="$4"
+  local batch_fee="$5"
+  local terms="$6"
+  local privacy="$7"
+  local asset_boundary="$8"
+  local escaped_profile escaped_token escaped_contract escaped_seller_fee escaped_batch_fee
+  local escaped_terms escaped_privacy escaped_asset_boundary
+  escaped_profile="$(candid_text "$profile")"
+  escaped_token="$(candid_text "$token")"
+  escaped_contract="$(candid_text "$contract")"
+  escaped_seller_fee="$(candid_text "$seller_fee")"
+  escaped_batch_fee="$(candid_text "$batch_fee")"
+  escaped_terms="$(candid_text "$terms")"
+  escaped_privacy="$(candid_text "$privacy")"
+  escaped_asset_boundary="$(candid_text "$asset_boundary")"
+  icp canister call --environment "$ENVIRONMENT" "$CANISTER" set_runtime_profile "(record {
+    profile = \"$escaped_profile\";
+    token = \"$escaped_token\";
+    batch_contract = \"$escaped_contract\";
+    seller_settlement_fee_amount = \"$escaped_seller_fee\";
+    batch_settlement_fee_amount = \"$escaped_batch_fee\";
+    terms_version = \"$escaped_terms\";
+    privacy_version = \"$escaped_privacy\";
+    asset_boundary_version = \"$escaped_asset_boundary\";
+  })"
+}
+
 cd "$ROOT"
 load_dotenv
 
 required_env FACILITATOR_EVM_PRIVATE_KEY
 required_env JPYC_EIP712_VERSION
-required_env POLYGON_RPC_SERVICES
+required_env POLYGON_RPC_URL
 required_env FACILITATOR_PUBLIC_ORIGIN
 required_env SELLER_CREDIT_PAY_TO
-required_env SELLER_CREDIT_TOPUP_AMOUNT
 required_env SELLER_SETTLEMENT_FEE_AMOUNT
+readonly RESOLVED_NETWORK_PROFILE="${NETWORK_PROFILE:-polygon}"
+case "$RESOLVED_NETWORK_PROFILE" in
+  polygon)
+    readonly RESOLVED_NETWORK_TOKEN="0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB"
+    ;;
+  amoy)
+    required_env AMOY_JPYC_ADDRESS
+    required_env AMOY_BATCH_SETTLEMENT_CONTRACT
+    require_nonzero_evm_address AMOY_JPYC_ADDRESS "$AMOY_JPYC_ADDRESS"
+    require_nonzero_evm_address AMOY_BATCH_SETTLEMENT_CONTRACT "$AMOY_BATCH_SETTLEMENT_CONTRACT"
+    readonly RESOLVED_NETWORK_TOKEN="$AMOY_JPYC_ADDRESS"
+    BATCH_SETTLEMENT_CONTRACT="$AMOY_BATCH_SETTLEMENT_CONTRACT"
+    ;;
+  *)
+    echo "NETWORK_PROFILE must be polygon or amoy" >&2
+    exit 1
+    ;;
+esac
 require_private_key FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
-require_single_https_rpc_url POLYGON_RPC_SERVICES "$POLYGON_RPC_SERVICES"
+require_polygon_rpc_url POLYGON_RPC_URL "$POLYGON_RPC_URL"
 require_https_origin FACILITATOR_PUBLIC_ORIGIN "$FACILITATOR_PUBLIC_ORIGIN"
 require_nonzero_evm_address SELLER_CREDIT_PAY_TO "$SELLER_CREDIT_PAY_TO"
-require_positive_integer SELLER_CREDIT_TOPUP_AMOUNT "$SELLER_CREDIT_TOPUP_AMOUNT"
-require_positive_integer SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT"
+require_uint128_integer SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT"
 readonly RESOLVED_FACILITATOR_MAX_GAS="${FACILITATOR_MAX_GAS:-$DEFAULT_FACILITATOR_MAX_GAS}"
 readonly RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI="${FACILITATOR_MAX_SETTLEMENT_FEE_WEI:-$DEFAULT_FACILITATOR_MAX_SETTLEMENT_FEE_WEI}"
 readonly RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="${SETTLE_CONFIRMATION_TIMEOUT_SECONDS:-$DEFAULT_SETTLE_CONFIRMATION_TIMEOUT_SECONDS}"
 readonly RESOLVED_SETTLE_MIN_CONFIRMATIONS="${SETTLE_MIN_CONFIRMATIONS:-$DEFAULT_SETTLE_MIN_CONFIRMATIONS}"
 readonly RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS="${SETTLEMENT_CACHE_TTL_SECONDS:-$DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS}"
 readonly RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS="${BATCH_WITHDRAW_DELAY_SECONDS:-$DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS}"
+readonly RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT="${BATCH_SETTLEMENT_FEE_AMOUNT:-10000000000000000000}"
 require_positive_integer FACILITATOR_MAX_GAS "$RESOLVED_FACILITATOR_MAX_GAS"
 require_positive_integer FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI"
 require_positive_integer SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
 require_positive_integer SETTLE_MIN_CONFIRMATIONS "$RESOLVED_SETTLE_MIN_CONFIRMATIONS"
 require_positive_integer SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"
+require_uint128_integer BATCH_SETTLEMENT_FEE_AMOUNT "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT"
 if [[ -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
   required_env BATCH_SETTLEMENT_CONTRACT
   required_env BATCH_SETTLEMENT_FEE_AMOUNT
   require_private_key BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY "$BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
   require_batch_key_separation
   require_nonzero_evm_address BATCH_SETTLEMENT_CONTRACT "$BATCH_SETTLEMENT_CONTRACT"
-  require_official_batch_settlement_contract "$BATCH_SETTLEMENT_CONTRACT"
+  if [[ "$RESOLVED_NETWORK_PROFILE" == "polygon" ]]; then
+    require_official_batch_settlement_contract "$BATCH_SETTLEMENT_CONTRACT"
+  fi
   require_integer_range BATCH_WITHDRAW_DELAY_SECONDS "$RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS" "$MIN_BATCH_WITHDRAW_DELAY_SECONDS" "$MAX_BATCH_WITHDRAW_DELAY_SECONDS"
   require_uint128_integer BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT"
+  if [[ "${REQUIRE_PRODUCTION_FEES:-0}" == "1" ]]; then
+    require_uint_minimum BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT" "10000000000000000000"
+  fi
+fi
+if [[ "$RESOLVED_NETWORK_PROFILE" == "polygon" || "${REQUIRE_PRODUCTION_FEES:-0}" == "1" ]]; then
+  require_uint_minimum SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT" "1000000000000000000"
+  require_uint_minimum BATCH_SETTLEMENT_FEE_AMOUNT "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" "10000000000000000000"
+  for version_name in SELLER_TERMS_VERSION PRIVACY_VERSION ASSET_BOUNDARY_VERSION; do
+    version_value="${!version_name:-}"
+    if [[ -z "$version_value" || "$version_value" == *-draft ]]; then
+      echo "$version_name must be an approved, non-draft version for production" >&2
+      exit 1
+    fi
+  done
 fi
 
+case "$MODE" in
+  --validate-only)
+    echo "validated canister environment for $CANISTER@$ENVIRONMENT"
+    exit 0
+    ;;
+  --sync|--disable-batch)
+    ;;
+  *)
+    echo "unknown mode: $MODE" >&2
+    exit 1
+    ;;
+esac
+
 set_env FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
+set_runtime_profile \
+  "$RESOLVED_NETWORK_PROFILE" \
+  "$RESOLVED_NETWORK_TOKEN" \
+  "${BATCH_SETTLEMENT_CONTRACT:-$CANONICAL_BATCH_SETTLEMENT_CONTRACT}" \
+  "$SELLER_SETTLEMENT_FEE_AMOUNT" \
+  "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" \
+  "${SELLER_TERMS_VERSION:-2026-07-13-draft}" \
+  "${PRIVACY_VERSION:-2026-07-13-draft}" \
+  "${ASSET_BOUNDARY_VERSION:-2026-07-13-draft}"
 set_env JPYC_EIP712_VERSION "$JPYC_EIP712_VERSION"
-set_env POLYGON_RPC_SERVICES "$POLYGON_RPC_SERVICES"
+set_env POLYGON_RPC_URL "$POLYGON_RPC_URL"
 set_env FACILITATOR_PUBLIC_ORIGIN "$FACILITATOR_PUBLIC_ORIGIN"
 set_env SELLER_CREDIT_PAY_TO "$SELLER_CREDIT_PAY_TO"
-set_env SELLER_CREDIT_TOPUP_AMOUNT "$SELLER_CREDIT_TOPUP_AMOUNT"
-set_env SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT"
 set_env FACILITATOR_MAX_GAS "$RESOLVED_FACILITATOR_MAX_GAS"
 set_env FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI"
 set_env SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
@@ -349,12 +447,8 @@ set_env SETTLE_MIN_CONFIRMATIONS "$RESOLVED_SETTLE_MIN_CONFIRMATIONS"
 set_env SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"
 if [[ -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
   set_env BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY "$BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
-  set_env BATCH_SETTLEMENT_CONTRACT "$BATCH_SETTLEMENT_CONTRACT"
   set_env BATCH_WITHDRAW_DELAY_SECONDS "$RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS"
-  set_env BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT"
-else
+elif [[ "$MODE" == "--disable-batch" ]]; then
   set_env BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY ""
-  set_env BATCH_SETTLEMENT_CONTRACT ""
-  set_env BATCH_WITHDRAW_DELAY_SECONDS ""
-  set_env BATCH_SETTLEMENT_FEE_AMOUNT ""
 fi
+echo "synchronized canister environment for $CANISTER@$ENVIRONMENT"

@@ -235,6 +235,7 @@ pub fn json_response(status_code: u16, value: &impl Serialize) -> HttpResponse {
         headers: vec![
             HeaderField("content-type".to_string(), "application/json".to_string()),
             HeaderField("cache-control".to_string(), "no-store".to_string()),
+            HeaderField("access-control-allow-origin".to_string(), "*".to_string()),
         ],
         body,
         upgrade: None,
@@ -250,6 +251,7 @@ pub fn text_response(status_code: u16, text: &str) -> HttpResponse {
                 "text/plain; charset=utf-8".to_string(),
             ),
             HeaderField("cache-control".to_string(), "no-store".to_string()),
+            HeaderField("access-control-allow-origin".to_string(), "*".to_string()),
         ],
         body: text.as_bytes().to_vec(),
         upgrade: None,

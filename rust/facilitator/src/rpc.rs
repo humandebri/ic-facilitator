@@ -1,18 +1,27 @@
 // rust/facilitator/src/rpc.rs: EVM RPC canister 経由で Polygon の読取・署名済みtx送信を実行する。
-use candid::{CandidType, Deserialize as CandidDeserialize, Principal};
-use evm_rpc_client::{EvmRpcClient, EVM_RPC_CANISTER};
-use evm_rpc_types::{Hex, MultiRpcResult, RpcApi, RpcServices, SendRawTransactionStatus};
-use ic_canister_runtime::IcRuntime;
+use candid::{CandidType, Deserialize as CandidDeserialize};
+use canhttp::{
+    cycles::{ChargeMyself, CyclesAccountingServiceBuilder},
+    http::HttpConversionLayer,
+    Client, IsReplicatedRequestExtension, MaxResponseBytesRequestExtension,
+};
+use http::Request;
 use serde_json::{json, Value};
-use std::str::FromStr;
+use tower::{Service, ServiceBuilder, ServiceExt};
 
+#[cfg(test)]
+use crate::hexutil::JPYC_POLYGON_ADDRESS;
 use crate::hexutil::{address_word, parse_address};
-use crate::hexutil::{parse_hex, parse_u256_hex, selector, JPYC_POLYGON_ADDRESS};
+use crate::hexutil::{parse_hex, parse_u256_hex, selector};
 use crate::tx::{encode_settle_calldata, settle_to_address, sign_eip1559_tx, Eip1559Tx};
 use crate::types::FacilitatorRequest;
 
-const POLYGON_CHAIN_ID: u64 = 137;
-const RESPONSE_SIZE_BYTES: u64 = 20_000;
+const BLOCK_NUMBER_RESPONSE_SIZE_BYTES: u64 = 128;
+const CALL_RESPONSE_SIZE_BYTES: u64 = 192;
+const FEE_HISTORY_RESPONSE_SIZE_BYTES: u64 = 320;
+// Polygon実測はログ0件相当1,031 bytes、3ログ最大3,258 bytes。現行batch ABIのclaimはイベントをemitしない。
+const RECEIPT_RESPONSE_SIZE_BYTES: u64 = 4_096;
+const SEND_RAW_TRANSACTION_RESPONSE_SIZE_BYTES: u64 = 512;
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const SETTLED_TOPIC: &str = "0x7337b4386b690fdb8ba66905b92b9d45d33bc6626ee2620c905fb150ec0cc47d";
 
@@ -20,7 +29,7 @@ pub struct RpcConfig {
     pub max_gas: u128,
     pub max_settlement_fee_wei: u128,
     pub min_confirmations: u64,
-    pub services: String,
+    pub url: String,
 }
 
 pub enum SettlementOutcome {
@@ -157,7 +166,7 @@ pub async fn broadcast_settlement(
             to,
             value: 0,
             data,
-            chain_id: POLYGON_CHAIN_ID,
+            chain_id: crate::configured_chain_id(),
         },
         private_key,
     )?;
@@ -213,7 +222,7 @@ pub async fn broadcast_contract_transaction(
             to,
             value: 0,
             data,
-            chain_id: POLYGON_CHAIN_ID,
+            chain_id: crate::configured_chain_id(),
         },
         private_key,
     )?;
@@ -301,6 +310,7 @@ async fn receipt_status_for_tx(
     if result.is_null() {
         return Ok(ReceiptStatus::Pending);
     }
+    require_receipt_transaction_hash(&result, tx)?;
     let latest_block = rpc_hex_u128(config, "eth_blockNumber", json!([])).await?;
     Ok(receipt_status(
         &result,
@@ -321,6 +331,7 @@ async fn receipt_status_for_contract_tx(
     if result.is_null() {
         return Ok(ContractReceiptStatus::Pending);
     }
+    require_receipt_transaction_hash(&result, tx)?;
     let latest_block = rpc_hex_u128(config, "eth_blockNumber", json!([])).await?;
     Ok(receipt_status_for_contract(
         &result,
@@ -374,6 +385,17 @@ fn post_contract_broadcast_outcome(
             ContractSettlementOutcome::Failed { tx, message }
         }
     }
+}
+
+fn require_receipt_transaction_hash(receipt: &Value, expected: &str) -> Result<(), String> {
+    if receipt
+        .get("transactionHash")
+        .and_then(Value::as_str)
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    {
+        return Ok(());
+    }
+    Err("eth_getTransactionReceipt: transaction hash mismatch".to_string())
 }
 
 fn receipt_status(
@@ -571,14 +593,18 @@ async fn rpc_string(config: &RpcConfig, method: &str, params: Value) -> Result<S
 
 async fn rpc_value(config: &RpcConfig, method: &str, params: Value) -> Result<Value, String> {
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let text = client(config)?
-        .multi_request(body)
-        .send()
-        .await
-        .pipe(consistent_result)
-        .map_err(|err| format!("{method}: {err}"))?;
+    let text = rpc_post(config, method, &body, response_size_for_method(method)?).await?;
+    parse_rpc_value(method, &text)
+}
+
+fn parse_rpc_value(method: &str, text: &str) -> Result<Value, String> {
     let value: Value =
         serde_json::from_str(&text).map_err(|_| format!("invalid rpc json: {text}"))?;
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || value.get("id").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(format!("{method}: invalid JSON-RPC envelope"));
+    }
     if let Some(error) = value.get("error") {
         return Err(format!("{method}: {error}"));
     }
@@ -590,26 +616,16 @@ async fn rpc_value(config: &RpcConfig, method: &str, params: Value) -> Result<Va
 
 async fn send_raw_transaction(config: &RpcConfig, raw: &str) -> Result<String, String> {
     let fallback_hash = raw_transaction_hash(raw)?;
-    let raw = Hex::from_str(raw).map_err(|err| format!("eth_sendRawTransaction: {err}"))?;
-    let result = client(config)?
-        .send_raw_transaction(raw)
-        .send()
-        .await
-        .pipe(consistent_result)
-        .map_err(|err| format!("eth_sendRawTransaction: {err}"))?;
-
-    match result {
-        SendRawTransactionStatus::Ok(Some(tx)) => Ok(tx.to_string()),
-        SendRawTransactionStatus::Ok(None) => Ok(fallback_hash),
-        SendRawTransactionStatus::InsufficientFunds => {
-            Err("eth_sendRawTransaction: insufficient funds".to_string())
+    parse_hex(raw, None).map_err(|err| format!("eth_sendRawTransaction: {err}"))?;
+    match rpc_string(config, "eth_sendRawTransaction", json!([raw])).await {
+        Ok(returned_hash) if returned_hash.eq_ignore_ascii_case(&fallback_hash) => {
+            Ok(fallback_hash)
         }
-        SendRawTransactionStatus::NonceTooLow => {
-            Err("eth_sendRawTransaction: nonce too low".to_string())
-        }
-        SendRawTransactionStatus::NonceTooHigh => {
-            Err("eth_sendRawTransaction: nonce too high".to_string())
-        }
+        Ok(returned_hash) => Err(format!(
+            "eth_sendRawTransaction: returned transaction hash mismatch: {returned_hash}"
+        )),
+        Err(message) if message.to_ascii_lowercase().contains("already known") => Ok(fallback_hash),
+        Err(message) => Err(message),
     }
 }
 
@@ -621,90 +637,73 @@ fn raw_transaction_hash(raw: &str) -> Result<String, String> {
     ))
 }
 
-fn client(
-    config: &RpcConfig,
-) -> Result<
-    EvmRpcClient<
-        ic_canister_runtime::IcRuntime,
-        evm_rpc_client::CandidResponseConverter,
-        evm_rpc_client::NoRetry,
-    >,
-    String,
-> {
-    let canister_id = evm_rpc_canister_id()?;
-    Ok(EvmRpcClient::builder(IcRuntime::new(), canister_id)
-        .with_rpc_sources(rpc_services(&config.services)?)
-        .with_response_size_estimate(RESPONSE_SIZE_BYTES)
-        .build())
-}
-
-fn evm_rpc_canister_id() -> Result<Principal, String> {
-    let value = ic_cdk::api::env_var_value("PUBLIC_CANISTER_ID:evm_rpc");
-    if value.trim().is_empty() {
-        return Ok(EVM_RPC_CANISTER);
-    }
-    Principal::from_text(value).map_err(|err| format!("invalid PUBLIC_CANISTER_ID:evm_rpc: {err}"))
-}
-
-fn rpc_services(value: &str) -> Result<RpcServices, String> {
-    let url = single_rpc_url(value)?;
-    Ok(RpcServices::Custom {
-        chain_id: POLYGON_CHAIN_ID,
-        services: vec![RpcApi { url, headers: None }],
+fn response_size_for_method(method: &str) -> Result<u64, String> {
+    Ok(match method {
+        "eth_blockNumber" | "eth_estimateGas" | "eth_getTransactionCount" => {
+            BLOCK_NUMBER_RESPONSE_SIZE_BYTES
+        }
+        "eth_call" => CALL_RESPONSE_SIZE_BYTES,
+        "eth_feeHistory" => FEE_HISTORY_RESPONSE_SIZE_BYTES,
+        "eth_getTransactionReceipt" => RECEIPT_RESPONSE_SIZE_BYTES,
+        "eth_sendRawTransaction" => SEND_RAW_TRANSACTION_RESPONSE_SIZE_BYTES,
+        _ => return Err(format!("unsupported RPC method: {method}")),
     })
 }
 
-fn single_rpc_url(value: &str) -> Result<String, String> {
-    let services = value
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .collect::<Vec<_>>();
-    if services.is_empty() {
-        return Err("POLYGON_RPC_SERVICES must contain one HTTPS RPC URL".to_string());
+async fn rpc_post(
+    config: &RpcConfig,
+    method: &str,
+    body: &Value,
+    max_response_bytes: u64,
+) -> Result<String, String> {
+    let request = build_rpc_request(&config.url, method, body, max_response_bytes)?;
+    let mut service = ServiceBuilder::new()
+        .layer(HttpConversionLayer)
+        .cycles_accounting(ChargeMyself::default())
+        .service(Client::new_with_box_error());
+    let response = service
+        .ready()
+        .await
+        .map_err(|err| format!("{method}: HTTPS outcall unavailable: {err}"))?
+        .call(request)
+        .await
+        .map_err(|err| format!("{method}: HTTPS outcall failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{method}: RPC HTTP status {}", response.status()));
     }
-    if services.len() != 1 {
-        return Err("POLYGON_RPC_SERVICES must contain exactly one HTTPS RPC URL".to_string());
-    }
-    let url = services[0];
-    if !is_https_rpc_origin(url) {
-        return Err(
-            "POLYGON_RPC_SERVICES must be a single https://host[:port] RPC origin".to_string(),
-        );
-    }
-    Ok(url.to_string())
+    String::from_utf8(response.into_body())
+        .map_err(|_| format!("{method}: RPC response is not UTF-8"))
 }
 
-fn is_https_rpc_origin(value: &str) -> bool {
-    if !value.starts_with("https://") || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return false;
-    }
-    let host_port = &value["https://".len()..];
-    if host_port.is_empty()
-        || host_port.contains('/')
-        || host_port.contains('?')
-        || host_port.contains('#')
-        || host_port.contains('@')
+fn build_rpc_request(
+    url: &str,
+    method: &str,
+    body: &Value,
+    max_response_bytes: u64,
+) -> Result<Request<Vec<u8>>, String> {
+    validate_rpc_url(url)?;
+    Request::post(url)
+        .header("content-type", "application/json")
+        .max_response_bytes(max_response_bytes)
+        .replicated(false)
+        .body(serde_json::to_vec(body).map_err(|err| format!("{method}: {err}"))?)
+        .map_err(|err| format!("{method}: invalid HTTP request: {err}"))
+}
+
+fn validate_rpc_url(value: &str) -> Result<(), String> {
+    let uri = value.parse::<http::Uri>().map_err(|_| {
+        "POLYGON_RPC_URL must be a HTTPS URL without userinfo or fragment".to_string()
+    })?;
+    if uri.scheme_str() != Some("https")
+        || uri.authority().is_none()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        || value.contains('#')
     {
-        return false;
+        return Err("POLYGON_RPC_URL must be a HTTPS URL without userinfo or fragment".to_string());
     }
-    match host_port.split_once(':') {
-        Some((host, port)) => {
-            !host.is_empty()
-                && !host.contains(':')
-                && !port.is_empty()
-                && port.bytes().all(|byte| byte.is_ascii_digit())
-        }
-        None => !host_port.contains(':'),
-    }
-}
-
-fn consistent_result<T: std::fmt::Debug>(result: MultiRpcResult<T>) -> Result<T, String> {
-    match result {
-        MultiRpcResult::Consistent(Ok(value)) => Ok(value),
-        MultiRpcResult::Consistent(Err(err)) => Err(format!("{err:?}")),
-        MultiRpcResult::Inconsistent(items) => Err(format!("inconsistent RPC result: {items:?}")),
-    }
+    Ok(())
 }
 
 pub fn expected_transfer(request: &FacilitatorRequest) -> ExpectedTransfer {
@@ -730,7 +729,10 @@ fn transfer_log_matches(log: &Value, expected: &ExpectedTransfer) -> bool {
     if !log
         .get("address")
         .and_then(Value::as_str)
-        .map(|address| crate::hexutil::same_address(address, JPYC_POLYGON_ADDRESS))
+        .map(|address| {
+            crate::configured_token_address()
+                .is_ok_and(|token| crate::hexutil::same_address(address, &token))
+        })
         .unwrap_or(false)
     {
         return false;
@@ -990,42 +992,99 @@ fn decimal_add_small(value: &str, addend: u8) -> String {
     String::from_utf8(out).unwrap_or_else(|_| "0".to_string())
 }
 
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_polygon_rpc_services() {
-        let services = rpc_services("https://polygon.example").unwrap();
-        match services {
-            RpcServices::Custom { chain_id, services } => {
-                assert_eq!(chain_id, POLYGON_CHAIN_ID);
-                assert_eq!(services.len(), 1);
-                assert_eq!(services[0].url, "https://polygon.example");
-            }
-            _ => panic!("expected custom services"),
+    fn assigns_conservative_response_size_by_rpc_method() {
+        for method in [
+            "eth_blockNumber",
+            "eth_estimateGas",
+            "eth_getTransactionCount",
+        ] {
+            assert_eq!(
+                response_size_for_method(method).unwrap(),
+                BLOCK_NUMBER_RESPONSE_SIZE_BYTES
+            );
         }
+        assert_eq!(
+            response_size_for_method("eth_call").unwrap(),
+            CALL_RESPONSE_SIZE_BYTES
+        );
+        assert_eq!(
+            response_size_for_method("eth_feeHistory").unwrap(),
+            FEE_HISTORY_RESPONSE_SIZE_BYTES
+        );
+        assert_eq!(
+            response_size_for_method("eth_getTransactionReceipt").unwrap(),
+            RECEIPT_RESPONSE_SIZE_BYTES
+        );
+        assert_eq!(
+            response_size_for_method("eth_sendRawTransaction").unwrap(),
+            SEND_RAW_TRANSACTION_RESPONSE_SIZE_BYTES
+        );
+        assert!(response_size_for_method("eth_unknownMethod").is_err());
     }
 
     #[test]
-    fn rpc_url_must_be_single_https_url() {
-        assert!(single_rpc_url("https://polygon.example").is_ok());
-        assert!(single_rpc_url("https://polygon.example:443").is_ok());
-        assert!(single_rpc_url("").is_err());
-        assert!(single_rpc_url("https://one.example,https://two.example").is_err());
-        assert!(single_rpc_url("http://polygon.example").is_err());
-        assert!(single_rpc_url("https://trusted.example@evil.example").is_err());
-        assert!(single_rpc_url("https://polygon.example/path").is_err());
-        assert!(single_rpc_url("https://polygon.example?x=1").is_err());
-        assert!(single_rpc_url("https://polygon.example#x").is_err());
+    fn rpc_url_must_be_https_without_credentials_or_fragment() {
+        assert!(validate_rpc_url("https://polygon.example").is_ok());
+        assert!(validate_rpc_url("https://polygon.example:443").is_ok());
+        assert!(validate_rpc_url("https://polygon.example/v1/key?mode=fast").is_ok());
+        assert!(validate_rpc_url("").is_err());
+        assert!(validate_rpc_url("http://polygon.example").is_err());
+        assert!(validate_rpc_url("https://trusted.example@evil.example").is_err());
+        assert!(validate_rpc_url("https://polygon.example#x").is_err());
+    }
+
+    #[test]
+    fn rpc_request_is_non_replicated_and_has_method_response_limit() {
+        let request = build_rpc_request(
+            "https://polygon.example/v1/key",
+            "eth_blockNumber",
+            &json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}),
+            BLOCK_NUMBER_RESPONSE_SIZE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(request.get_is_replicated(), Some(false));
+        assert_eq!(
+            request.get_max_response_bytes(),
+            Some(BLOCK_NUMBER_RESPONSE_SIZE_BYTES)
+        );
+        assert_eq!(
+            request.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn rpc_response_rejects_invalid_json_rpc_envelopes_and_errors() {
+        assert_eq!(
+            parse_rpc_value(
+                "eth_blockNumber",
+                r#"{"jsonrpc":"2.0","id":2,"result":"0x1"}"#
+            )
+            .unwrap_err(),
+            "eth_blockNumber: invalid JSON-RPC envelope"
+        );
+        assert!(parse_rpc_value(
+            "eth_blockNumber",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"failed"}}"#
+        )
+        .unwrap_err()
+        .contains("failed"));
+        assert!(parse_rpc_value("eth_blockNumber", "not-json")
+            .unwrap_err()
+            .starts_with("invalid rpc json"));
+        assert_eq!(
+            parse_rpc_value(
+                "eth_blockNumber",
+                r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#
+            )
+            .unwrap(),
+            json!("0x1")
+        );
     }
 
     #[test]

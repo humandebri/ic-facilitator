@@ -79,12 +79,9 @@ const REQUIRED_BATCH_DID_METHODS = [
   "batch_channel",
   "batch_channel_count",
   "batch_channels",
-  "batch_create_payment_intent",
   "batch_deleted_channel",
   "batch_deleted_channel_count",
   "batch_deleted_channels",
-  "batch_mark_payment_intent",
-  "batch_payment_intent",
   "batch_receiver_authorizer",
   "batch_set_seller",
   "batch_set_writer_receiver_scope",
@@ -111,10 +108,6 @@ const REQUIRED_BATCH_DID_SHAPES: readonly { readonly name: string; readonly patt
   {
     name: "type BatchDeletedChannel",
     pattern: /\btype\s+BatchDeletedChannel\s*=\s*record\s*\{[\s\S]*\bdeleted_at\s*:\s*nat64\s*;[\s\S]*\bdeleted_by\s*:\s*text\s*;[\s\S]*\bchannel\s*:\s*BatchChannel\s*;[\s\S]*\}/
-  },
-  {
-    name: "type BatchPaymentIntent",
-    pattern: /\btype\s+BatchPaymentIntent\s*=\s*record\s*\{[\s\S]*\bintent_id\s*:\s*text\s*;[\s\S]*\breceiver_address\s*:\s*text\s*;[\s\S]*\bstatus\s*:\s*text\s*;[\s\S]*\}/
   },
   {
     name: "type BatchSeller",
@@ -362,15 +355,12 @@ function missingBatchDidStorageItems(did: string): readonly string[] {
       { name: "method batch_channel signature", pattern: /\bbatch_channel\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+BatchChannel\s*\)\s*query\s*;/ },
       { name: "method batch_channel_count signature", pattern: /\bbatch_channel_count\s*:\s*\(\s*\)\s*->\s*\(\s*nat64\s*\)\s*query\s*;/ },
       { name: "method batch_channels signature", pattern: /\bbatch_channels\s*:\s*\(\s*opt\s+nat64\s*\)\s*->\s*\(\s*vec\s+BatchChannel\s*\)\s*query\s*;/ },
-      { name: "method batch_create_payment_intent signature", pattern: /\bbatch_create_payment_intent\s*:\s*\(\s*text\s*,\s*text\s*,\s*text\s*,\s*text\s*,\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result\s*,?\s*\)\s*;/ },
       { name: "method batch_deleted_channel signature", pattern: /\bbatch_deleted_channel\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+BatchDeletedChannel\s*\)\s*query\s*;/ },
       { name: "method batch_deleted_channel_count signature", pattern: /\bbatch_deleted_channel_count\s*:\s*\(\s*\)\s*->\s*\(\s*nat64\s*\)\s*query\s*;/ },
       { name: "method batch_deleted_channels signature", pattern: /\bbatch_deleted_channels\s*:\s*\(\s*opt\s+nat64\s*\)\s*->\s*\(\s*vec\s+BatchDeletedChannel\s*\)\s*query\s*;/ },
-      { name: "method batch_mark_payment_intent signature", pattern: /\bbatch_mark_payment_intent\s*:\s*\(\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result\s*,?\s*\)\s*;/ },
-      { name: "method batch_payment_intent signature", pattern: /\bbatch_payment_intent\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+BatchPaymentIntent\s*\)\s*query\s*;/ },
       { name: "method batch_receiver_authorizer signature", pattern: /\bbatch_receiver_authorizer\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
-      { name: "method batch_set_seller signature", pattern: /\bbatch_set_seller\s*:\s*\(\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result_1\s*,?\s*\)\s*;/ },
-      { name: "method batch_set_writer_receiver_scope signature", pattern: /\bbatch_set_writer_receiver_scope\s*:\s*\(\s*principal\s*,\s*text\s*,\s*bool\s*\)\s*->\s*\(\s*Result_2\s*,?\s*\)\s*;/ },
+      { name: "method batch_set_seller signature", pattern: /\bbatch_set_seller\s*:\s*\(\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result(?:_\d+)?\s*,?\s*\)\s*;/ },
+      { name: "method batch_set_writer_receiver_scope signature", pattern: /\bbatch_set_writer_receiver_scope\s*:\s*\(\s*principal\s*,\s*text\s*,\s*bool\s*\)\s*->\s*\(\s*Result(?:_\d+)?\s*,?\s*\)\s*;/ },
       { name: "method batch_settlement_contract signature", pattern: /\bbatch_settlement_contract\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
       { name: "method batch_settlement_fee_amount signature", pattern: /\bbatch_settlement_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
       { name: "method batch_update_channel signature", pattern: /\bbatch_update_channel\s*:\s*\(\s*text\s*,\s*opt\s+nat64\s*,\s*BatchChannelUpdate\s*\)\s*->\s*\(\s*BatchChannelUpdateResult\s*,?\s*\)\s*;/ },
@@ -495,6 +485,9 @@ function batchSettlementFeeStage(env: NodeJS.ProcessEnv): BatchProductionReadine
   }
   if (BigInt(amount) > UINT128_MAX) {
     return fail("batch:settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT must fit uint128");
+  }
+  if (BigInt(amount) < 10n ** 19n) {
+    return fail("batch:settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT must be at least 10000000000000000000");
   }
   return ok("batch:settlement-fee", amount);
 }

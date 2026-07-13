@@ -8,9 +8,11 @@ use crate::batch::{
     compute_batch_channel_id, BatchChannelConfig, BatchErc3009Authorization, BatchRequestPayload,
     BatchVoucherClaim,
 };
+#[cfg(test)]
+use crate::hexutil::JPYC_POLYGON_ADDRESS;
 use crate::hexutil::{
     address_hex, address_word, keccak256, parse_address, parse_hex, parse_u128_decimal_word,
-    parse_u256_decimal, selector, u256_word, JPYC_POLYGON_ADDRESS,
+    parse_u256_decimal, selector, u256_word,
 };
 use crate::types::Eip3009Payload;
 
@@ -455,7 +457,7 @@ fn batch_typed_digest(message_hash: [u8; 32], contract: &str) -> Result<[u8; 32]
     ));
     encoded.extend_from_slice(&keccak256(b"x402 Batch Settlement"));
     encoded.extend_from_slice(&keccak256(b"1"));
-    encoded.extend_from_slice(&u256_word(137));
+    encoded.extend_from_slice(&u256_word(crate::configured_chain_id() as u128));
     encoded.extend_from_slice(&address_word(&parse_address(
         contract,
         "BATCH_SETTLEMENT_CONTRACT",
@@ -554,7 +556,7 @@ fn append_bytes_trimmed(stream: &mut RlpStream, value: &[u8]) {
 }
 
 pub fn settle_to_address() -> Result<[u8; 20], String> {
-    parse_address(JPYC_POLYGON_ADDRESS, "JPYC token")
+    parse_address(&crate::configured_token_address()?, "JPYC token")
 }
 
 #[cfg(test)]
@@ -741,6 +743,28 @@ mod tests {
             format!("0x{}", hex::encode(data)),
             "0xe43ce1f20000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000024000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000020000000000000000000000000b51afb2cba39fb1e3e2b3d1df337579896fba993000000000000000000000000b51afb2cba39fb1e3e2b3d1df337579896fba99300000000000000000000000010000000000000000000000000000000000004020000000000000000000000002000000000000000000000000000000000000402000000000000000000000000431d5dff03120afa4bdf332c61a6e1766ef37bdb0000000000000000000000000000000000000000000000000000000000000384333333333333333333333333333333333333333333333333333333333333333300000000000000000000000000000000000000000000000000000000000000640000000000000000000000000000000000000000000000000000000000000140000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000411111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111100000000000000000000000000000000000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn batch_claim_calldata_supports_sdk_default_hundred_claims() {
+        let payload = BatchRequestPayload {
+            kind: "claim".to_string(),
+            channel_config: None,
+            voucher: None,
+            deposit: None,
+            amount: None,
+            refund_nonce: None,
+            claims: Some(vec![batch_voucher_claim(); 100]),
+            receiver: None,
+            token: None,
+            claim_authorizer_signature: Some(batch_signature()),
+            refund_authorizer_signature: None,
+        };
+
+        let data =
+            encode_batch_claim_calldata(&payload, "", DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        assert_eq!(&data[..4], &selector("claimWithSignature((((address,address,address,address,address,uint40,bytes32),uint128),bytes,uint128)[],bytes)"));
+        assert!(data.len() > 40_000);
     }
 
     #[test]

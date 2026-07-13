@@ -2,20 +2,23 @@
 use serde_json::json;
 
 use crate::eip712::recover_eip3009_signer;
-use crate::hexutil::{same_address, JPYC_EIP712_NAME, JPYC_POLYGON_ADDRESS, NETWORK};
+use crate::hexutil::{same_address, JPYC_EIP712_NAME};
+#[cfg(test)]
+use crate::hexutil::{JPYC_POLYGON_ADDRESS, NETWORK};
 use crate::types::{
     FacilitatorRequest, PaymentPayload, PaymentRequirements, SettleResponse, SupportedKind,
     SupportedResponse,
 };
 
 pub fn supported(facilitator_address: String, eip712_version: &str) -> SupportedResponse {
+    let network = crate::configured_network();
     let mut signers = std::collections::BTreeMap::new();
-    signers.insert(NETWORK.to_string(), vec![facilitator_address]);
+    signers.insert(network.clone(), vec![facilitator_address]);
     SupportedResponse {
         kinds: vec![SupportedKind {
             x402_version: 2,
             scheme: "exact".to_string(),
-            network: NETWORK.to_string(),
+            network,
             extra: json!({
                 "assetTransferMethod": "eip3009",
                 "name": JPYC_EIP712_NAME,
@@ -81,7 +84,7 @@ pub fn successful_settlement(tx: String, payer: String, amount: String) -> Settl
     SettleResponse {
         success: true,
         transaction: tx,
-        network: NETWORK.to_string(),
+        network: crate::configured_network(),
         payer: Some(payer),
         amount: Some(amount),
         error_reason: None,
@@ -114,17 +117,19 @@ fn validate_requirements(requirements: &PaymentRequirements) -> Result<(), Verif
             None,
         ));
     }
-    if requirements.network != NETWORK {
+    if requirements.network != crate::configured_network() {
         return Err(fail(
             "invalid_exact_evm_network_mismatch",
-            "network must be eip155:137",
+            "network does not match NETWORK_PROFILE",
             None,
         ));
     }
-    if !same_address(&requirements.asset, JPYC_POLYGON_ADDRESS) {
+    if !crate::configured_token_address()
+        .is_ok_and(|token| same_address(&requirements.asset, &token))
+    {
         return Err(fail(
             "invalid_exact_evm_asset",
-            "asset must be JPYC on Polygon",
+            "asset does not match NETWORK_PROFILE token",
             None,
         ));
     }

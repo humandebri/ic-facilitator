@@ -6,8 +6,10 @@ use serde_json::Value;
 
 use crate::hexutil::{
     address_hex, address_word, keccak256, parse_address, parse_hex, parse_u128_decimal_word,
-    parse_u256_decimal, same_address, u256_word, JPYC_EIP712_NAME, JPYC_POLYGON_ADDRESS, NETWORK,
+    parse_u256_decimal, same_address, u256_word, JPYC_EIP712_NAME,
 };
+#[cfg(test)]
+use crate::hexutil::{JPYC_POLYGON_ADDRESS, NETWORK};
 use crate::tx::ERC3009_DEPOSIT_COLLECTOR_ADDRESS;
 use crate::types::{PaymentRequirements, ResourceInfo};
 
@@ -484,11 +486,13 @@ fn validate_batch_operation_requirements(requirements: &PaymentRequirements) -> 
     if requirements.scheme != BATCH_SCHEME {
         return Err("scheme must be batch-settlement".to_string());
     }
-    if requirements.network != NETWORK {
-        return Err("batch network must be eip155:137".to_string());
+    let network = crate::configured_network();
+    if requirements.network != network {
+        return Err(format!("batch network must be {network}"));
     }
-    if !same_address(&requirements.asset, JPYC_POLYGON_ADDRESS) {
-        return Err("batch asset must be JPYC on Polygon".to_string());
+    let token = crate::configured_token_address()?;
+    if !same_address(&requirements.asset, &token) {
+        return Err("batch asset does not match the active network profile".to_string());
     }
     if requirements.amount != "0" {
         return Err("batch operation amount must be 0".to_string());
@@ -909,11 +913,13 @@ fn validate_batch_requirements(requirements: &PaymentRequirements) -> Result<(),
     if requirements.scheme != BATCH_SCHEME {
         return Err("scheme must be batch-settlement".to_string());
     }
-    if requirements.network != NETWORK {
-        return Err("batch network must be eip155:137".to_string());
+    let network = crate::configured_network();
+    if requirements.network != network {
+        return Err(format!("batch network must be {network}"));
     }
-    if !same_address(&requirements.asset, JPYC_POLYGON_ADDRESS) {
-        return Err("batch asset must be JPYC on Polygon".to_string());
+    let token = crate::configured_token_address()?;
+    if !same_address(&requirements.asset, &token) {
+        return Err("batch asset does not match the active network profile".to_string());
     }
     if requirements
         .extra

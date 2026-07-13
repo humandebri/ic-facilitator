@@ -15,7 +15,6 @@ import {
   isHttpsOrigin,
   isPositiveIntegerString,
   isPrivateKey,
-  isSingleHttpsRpcServices,
   parseMode
 } from "../scripts/doctor";
 
@@ -26,10 +25,9 @@ function canisterEnv(publicOrigin: string): NodeJS.ProcessEnv {
     FACILITATOR_EVM_PRIVATE_KEY: privateKey,
     FACILITATOR_PUBLIC_ORIGIN: publicOrigin,
     JPYC_EIP712_VERSION: "1",
-    POLYGON_RPC_SERVICES: "https://polygon.example",
+    POLYGON_RPC_URL: "https://polygon.example",
     SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
-    SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-    SELLER_SETTLEMENT_FEE_AMOUNT: "100"
+    SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000"
   };
 }
 
@@ -60,9 +58,6 @@ describe("doctor helpers", () => {
     expect(isPrivateKey("0x1")).toBe(false);
     expect(isHttpUrl("https://polygon.example")).toBe(true);
     expect(isHttpUrl("file:///tmp/x")).toBe(false);
-    expect(isSingleHttpsRpcServices("https://polygon.example")).toBe(true);
-    expect(isSingleHttpsRpcServices("http://polygon.example")).toBe(false);
-    expect(isSingleHttpsRpcServices("https://a.example,https://b.example")).toBe(false);
     expect(isPositiveIntegerString("60")).toBe(true);
     expect(isPositiveIntegerString("30000000000000000")).toBe(true);
     expect(isPositiveIntegerString("0")).toBe(false);
@@ -75,7 +70,7 @@ describe("doctor helpers", () => {
       FACILITATOR_MAX_SETTLEMENT_FEE_WEI: "0",
       FACILITATOR_PUBLIC_ORIGIN: "http://canister.example.test",
       JPYC_POLYGON_ADDRESS: "0x402",
-      POLYGON_RPC_SERVICES: "http://polygon.example",
+      POLYGON_RPC_URL: "http://polygon.example",
       SELLER_CREDIT_PAY_TO: "0x402",
       SELLER_CREDIT_TOPUP_AMOUNT: "0",
       SELLER_SETTLEMENT_FEE_AMOUNT: "1.5",
@@ -86,36 +81,34 @@ describe("doctor helpers", () => {
 
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_EVM_PRIVATE_KEY")).toBe(true);
     expect(checks.some((check) => check.name === "env:JPYC_POLYGON_ADDRESS" && check.status === "warn")).toBe(true);
-    expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_URL")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_MAX_GAS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_MAX_SETTLEMENT_FEE_WEI")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_PUBLIC_ORIGIN")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_PAY_TO")).toBe(true);
-    expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_TOPUP_AMOUNT")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_TOPUP_AMOUNT")).toBe(false);
     expect(checks.some((check) => check.name === "env-format:SELLER_SETTLEMENT_FEE_AMOUNT")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLE_MIN_CONFIRMATIONS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLEMENT_CACHE_TTL_SECONDS")).toBe(true);
   }, 20_000);
 
-  it("rejects non-origin Polygon RPC service values for canister env", () => {
+  it("accepts path/query but rejects unsafe Polygon RPC URLs for canister env", () => {
     for (const value of [
       "https://trusted.example@evil.example",
-      "https://polygon.example/path",
-      "https://polygon.example?x=1",
       "https://polygon.example#x"
     ]) {
       const checks = collectChecks(".", {
-        POLYGON_RPC_SERVICES: value
+        POLYGON_RPC_URL: value
       }, "canister");
 
-      expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(true);
+      expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_URL")).toBe(true);
     }
 
-    const checks = collectChecks(".", {
-      POLYGON_RPC_SERVICES: "https://polygon.example:443"
-    }, "canister");
-    expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(false);
+    for (const value of ["https://polygon.example:443", "https://polygon.example/path", "https://polygon.example?x=1"]) {
+      const checks = collectChecks(".", { POLYGON_RPC_URL: value }, "canister");
+      expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_URL")).toBe(false);
+    }
   }, 20_000);
 
   it("validates facilitator public origin as a strict HTTPS origin", () => {
@@ -203,10 +196,12 @@ describe("doctor helpers", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
-          SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
@@ -215,10 +210,10 @@ describe("doctor helpers", () => {
       const output = readFileSync(logPath, "utf8");
       expect(output).toContain('"FACILITATOR_EVM_PRIVATE_KEY",');
       expect(output).toContain('"JPYC_EIP712_VERSION", "1"');
-      expect(output).toContain('"POLYGON_RPC_SERVICES", "https://polygon.example"');
+      expect(output).toContain('"POLYGON_RPC_URL", "https://polygon.example"');
       expect(output).toContain('"SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402"');
-      expect(output).toContain('"SELLER_CREDIT_TOPUP_AMOUNT", "1000"');
-      expect(output).toContain('"SELLER_SETTLEMENT_FEE_AMOUNT", "100"');
+      expect(output).not.toContain('"SELLER_CREDIT_TOPUP_AMOUNT"');
+      expect(output).toContain('seller_settlement_fee_amount = "1000000000000000000"');
       expect(output).toContain('"FACILITATOR_MAX_GAS", "500000"');
       expect(output).toContain('"FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "30000000000000000"');
       expect(output).toContain('"FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test"');

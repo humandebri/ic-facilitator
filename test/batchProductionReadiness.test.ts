@@ -200,7 +200,7 @@ function env(): NodeJS.ProcessEnv {
     BATCH_REFUND_TX: refundHash,
     BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
     BATCH_SETTLEMENT_CONTRACT: batchContract,
-    BATCH_SETTLEMENT_FEE_AMOUNT: "100",
+    BATCH_SETTLEMENT_FEE_AMOUNT: "10000000000000000000",
     BATCH_SETTLE_AMOUNT: "20",
     BATCH_SETTLE_RECEIVER: seller,
     BATCH_SETTLE_TOKEN: jpyc,
@@ -348,7 +348,7 @@ function batchStorageQueryOutput(args: readonly string[]): { readonly output: st
     return { output: `(opt "${batchContract}")`, status: 0 };
   }
   if (args.includes("batch_settlement_fee_amount")) {
-    return { output: `(opt "100")`, status: 0 };
+    return { output: `(opt "10000000000000000000")`, status: 0 };
   }
   if (args.includes("batch_channel_count")) {
     return { output: "(0 : nat64)", status: 0 };
@@ -1055,7 +1055,7 @@ describe("batch production readiness", () => {
 
     expect(report.ready).toBe(false);
     expect(report.stages).toContainEqual({
-      detail: "expected 100, got 101",
+      detail: "expected 10000000000000000000, got 101",
       name: "canister:batch-settlement-fee",
       status: "fail"
     });

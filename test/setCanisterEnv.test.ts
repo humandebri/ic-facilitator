@@ -32,10 +32,13 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
@@ -58,14 +61,16 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
+          DOTENV_PATH: join(dir, "missing.env"),
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_URL: "",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("missing required env: POLYGON_RPC_SERVICES");
+      expect(result.stderr).toContain("missing required env: POLYGON_RPC_URL");
       expect(() => readFileSync(logPath, "utf8")).toThrow();
     } finally {
       rmSync(dir, { force: true, recursive: true });
@@ -84,7 +89,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "http://polygon.example",
+          POLYGON_RPC_URL: "http://polygon.example",
           SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -93,18 +98,16 @@ describe("set_canister_env facilitator validation", () => {
       });
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("POLYGON_RPC_SERVICES must be a single https://host[:port] RPC origin");
+      expect(result.stderr).toContain("POLYGON_RPC_URL must be a HTTPS RPC URL without userinfo or fragment");
       expect(() => readFileSync(logPath, "utf8")).toThrow();
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
   });
 
-  it("rejects non-origin Polygon RPC services before calling icp", () => {
+  it("rejects unsafe Polygon RPC URLs before calling icp", () => {
     for (const value of [
       "https://trusted.example@evil.example",
-      "https://polygon.example/path",
-      "https://polygon.example?x=1",
       "https://polygon.example#x"
     ]) {
       const { dir, logPath } = fakeIcpDir();
@@ -118,7 +121,7 @@ describe("set_canister_env facilitator validation", () => {
             FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
             ICP_FAKE_LOG: logPath,
             JPYC_EIP712_VERSION: "1",
-            POLYGON_RPC_SERVICES: value,
+            POLYGON_RPC_URL: value,
             SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
             SELLER_CREDIT_TOPUP_AMOUNT: "1000",
             SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -127,7 +130,7 @@ describe("set_canister_env facilitator validation", () => {
         });
 
         expect(result.status).toBe(1);
-        expect(result.stderr).toContain("POLYGON_RPC_SERVICES must be a single https://host[:port] RPC origin");
+        expect(result.stderr).toContain("POLYGON_RPC_URL must be a HTTPS RPC URL without userinfo or fragment");
         expect(() => readFileSync(logPath, "utf8")).toThrow();
       } finally {
         rmSync(dir, { force: true, recursive: true });
@@ -147,7 +150,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://trusted.example@evil.example",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -179,7 +182,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -209,7 +212,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -240,7 +243,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -271,7 +274,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -302,7 +305,7 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
           SELLER_SETTLEMENT_FEE_AMOUNT: "100",
@@ -330,10 +333,13 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
@@ -342,21 +348,53 @@ describe("set_canister_env facilitator validation", () => {
       const log = readFileSync(logPath, "utf8");
       expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
       expect(log).toContain('set_env ("JPYC_EIP712_VERSION", "1")');
-      expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon.example")');
+      expect(log).toContain('set_env ("POLYGON_RPC_URL", "https://polygon.example")');
       expect(log).toContain('set_env ("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test")');
       expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
-      expect(log).toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT", "1000")');
-      expect(log).toContain('set_env ("SELLER_SETTLEMENT_FEE_AMOUNT", "100")');
+      expect(log).not.toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT"');
+      expect(log).toContain('seller_settlement_fee_amount = "1000000000000000000"');
+      expect(log).toContain('terms_version = "2026-07-13"');
       expect(log).not.toContain("JPYC_POLYGON_ADDRESS");
       expect(log).toContain('set_env ("FACILITATOR_MAX_GAS", "500000")');
       expect(log).toContain('set_env ("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "30000000000000000")');
       expect(log).toContain('set_env ("SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "60")');
       expect(log).toContain('set_env ("SETTLE_MIN_CONFIRMATIONS", "3")');
       expect(log).toContain('set_env ("SETTLEMENT_CACHE_TTL_SECONDS", "86400")');
+      expect(log).not.toContain('set_env ("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"');
+      expect(log).not.toContain('set_env ("BATCH_SETTLEMENT_CONTRACT"');
+      expect(log).not.toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS"');
+      expect(log).not.toContain('set_env ("BATCH_SETTLEMENT_FEE_AMOUNT"');
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("clears batch env only when explicitly disabled", () => {
+    const { dir, logPath } = fakeIcpDir();
+    try {
+      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local", "edge", "--disable-batch"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
+          ICP_FAKE_LOG: logPath,
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_URL: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
+          PATH: `${dir}:${process.env.PATH ?? ""}`
+        }
+      });
+
+      expect(result.status).toBe(0);
+      const log = readFileSync(logPath, "utf8");
       expect(log).toContain('set_env ("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "")');
-      expect(log).toContain('set_env ("BATCH_SETTLEMENT_CONTRACT", "")');
-      expect(log).toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS", "")');
-      expect(log).toContain('set_env ("BATCH_SETTLEMENT_FEE_AMOUNT", "")');
+      expect(log).not.toContain('set_env ("BATCH_SETTLEMENT_FEE_AMOUNT", "")');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
@@ -373,15 +411,18 @@ describe("set_canister_env facilitator validation", () => {
           ...process.env,
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: batchReceiverAuthorizerKey,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
-          BATCH_SETTLEMENT_FEE_AMOUNT: "100",
+          BATCH_SETTLEMENT_FEE_AMOUNT: "10000000000000000000",
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });
@@ -389,9 +430,9 @@ describe("set_canister_env facilitator validation", () => {
       expect(result.status).toBe(0);
       const log = readFileSync(logPath, "utf8");
       expect(log).toContain(`set_env ("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "${batchReceiverAuthorizerKey}")`);
-      expect(log).toContain(`set_env ("BATCH_SETTLEMENT_CONTRACT", "${batchSettlementContract}")`);
+      expect(log).toContain(`batch_contract = "${batchSettlementContract}"`);
       expect(log).toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS", "900")');
-      expect(log).toContain('set_env ("BATCH_SETTLEMENT_FEE_AMOUNT", "100")');
+      expect(log).toContain('batch_settlement_fee_amount = "10000000000000000000"');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
@@ -404,11 +445,14 @@ describe("set_canister_env facilitator validation", () => {
       writeFileSync(dotenvPath, [
         `FACILITATOR_EVM_PRIVATE_KEY=${privateKey}`,
         "JPYC_EIP712_VERSION=1",
-        "POLYGON_RPC_SERVICES=https://polygon.example",
+        "POLYGON_RPC_URL=https://polygon.example/v1/key?mode=fast",
         "FACILITATOR_PUBLIC_ORIGIN=https://canister.example.test",
         "SELLER_CREDIT_PAY_TO=0x2000000000000000000000000000000000000402",
         "SELLER_CREDIT_TOPUP_AMOUNT=1000",
-        "SELLER_SETTLEMENT_FEE_AMOUNT=100",
+        "SELLER_SETTLEMENT_FEE_AMOUNT=1000000000000000000",
+        "SELLER_TERMS_VERSION=2026-07-13",
+        "PRIVACY_VERSION=2026-07-13",
+        "ASSET_BOUNDARY_VERSION=2026-07-13",
         "FACILITATOR_MAX_GAS=700000",
         "FACILITATOR_MAX_SETTLEMENT_FEE_WEI=40000000000000000"
       ].join("\n"));
@@ -427,11 +471,11 @@ describe("set_canister_env facilitator validation", () => {
       const log = readFileSync(logPath, "utf8");
       expect(log).toContain(`set_env ("FACILITATOR_EVM_PRIVATE_KEY", "${privateKey}")`);
       expect(log).toContain('set_env ("JPYC_EIP712_VERSION", "1")');
-      expect(log).toContain('set_env ("POLYGON_RPC_SERVICES", "https://polygon.example")');
+      expect(log).toContain('set_env ("POLYGON_RPC_URL", "https://polygon.example/v1/key?mode=fast")');
       expect(log).toContain('set_env ("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test")');
       expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
-      expect(log).toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT", "1000")');
-      expect(log).toContain('set_env ("SELLER_SETTLEMENT_FEE_AMOUNT", "100")');
+      expect(log).not.toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT"');
+      expect(log).toContain('seller_settlement_fee_amount = "1000000000000000000"');
       expect(log).toContain('set_env ("FACILITATOR_MAX_GAS", "700000")');
       expect(log).toContain('set_env ("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "40000000000000000")');
     } finally {
@@ -446,7 +490,7 @@ describe("set_canister_env facilitator validation", () => {
       writeFileSync(dotenvPath, [
         "FACILITATOR_EVM_PRIVATE_KEY=0x2222222222222222222222222222222222222222222222222222222222222222",
         "JPYC_EIP712_VERSION=2",
-        "POLYGON_RPC_SERVICES=https://dotenv.example",
+        "POLYGON_RPC_URL=https://dotenv.example",
         "FACILITATOR_PUBLIC_ORIGIN=https://dotenv.example",
         "SELLER_CREDIT_PAY_TO=0x3000000000000000000000000000000000000402",
         "SELLER_CREDIT_TOPUP_AMOUNT=3000",
@@ -465,10 +509,13 @@ describe("set_canister_env facilitator validation", () => {
           FACILITATOR_MAX_SETTLEMENT_FEE_WEI: "50000000000000000",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
-          POLYGON_RPC_SERVICES: "https://polygon.example",
+          POLYGON_RPC_URL: "https://polygon.example",
           SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
           SELLER_CREDIT_TOPUP_AMOUNT: "1000",
-          SELLER_SETTLEMENT_FEE_AMOUNT: "100",
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
           PATH: `${dir}:${process.env.PATH ?? ""}`
         }
       });

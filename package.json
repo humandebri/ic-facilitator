@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit && npm run build:facilitator",
+    "build": "tsc --noEmit && npm run web:build && npm run build:facilitator",
     "build:facilitator": "cargo build -p jpyc_x402_facilitator --release --target wasm32-unknown-unknown",
     "clean:build": "scripts/clean_build_artifacts.sh --yes",
     "did:check": "git ls-files --error-unmatch dist/facilitator.did && git diff --exit-code -- dist/facilitator.did",
@@ -11,7 +11,7 @@
     "doctor": "node --import tsx scripts/doctor.ts",
     "ic:clean:local": "scripts/clean_local_ic.sh --yes",
     "ic:deploy:local": "icp deploy edge --yes",
-    "ic:deploy:mainnet": "icp deploy -e ic edge --subnet re2t4-faa75-v3vhk-kdmdr-uyrkl-aik2l-ixd6u-p3fyr-zlfkc-6c5af-zae --yes",
+    "ic:deploy:mainnet": "scripts/deploy_mainnet.sh",
     "ic:env:local": "scripts/set_canister_env.sh local",
     "ic:env:mainnet": "scripts/set_canister_env.sh ic",
     "lint:hidden-unicode": "node scripts/check_hidden_unicode.mjs",
@@ -22,6 +22,11 @@
     "receipt:batch:all": "node --import tsx scripts/batch_settlement_receipt.ts --all",
     "receipt:settlement": "node --import tsx scripts/settlement_receipt.ts",
     "readiness:jpyc": "node --import tsx scripts/readiness.ts",
+    "measure:rpc-responses": "node --import tsx scripts/rpc_response_sizes.ts",
+    "measure:facilitator-costs": "node --import tsx scripts/facilitator_costs.ts",
+    "amoy:receipt:init": "node --import tsx scripts/amoy_batch_receipt.ts init",
+    "amoy:receipt": "forge build --root test/amoy && node --import tsx scripts/amoy_batch_receipt.ts run",
+    "amoy:receipt:revert-probe": "node --import tsx scripts/amoy_batch_receipt.ts revert-probe",
     "smoke:canister": "node --import tsx scripts/smoke_canister.ts",
     "smoke:canister:env": "node --import tsx scripts/smoke_canister_env.ts",
     "smoke:canister:paid-negative": "node --import tsx scripts/smoke_canister_paid_negative.ts",
@@ -31,18 +36,33 @@
     "wallet:env": "node --import tsx scripts/evm_wallet.ts --env",
     "wallet:new": "node --import tsx scripts/evm_wallet.ts",
     "wallet:jpyc": "node --import tsx scripts/jpyc_wallet.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "web:build": "tsc -p web/tsconfig.json && vite build --config web/vite.config.ts && npm run web:bundle:check",
+    "web:bundle:check": "node scripts/check_web_bundle.mjs",
+    "web:dev": "vite --config web/vite.config.ts",
+    "web:preview": "vite preview --config web/vite.config.ts",
+    "web:deploy:preview": "npm run web:build && wrangler deploy --config web/wrangler.jsonc --env preview",
+    "web:types": "wrangler types --config web/wrangler.jsonc"
   },
   "dependencies": {
     "@x402/core": "2.13.0",
     "@x402/evm": "2.13.0",
-    "viem": "2.50.4"
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "viem": "2.50.4",
+    "vite": "latest"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
     "@types/node": "24.10.1",
     "tsx": "4.22.4",
     "typescript": "5.9.3",
-    "vitest": "4.1.0"
+    "vitest": "4.1.0",
+    "wrangler": "latest"
   },
   "overrides": {
     "ws": "8.21.0"

@@ -2,6 +2,8 @@
 
 ICP canister 自体が JPYC on Polygon の x402 v2 `exact` / EIP-3009 facilitator として動く実装。x402 `batch-settlement` は canister-backed channel storage、`/verify`、onchain `deposit` / `claim` / `settle` / `refund` を扱う。
 
+batch settlementにおける資産の所在、署名権限、canister上のミラー情報およびseller creditとの区別は、[Batch settlementの資産管理境界](docs/batch-asset-boundary.md)に記載する。
+
 ## API
 
 - `GET /health`: facilitator の health と EVM address。
@@ -9,14 +11,16 @@ ICP canister 自体が JPYC on Polygon の x402 v2 `exact` / EIP-3009 facilitato
 - `GET /seller-credit?seller=0x...`: seller本人wallet の JPYC x402 決済で seller credit を購入する。
 - `POST /settle`: x402 `SettleRequest` を検証し、Polygon settlement tx を送信する。
 - `POST /verify`: `batch-settlement` 専用。full batch config が揃う時だけ動く。channel state は更新せず、ICP canister storage 上の mirrored `channelId` / `balance` / `totalClaimed` / `withdrawRequestedAt` / `refundNonce` snapshot を公式 SDK 互換の `extra.*` flat fields と監査用 `extra.channelState` に返す。`exact` は `unsupported_verify_scheme` で拒否する。
-- query `settlement(key)`, `settlement_count()`, `active_settlement_count()`, `batch_channel(channel_id)`, `batch_channel_count()`, `batch_channels(limit)`, `batch_deleted_channel(channel_id)`, `batch_deleted_channel_count()`, `batch_deleted_channels(limit)`, `batch_writer_receiver_scope(writer, receiver)`, `batch_writer_receiver_scope_count()`, `batch_writer_receiver_scopes(limit)`, `batch_payment_intent(intent_id)`: 認証なし public audit API。
+- query `settlement(key)`, `seller_settlements(seller, cursor, limit)`, `seller_acceptance(seller)`, `settlement_count()`, `active_settlement_count()`, `batch_channel(channel_id)`, `batch_channel_count()`, `batch_channels(limit)`, `batch_deleted_channel(channel_id)`, `batch_deleted_channel_count()`, `batch_deleted_channels(limit)`, `batch_writer_receiver_scope(writer, receiver)`, `batch_writer_receiver_scope_count()`, `batch_writer_receiver_scopes(limit)`: 認証なし public audit API。
 - update `batch_update_channel(channel_id, expected_revision, update)`: server adapter 用の CAS channel storage API。controller は全 receiver、non-controller は SQLite の enabled writer scope がある receiver だけ更新できる。
-- update `batch_set_seller(receiver, status)`, `batch_set_writer_receiver_scope(writer, receiver, enabled)`, `batch_create_payment_intent(intent_id, receiver, payer, resource_url, amount, nonce)`, `batch_mark_payment_intent(intent_id, status)`: controller 管理API。
+- update `batch_set_seller(receiver, status)`, `batch_set_writer_receiver_scope(writer, receiver, enabled)`: controller管理API。network profile、token、Batch contract、Exact/Batch料金、3文書versionは`set_runtime_profile(record)`で検証後に一括更新する。
+
+Seller onboardingは`POST /seller-acceptance/challenge`で単回nonce付きEIP-191 messageを取得し、`POST /seller-acceptance`へ署名を返す。challengeは5分有効、sellerごとに最新1件、canister全体で最大1,000件とし、満杯時は期限切れを回収しても空きがなければ429を返す。一時challengeはcanister upgradeで無効化するが、成立済みのseller同意記録は保持する。現行versionへの同意がないsellerはExact・Batch settlementを利用できない。商品、注文、payment intentはmerchant側の責務であり、facilitatorは保持しない。
 
 public audit query は seller / payer / receiver / merchant の突合に使える生データを返す。`BatchChannel` は `channelConfig.payer` / `receiver` / `token` / `receiverAuthorizer`、voucher `signature`、`balance`、`chargedCumulativeAmount`、`pendingRequest`、ms epoch の `lastRequestTimestamp` / `withdrawRequestedAt` / `onchainSyncedAt` を含む。`BatchDeletedChannel` は削除直前の `BatchChannel` 全体、`settlement` は `pay_to` と settlement response / snapshot を返す。署名収集、channel state 推移、payer/receiver/token 相関が可能になる前提で公開する。redaction API や caller 制限は現行 v1 対象外。
 
 `/settle` は JPYC token contract の `transferWithAuthorization(...)` を呼ぶ。facilitator tx の gas は `FACILITATOR_EVM_PRIVATE_KEY` の address が払う。
-seller は本人wallet で `/seller-credit?seller=0x...` の x402 決済を行い、`SELLER_CREDIT_TOPUP_AMOUNT` 分の credit を購入する。通常 `/settle` は `paymentRequirements.extra.sellerAuthorization` の EIP-191 署名を検証し、`payTo` seller の承認後に `SELLER_SETTLEMENT_FEE_AMOUNT` を reserve する。送信前失敗時だけ refund する。
+seller は本人wallet で `/seller-credit?seller=0x...&amount=100` の x402 決済を行い、指定した1〜10,000 JPYC（小数18桁まで）の credit を購入する。通常 `/settle` は `paymentRequirements.extra.sellerAuthorization` の EIP-191 署名を検証し、`payTo` seller の承認後に `SELLER_SETTLEMENT_FEE_AMOUNT` を reserve する。送信前失敗時だけ refund する。
 tx broadcast 後に receipt が failed になった場合、seller fee は refund しない。facilitator 側の calldata/receipt bug が疑われる場合は canister 修正後に運用補填で処理する。
 request body は 64KiB で拒否する。`/settle` は同一 seller 単位の active tx がある場合は `429 settlement_queue_busy` を返す。
 pending tx は同一 settlement request の再送で receipt refresh と nonce replacement を起動する。broadcast 済み pending record は TTL だけでは purge しない。active tx は settled/failed になるまで保持する。active tx、nonce、settlement、seller credit は stable structures に保存し、upgrade 前後で復元する。
@@ -66,7 +70,6 @@ FACILITATOR_EVM_PRIVATE_KEY=0x...
 ICP_ENVIRONMENT=ic
 ICP_CANISTER=edge
 JPYC_EIP712_VERSION=1
-POLYGON_RPC_SERVICES=https://polygon-rpc.example
 POLYGON_RPC_URL=https://polygon-rpc.example
 FACILITATOR_PUBLIC_ORIGIN=https://edge.example
 X402_BASE_URL=https://edge.example
@@ -76,12 +79,11 @@ SETTLE_CONFIRMATION_TIMEOUT_SECONDS=60
 SETTLE_MIN_CONFIRMATIONS=3
 SETTLEMENT_CACHE_TTL_SECONDS=86400
 SELLER_CREDIT_PAY_TO=0x...
-SELLER_CREDIT_TOPUP_AMOUNT=1000000000000000000
-SELLER_SETTLEMENT_FEE_AMOUNT=1000000000000000
+SELLER_SETTLEMENT_FEE_AMOUNT=1000000000000000000
 BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY=0x...
 BATCH_SETTLEMENT_CONTRACT=0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003
 BATCH_WITHDRAW_DELAY_SECONDS=900
-BATCH_SETTLEMENT_FEE_AMOUNT=1000000000000000
+BATCH_SETTLEMENT_FEE_AMOUNT=10000000000000000000
 BATCH_MIN_CANISTER_CYCLES=1000000000000
 BATCH_SETTLEMENT_ACTION=deposit
 BATCH_SETTLEMENT_TX=0x...
@@ -108,12 +110,12 @@ FACILITATOR_DEBUG_COST=0
 ```
 
 `FACILITATOR_EVM_PRIVATE_KEY` は repo 外の SEV / subnet / deploy 運用基盤で保護する前提。facilitator 実装は tECDSA を使わない。tECDSA 移行、外部 signer 化、鍵保管方式変更はこの repo の責務ではない。
-JPYC token contract は Polygon mainnet の固定値 `0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB` を使う。canister env の `JPYC_POLYGON_ADDRESS` は読まない。
-`POLYGON_RPC_SERVICES` は canister 用で、単一 `https://host[:port]` のみ。`POLYGON_RPC_URL` は Node CLI smoke/preflight/receipt 用で、HTTPS、userinfo なし、fragment なしを必須とし、provider API key 用の path/query は許可する。未設定、HTTP、複数 URL、userinfo、fragment は config error とする。単一 RPC のため、gas 推定、nonce、receipt 判定は provider 偏りの残余リスクを持つ。
+network、token、BatchSettlement contract、Exact/Batch料金、3文書versionは`set_runtime_profile`で原子的に設定する。`polygon` profileはchain ID 137、本番JPYC、公式BatchSettlement contractとの完全一致を要求する。`amoy` profileはchain ID 80002と、Preview専用の明示的なtest token・contractを要求する。profileの部分変更や両profileのaddress混在は拒否する。
+`POLYGON_RPC_URL` は canister と Node CLI で共用し、HTTPS、userinfo なし、fragment なしを必須とする。provider API key 用の path/query は許可する。canister は `canhttp` の非複製HTTPS outcall（`is_replicated=false`）で単一RPCへ直接接続し、EVM RPC canisterは使わない。単一IC replicaと単一RPCを信頼するため、gas推定、nonce、receipt判定には改ざん・provider偏りの残余リスクがある。raw tx hashはローカル計算し、gas/fee cap、receipt transaction hash・送受信者・event・confirmationを検証してfail closedにする。
 `FACILITATOR_PUBLIC_ORIGIN` は payment resource URL の origin。Host / forwarded proto header は信用しない。
 `SETTLE_MIN_CONFIRMATIONS` は settlement receipt を success 扱いする最小 confirmation 数。既定値は `3`。
-`SELLER_CREDIT_PAY_TO` は seller credit 購入代金の受取先。`SELLER_CREDIT_TOPUP_AMOUNT` と `SELLER_SETTLEMENT_FEE_AMOUNT` は JPYC atomic unit。`FACILITATOR_MAX_SETTLEMENT_FEE_WEI` は `gas_limit * max_fee_per_gas` の送信前 cap。超過時は tx を broadcast せず `gas_too_expensive` を返す。
-`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY`、`BATCH_WITHDRAW_DELAY_SECONDS`、`BATCH_SETTLEMENT_FEE_AMOUNT`、`BATCH_SETTLEMENT_CONTRACT`、active seller に紐づく enabled writer scope が1件以上ある時だけ `/supported` に `batch-settlement` を広告し、partial / invalid batch config では base capability だけを返す。batch `/verify` / `/settle` は同じ full config を要求する。`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY` は `FACILITATOR_EVM_PRIVATE_KEY` と別 address を導出する鍵にする。`BATCH_SETTLEMENT_CONTRACT` は pinned `@x402/evm` の公式 `BATCH_SETTLEMENT_ADDRESS` `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003` だけ許可する。`BATCH_WITHDRAW_DELAY_SECONDS` は x402 公式範囲の 900〜2592000 秒だけ許可する。`BATCH_SETTLEMENT_FEE_AMOUNT` は batch `/settle` の onchain tx fee reserve 用。SQLite は同一 facilitator canister の stable memory 内DBで、外部DBではない。controller は channel create 前に `batch_set_seller(receiver, "active")`、`batch_set_writer_receiver_scope(writer, receiver, true)`、`batch_create_payment_intent(intent_id, receiver, payer, resource_url, amount, nonce)` を登録する。`intent_id` は merchant/order 側 commitment として残し、SDK が生成する `pendingRequest.pendingId` とは別物にする。`pendingId` は SDK reservation 時に receiver/payer/channel salt/差分 amount に一致する `created` intent へ bind され、intent の `pending_id` に保存される。初期 create と既存 channel の新規 live `pendingRequest` 設定は、対応 intent が一意に存在する場合だけ通り、成功時に intent は `bound` になる。`pendingRequest` 消費で `chargedCumulativeAmount` が増えると intent は `paid` になる。`batch_update_channel` は per-channel CAS、SQLite ACL、batch runtime config、channel id/config/signature 検証、storage 上限、初期create時の会計ゼロ状態、`chargedCumulativeAmount` / `signedMaxClaimable` / `totalClaimed` / `refundNonce` の単調増加を強制し、`chargedCumulativeAmount` 増加は live `pendingRequest` 消費時だけ許可する。公式 `BatchSettlementChannelManager.refundChannel()` の成功後cleanupと同じ channel delete を許可し、削除直前の最終snapshotは上限付きの `batch_deleted_channel*` 監査APIに残す。batch channel の `pendingRequest.expiresAt`、`lastRequestTimestamp`、`withdrawRequestedAt`、`onchainSyncedAt` は millisecond epoch。batch `/settle` は deposit / claim / settle / refund の x402 公式 ABI calldata を送信する。deposit / refund は client-signed payment なので full batch `extra` と EIP-712 version を検証する。claim / settle は公式 `BatchSettlementChannelManager` が `extra: {}` の最小 requirements で送るため、`amount == "0"`、`payTo` / `asset` / channel config / voucher signature / receiverAuthorizer 一致を検証して受理する。runtime `/settle` は低コスト化のため receipt 主体で判定し、deposit / claim / refund は tx status、confirmation、contract address、tx sender を確認する。settle は送信前に `receivers(receiver, token)` を1回だけ読み、未settle額がなければ no-op として tx を送らず fee を戻す。settle tx が発生した場合は receipt の `Settled(receiver, token, amount>0)` event を確認し、その event amount を response amount に使う。deposit / claim / refund の post-state 監査は runtime では行わず、`receipt:batch` / `verify:batch` の運用検証に集約する。
+`SELLER_CREDIT_PAY_TO` は seller credit 購入代金の受取先。top-up額はリクエストの`amount`でJPYC表示単位として指定し、`SELLER_SETTLEMENT_FEE_AMOUNT`と`BATCH_SETTLEMENT_FEE_AMOUNT`はJPYC atomic unit。料金は通常settle 1 JPYC、全batch action 10 JPYC。`FACILITATOR_MAX_SETTLEMENT_FEE_WEI` は `gas_limit * max_fee_per_gas` の送信前 cap。超過時は tx を broadcast せず `gas_too_expensive` を返す。
+`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY`、`BATCH_WITHDRAW_DELAY_SECONDS`、`BATCH_SETTLEMENT_FEE_AMOUNT`、profileに一致するBatchSettlement contract、active sellerに紐づくenabled writer scopeが1件以上ある時だけ`/supported`に`batch-settlement`を広告する。channel更新はchannel config、payer voucher、receiver authorizer、nonce、累積額、CAS revision、オンチェーン制約で検証し、商品・注文・payment intentには依存しない。`batch_update_channel`は会計値とnonceの単調増加を強制し、削除直前のsnapshotを監査APIに残す。payment-intent APIはbreaking changeとして廃止した。旧SQLiteにintentまたはbindingが残るupgradeはfail-closedとなる。既存mainnet canisterへの直接upgradeは`deploy_mainnet.sh`も拒否するため、旧APIを保持したtransition releaseでlegacy rowを監査・解消してから本releaseへ進む。今回のMVP完了条件にはmainnet移行を含めない。
 
 ## Cost 計測
 
@@ -130,7 +132,13 @@ JPYC token contract は Polygon mainnet の固定値 `0x431D5dfF03120AFA4bDf332c
 }
 ```
 
-`totalInstructions` は canister の call-context instruction counter。native test では 0。`rpcCalls` は固定費算定用の概算で、`pending_nonce=1`、`send_settlement=5`、`gas_too_expensive send_settlement=2`、`refresh=2` として数える。通常 settlement と seller-credit paid settlement の full path は 6 RPC。batch deposit / claim / refund の runtime tx path も概算 6 RPC。batch settle は no-op check が追加されるため、tx ありで概算 7 RPC、no-op は概算 1 RPC。手順は staging/mainnet で同一 payload を複数回投げ、`settle.send_settlement` / `batch_settle.send` まで到達した成功/失敗を集計し、`P95 totalInstructions + RPC 固定費 + 失敗/再送バッファ + 利益` を `SELLER_SETTLEMENT_FEE_AMOUNT` / `BATCH_SETTLEMENT_FEE_AMOUNT` に反映する。mainnet 反映前に `POLYGON_RPC_SERVICES` の RPC が `eth_feeHistory` と `eth_blockNumber` に対応することを確認する。
+`totalInstructions` は canister の call-context instruction counter。native test では 0。`rpcCalls` は固定費算定用の概算で、`pending_nonce=1`、`send_settlement=5`、`gas_too_expensive send_settlement=2`、`refresh=2` として数える。通常 settlement と seller-credit paid settlement の full path は 6 RPC。batch deposit / claim / refund の runtime tx pathも6 RPC。batch settleはtxありで7 RPC、no-opは1 RPC。staging/mainnetのP95原価を集計し、概ね原価2倍になるよう料金を見直す。mainnet反映前に`POLYGON_RPC_URL`が`eth_feeHistory`と`eth_blockNumber`に対応することを確認する。
+
+`npm run measure:rpc-responses` は `POLYGON_RPC_URL` に読み取り専用RPCを送り、raw JSONのUTF-8 byte数、安全余裕込みの推奨上限、現行20KB比の削減cyclesをJSON出力する。receipt計測には `SETTLEMENT_TX` と `BATCH_DEPOSIT_TX` / `BATCH_CLAIM_TX` / `BATCH_REFUND_TX` / `BATCH_SETTLE_TX` を使い、不足時は終了コード2と `missingReceiptSamples` を返す。秘密鍵やRPC URLは出力しない。
+
+`npm run measure:facilitator-costs` は13-node非複製HTTPS outcallの機能別概算、100件claimの実測gas sample、推奨JPYC料金をJSON出力する。為替・価格・gasは`XDR_USD`、`USD_JPY`、`POL_USD`、`GAS_PRICE_GWEI`で上書きできる。
+
+RPC response size estimate は実測に基づき、block number / gas estimate / nonce は128 bytes、`eth_call` は192 bytes、fee history は320 bytes、raw tx送信は512 bytes、receiptは4KiBとする。receiptはPolygon実測でログ0件相当1,031 bytes、3ログ最大3,258 bytesだった。batch claimはSDK既定の100件を維持し、現行contract ABIではclaim eventをemitしないためclaim件数でreceiptは増えない。未登録のRPC methodは送信前に拒否する。
 
 ## Local
 
@@ -145,7 +153,7 @@ npm run smoke:canister
 ```
 
 `npm run ic:env:local` は `.env` を読み、facilitator 秘密鍵、gas/settlement、seller-credit 設定を canister の stable env に注入する。
-`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY` を指定しない env 注入では、canister 上の `BATCH_*` を空文字で上書きし、過去の batch 設定残留を無効化する。
+通常のenv同期で`BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY`を省略しても既存batch設定は変更しない。明示的な`--disable-batch`ではreceiver authorizer private keyだけを空文字化し、contract・fee・withdraw delayを有効なruntime profileとして保持したまま、`/supported`のbatch広告とbatch実行をfail-closedで無効化する。
 
 ## 実決済 smoke
 
@@ -189,7 +197,7 @@ merchant は nonce 生成時に order ID、resource URL、amount、payer、selle
 ## Release
 
 本番投入時は main 直 deploy ではなく annotated tag を使う。`v0.1.0` 作成前に `git tag --list` と `git ls-remote --tags origin` で重複を確認し、tag message に目的、主要変更、検証コマンド、wasm hash 記録手順を含める。
-mainnet deploy は SEV subnet `re2t4-faa75-v3vhk-kdmdr-uyrkl-aik2l-ixd6u-p3fyr-zlfkc-6c5af-zae` を指定する。`npm run ic:deploy:mainnet` は `icp deploy -e ic edge --subnet re2t4-faa75-v3vhk-kdmdr-uyrkl-aik2l-ixd6u-p3fyr-zlfkc-6c5af-zae --yes` を実行する。
+mainnet公開はこのMVPの対象外であり、`npm run ic:deploy:mainnet`は設定検証後に必ず停止する。既存canisterは旧payment-intent rowを監査・解消するtransition releaseなしに直接upgradeしない。Production手順を有効化する際は、profile・token・contract・料金・承認済み3文書versionを`set_runtime_profile`で原子的に反映し、readiness checklistをすべて満たすことを別リリースで確認する。
 
 ## 検証
 

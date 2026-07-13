@@ -276,6 +276,18 @@ export async function checkCanisterSmoke(options: CanisterSmokeOptions = {}): Pr
   if (!/^0x[0-9a-fA-F]{40}$/.test(facilitatorAddress)) {
     throw new Error("health.facilitatorAddress must be an EVM address");
   }
+  const expectedSellerFee = readEnv(env, "SELLER_SETTLEMENT_FEE_AMOUNT")?.trim();
+  if (expectedSellerFee) {
+    if (!/^[1-9][0-9]*$/.test(expectedSellerFee) || BigInt(expectedSellerFee) < 10n ** 18n) {
+      throw new Error("SELLER_SETTLEMENT_FEE_AMOUNT must be at least 1000000000000000000");
+    }
+    if (health.sellerSettlementFeeAmount !== expectedSellerFee) {
+      throw new Error(`health.sellerSettlementFeeAmount mismatch: expected ${expectedSellerFee}, got ${String(health.sellerSettlementFeeAmount)}`);
+    }
+    if (health.polygonRpcConfigured !== true) {
+      throw new Error("health.polygonRpcConfigured must be true");
+    }
+  }
 
   const supportedResponse = await fetchFn(`${baseUrl}/supported`);
   const supported = requireRecord(await json(supportedResponse, 200), "supported");

@@ -178,6 +178,9 @@ function batchSettlementFeeCheck(env: NodeJS.ProcessEnv): BatchMainnetPreflightC
   if (BigInt(amount) > UINT128_MAX) {
     return fail("env:BATCH_SETTLEMENT_FEE_AMOUNT", "uint128 に収まらない");
   }
+  if (BigInt(amount) < 10n ** 19n) {
+    return fail("env:BATCH_SETTLEMENT_FEE_AMOUNT", "10 JPYC (1e19 atomic units) 未満");
+  }
   return ok("env:BATCH_SETTLEMENT_FEE_AMOUNT", amount);
 }
 

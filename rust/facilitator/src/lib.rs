@@ -24,7 +24,7 @@ use ic_sqlite_vfs::{
 };
 use ic_stable_structures::StableBTreeMap;
 use k256::ecdsa::SigningKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::batch::{
     batch_payload, compute_batch_channel_id, is_pending_only_provisional_channel,
@@ -80,9 +80,16 @@ const ACTIVE_SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(4);
 const NONCES_MEM_ID: MemoryId = MemoryId::new(5);
 const BATCH_CHANNELS_MEM_ID: MemoryId = MemoryId::new(6);
 const BATCH_DELETED_CHANNELS_MEM_ID: MemoryId = MemoryId::new(7);
+const SELLER_ACCEPTANCES_MEM_ID: MemoryId = MemoryId::new(8);
+const SELLER_ACCEPTANCE_CHALLENGES_MEM_ID: MemoryId = MemoryId::new(9);
+const SELLER_SETTLEMENT_INDEX_MEM_ID: MemoryId = MemoryId::new(10);
 #[cfg(not(test))]
 const SQLITE_MEMORY_ID: MemoryId = MemoryId::new(120);
 const BATCH_SQLITE_LIST_LIMIT: u64 = 1_000;
+#[cfg(not(test))]
+const MAX_SELLER_ACCEPTANCE_CHALLENGES: u64 = 1_000;
+#[cfg(test)]
+const MAX_SELLER_ACCEPTANCE_CHALLENGES: u64 = 3;
 
 #[cfg(not(test))]
 const BATCH_SQLITE_MIGRATIONS: &[Migration] = &[Migration {
@@ -141,6 +148,23 @@ const BATCH_SQLITE_MIGRATIONS_V2: &[Migration] = &[Migration {
             WHERE pending_id IS NOT NULL;
     ",
 }];
+#[cfg(not(test))]
+const BATCH_SQLITE_MIGRATIONS_V3: &[Migration] = &[Migration {
+    version: 3,
+    sql: "
+        DROP TABLE IF EXISTS payment_intent_removal_guard;
+        CREATE TABLE payment_intent_removal_guard (
+            row_count INTEGER NOT NULL CHECK(row_count = 0)
+        );
+        INSERT INTO payment_intent_removal_guard(row_count)
+            SELECT
+                (SELECT COUNT(*) FROM payment_intents) +
+                (SELECT COUNT(*) FROM batch_channel_bindings);
+        DROP TABLE payment_intent_removal_guard;
+        DROP TABLE IF EXISTS batch_channel_bindings;
+        DROP TABLE IF EXISTS payment_intents;
+    ",
+}];
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct StableState {
@@ -181,6 +205,18 @@ thread_local! {
         RefCell::new(StableBTreeMap::init(stable_memory(BATCH_CHANNELS_MEM_ID)));
     static BATCH_DELETED_CHANNELS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
         RefCell::new(StableBTreeMap::init(stable_memory(BATCH_DELETED_CHANNELS_MEM_ID)));
+    static SELLER_ACCEPTANCES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_ACCEPTANCES_MEM_ID)));
+    static SELLER_ACCEPTANCE_CHALLENGES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_ACCEPTANCE_CHALLENGES_MEM_ID)));
+    static SELLER_SETTLEMENT_INDEX: RefCell<StableBTreeMap<String, String, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_SETTLEMENT_INDEX_MEM_ID)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENFORCE_SELLER_ACCEPTANCE: RefCell<bool> = const { RefCell::new(false) };
+    static TEST_ACCEPTANCE_NONCE_SEQUENCE: RefCell<u64> = const { RefCell::new(0) };
 }
 
 #[derive(Clone)]
@@ -230,24 +266,77 @@ struct BatchWriterReceiverScope {
     updated_by: String,
 }
 
-#[derive(Clone, Debug, CandidType, CandidDeserialize, PartialEq, Eq)]
-struct BatchPaymentIntent {
-    intent_id: String,
-    receiver_address: String,
-    payer_address: String,
-    resource_url: String,
-    amount: String,
-    nonce: String,
-    pending_id: Option<String>,
-    status: String,
-    created_at: u64,
-    updated_at: u64,
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct RuntimeProfileUpdate {
+    profile: String,
+    token: String,
+    batch_contract: String,
+    seller_settlement_fee_amount: String,
+    batch_settlement_fee_amount: String,
+    terms_version: String,
+    privacy_version: String,
+    asset_boundary_version: String,
 }
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct SellerCredit {
     credit_atoms: u128,
     updated_at: u64,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerAcceptance {
+    seller: String,
+    status: String,
+    terms_version: String,
+    privacy_version: String,
+    asset_boundary_version: String,
+    accepted_at: u64,
+    superseded: bool,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerAcceptanceChallenge {
+    seller: String,
+    nonce: String,
+    expires_at: u64,
+    message: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerAcceptanceSubmission {
+    seller: String,
+    nonce: String,
+    expires_at: u64,
+    message: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerSettlementItem {
+    key: String,
+    kind: String,
+    status: String,
+    payer: String,
+    seller: String,
+    amount: String,
+    fee: String,
+    transaction: String,
+    confirmations: u64,
+    failure_reason: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerSettlementPage {
+    items: Vec<SellerSettlementItem>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
@@ -303,6 +392,8 @@ fn http_request(request: HttpRequest) -> HttpResponse {
 async fn http_request_update(request: HttpRequest) -> HttpResponse {
     match (request.method.as_str(), path(&request.url).as_str()) {
         ("GET", "/seller-credit") => seller_credit_http(request).await,
+        ("POST", "/seller-acceptance/challenge") => seller_acceptance_challenge_http(&request),
+        ("POST", "/seller-acceptance") => seller_acceptance_submit_http(&request),
         ("POST", "/settle") => settle_http(request).await,
         ("POST", "/verify") => verify_http(request).await,
         _ => route(request, true),
@@ -312,7 +403,168 @@ async fn http_request_update(request: HttpRequest) -> HttpResponse {
 #[update]
 fn set_env(name: String, value: String) {
     require_controller_or_trap();
+    if matches!(
+        name.as_str(),
+        "NETWORK_PROFILE"
+            | "AMOY_JPYC_ADDRESS"
+            | "AMOY_BATCH_SETTLEMENT_CONTRACT"
+            | "BATCH_SETTLEMENT_CONTRACT"
+            | "SELLER_SETTLEMENT_FEE_AMOUNT"
+            | "BATCH_SETTLEMENT_FEE_AMOUNT"
+            | "SELLER_TERMS_VERSION"
+            | "PRIVACY_VERSION"
+            | "ASSET_BOUNDARY_VERSION"
+    ) {
+        ic_cdk::trap("network profile fields must be changed with set_runtime_profile");
+    }
+    if let Err(message) = validate_env_update(&name, &value) {
+        ic_cdk::trap(&message);
+    }
     set_env_value(&name, &value);
+}
+
+fn validate_env_update(name: &str, value: &str) -> Result<(), String> {
+    if configured_network_profile().as_deref() != Ok("polygon") {
+        return Ok(());
+    }
+    if matches!(
+        name,
+        "SELLER_TERMS_VERSION" | "PRIVACY_VERSION" | "ASSET_BOUNDARY_VERSION"
+    ) && (value.trim().is_empty() || value.ends_with("-draft"))
+    {
+        return Err(format!(
+            "{name} must be an approved, non-draft version for Polygon production"
+        ));
+    }
+    let minimum = match name {
+        "SELLER_SETTLEMENT_FEE_AMOUNT" => Some(JPYC_ATOMIC_UNITS),
+        "BATCH_SETTLEMENT_FEE_AMOUNT" => Some(10 * JPYC_ATOMIC_UNITS),
+        _ => None,
+    };
+    if let Some(minimum) = minimum {
+        let amount = value
+            .parse::<u128>()
+            .map_err(|_| format!("{name} must be a positive uint128 integer"))?;
+        if amount < minimum {
+            return Err(format!("{name} is below the Polygon production minimum"));
+        }
+    }
+    Ok(())
+}
+
+#[update]
+fn set_runtime_profile(update: RuntimeProfileUpdate) -> Result<(), String> {
+    require_controller_or_trap();
+    if update.profile == "polygon" {
+        validate_polygon_production_values(
+            &update.seller_settlement_fee_amount,
+            &update.batch_settlement_fee_amount,
+            &update.terms_version,
+            &update.privacy_version,
+            &update.asset_boundary_version,
+        )?;
+    } else {
+        required_positive_u128_value(
+            "SELLER_SETTLEMENT_FEE_AMOUNT",
+            &update.seller_settlement_fee_amount,
+        )?;
+        required_positive_u128_value(
+            "BATCH_SETTLEMENT_FEE_AMOUNT",
+            &update.batch_settlement_fee_amount,
+        )?;
+    }
+    apply_network_profile(&update.profile, &update.token, &update.batch_contract)?;
+    set_env_value(
+        "SELLER_SETTLEMENT_FEE_AMOUNT",
+        &update.seller_settlement_fee_amount,
+    );
+    set_env_value(
+        "BATCH_SETTLEMENT_FEE_AMOUNT",
+        &update.batch_settlement_fee_amount,
+    );
+    set_env_value("SELLER_TERMS_VERSION", &update.terms_version);
+    set_env_value("PRIVACY_VERSION", &update.privacy_version);
+    set_env_value("ASSET_BOUNDARY_VERSION", &update.asset_boundary_version);
+    Ok(())
+}
+
+fn validate_polygon_production_values(
+    seller_fee: &str,
+    batch_fee: &str,
+    terms: &str,
+    privacy: &str,
+    asset_boundary: &str,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("SELLER_TERMS_VERSION", terms),
+        ("PRIVACY_VERSION", privacy),
+        ("ASSET_BOUNDARY_VERSION", asset_boundary),
+    ] {
+        if value.trim().is_empty() || value.ends_with("-draft") {
+            return Err(format!(
+                "{name} must be an approved, non-draft version for Polygon production"
+            ));
+        }
+    }
+    let seller_fee = required_positive_u128_value("SELLER_SETTLEMENT_FEE_AMOUNT", seller_fee)?;
+    if seller_fee < JPYC_ATOMIC_UNITS {
+        return Err(
+            "SELLER_SETTLEMENT_FEE_AMOUNT is below the Polygon production minimum".to_string(),
+        );
+    }
+    let batch_fee = required_positive_u128_value("BATCH_SETTLEMENT_FEE_AMOUNT", batch_fee)?;
+    if batch_fee < 10 * JPYC_ATOMIC_UNITS {
+        return Err(
+            "BATCH_SETTLEMENT_FEE_AMOUNT is below the Polygon production minimum".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn required_positive_u128_value(name: &str, value: &str) -> Result<u128, String> {
+    let value = value
+        .parse::<u128>()
+        .map_err(|_| format!("{name} must be a positive uint128 integer"))?;
+    if value == 0 {
+        return Err(format!("{name} must be a positive uint128 integer"));
+    }
+    Ok(value)
+}
+
+fn apply_network_profile(profile: &str, token: &str, batch_contract: &str) -> Result<(), String> {
+    match profile {
+        "polygon" => {
+            if !same_address(&token, JPYC_POLYGON_ADDRESS)
+                || !same_address(&batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
+            {
+                return Err(
+                    "polygon profile requires the pinned JPYC and official batch contract"
+                        .to_string(),
+                );
+            }
+            set_env_value("AMOY_JPYC_ADDRESS", "");
+            set_env_value("AMOY_BATCH_SETTLEMENT_CONTRACT", "");
+            set_env_value(
+                "BATCH_SETTLEMENT_CONTRACT",
+                CANONICAL_BATCH_SETTLEMENT_CONTRACT,
+            );
+        }
+        "amoy" => {
+            let token = normalize_evm_address("token", &token)?;
+            let batch_contract = normalize_evm_address("batch_contract", &batch_contract)?;
+            if same_address(&token, JPYC_POLYGON_ADDRESS)
+                || same_address(&batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
+            {
+                return Err("amoy profile must not mix Polygon production contracts".to_string());
+            }
+            set_env_value("AMOY_JPYC_ADDRESS", &token);
+            set_env_value("AMOY_BATCH_SETTLEMENT_CONTRACT", &batch_contract);
+            set_env_value("BATCH_SETTLEMENT_CONTRACT", &batch_contract);
+        }
+        _ => return Err("NETWORK_PROFILE must be polygon or amoy".to_string()),
+    }
+    set_env_value("NETWORK_PROFILE", profile);
+    Ok(())
 }
 
 fn require_controller_or_trap() {
@@ -338,12 +590,17 @@ fn pre_upgrade() {}
 #[post_upgrade]
 fn post_upgrade() {
     init_sqlite_db_or_trap();
-    if !stable_structures_empty() {
-        return;
+    if stable_structures_empty() {
+        if let Ok((state,)) = ic_cdk::storage::stable_restore::<(StableState,)>() {
+            migrate_legacy_state(state);
+        }
     }
-    if let Ok((state,)) = ic_cdk::storage::stable_restore::<(StableState,)>() {
-        migrate_legacy_state(state);
-    }
+    finalize_post_upgrade_state();
+}
+
+fn finalize_post_upgrade_state() {
+    clear_seller_acceptance_challenges();
+    rebuild_seller_settlement_index();
 }
 
 fn init_sqlite_db_or_trap() {
@@ -363,6 +620,8 @@ fn init_sqlite_db() -> Result<(), String> {
     SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS)
         .map_err(|error| format!("sqlite migration failed: {error}"))?;
     SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS_V2)
+        .map_err(|error| format!("sqlite migration failed: {error}"))?;
+    SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS_V3)
         .map_err(|error| format!("sqlite migration failed: {error}"))
 }
 
@@ -397,8 +656,6 @@ thread_local! {
     static TEST_BATCH_CALLER_IS_CONTROLLER: RefCell<bool> = const { RefCell::new(true) };
     static TEST_BATCH_SELLERS: RefCell<BTreeMap<String, BatchSeller>> = const { RefCell::new(BTreeMap::new()) };
     static TEST_BATCH_WRITER_RECEIVER_SCOPES: RefCell<BTreeMap<String, BatchWriterReceiverScope>> = const { RefCell::new(BTreeMap::new()) };
-    static TEST_BATCH_PAYMENT_INTENTS: RefCell<BTreeMap<String, BatchPaymentIntent>> = const { RefCell::new(BTreeMap::new()) };
-    static TEST_BATCH_CHANNEL_BINDINGS: RefCell<BTreeMap<String, (String, String, String, String)>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 #[cfg(test)]
@@ -451,38 +708,6 @@ fn require_seller_status(status: &str) -> Result<String, String> {
         "active" | "disabled" => Ok(status),
         _ => Err("seller status must be active or disabled".to_string()),
     }
-}
-
-fn require_payment_intent_status(status: &str) -> Result<String, String> {
-    let status = require_sqlite_text("status", status, 64)?;
-    match status.as_str() {
-        "created" | "bound" | "paid" | "cancelled" => Ok(status),
-        _ => Err("payment intent status must be created, bound, paid, or cancelled".to_string()),
-    }
-}
-
-fn can_transition_payment_intent_status(current: &str, next: &str) -> bool {
-    current == next
-        || matches!(
-            (current, next),
-            ("created", "bound")
-                | ("bound", "paid")
-                | ("created", "cancelled")
-                | ("bound", "cancelled")
-        )
-}
-
-fn require_payment_intent_amount(amount: &str) -> Result<String, String> {
-    let amount = require_sqlite_text("amount", amount, 512)?;
-    parse_positive_u128("amount", &amount)?;
-    Ok(amount)
-}
-
-fn require_payment_intent_nonce(nonce: &str) -> Result<String, String> {
-    let nonce = require_sqlite_text("nonce", nonce, 512)?.to_ascii_lowercase();
-    parse_hex(&nonce, Some(32))
-        .map_err(|_| "nonce must be a 32-byte 0x-prefixed hex string".to_string())?;
-    Ok(nonce)
 }
 
 #[cfg(not(test))]
@@ -600,26 +825,6 @@ fn batch_seller_from_row(row: &ic_sqlite_vfs::db::Row<'_>) -> Result<BatchSeller
         created_at: u64::try_from(row.get::<i64>(2)?)
             .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
         updated_at: u64::try_from(row.get::<i64>(3)?)
-            .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
-    })
-}
-
-#[cfg(not(test))]
-fn batch_payment_intent_from_row(
-    row: &ic_sqlite_vfs::db::Row<'_>,
-) -> Result<BatchPaymentIntent, SqliteDbError> {
-    Ok(BatchPaymentIntent {
-        intent_id: row.get::<String>(0)?,
-        receiver_address: row.get::<String>(1)?,
-        payer_address: row.get::<String>(2)?,
-        resource_url: row.get::<String>(3)?,
-        amount: row.get::<String>(4)?,
-        nonce: row.get::<String>(5)?,
-        pending_id: row.get::<Option<String>>(6)?,
-        status: row.get::<String>(7)?,
-        created_at: u64::try_from(row.get::<i64>(8)?)
-            .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
-        updated_at: u64::try_from(row.get::<i64>(9)?)
             .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
     })
 }
@@ -878,7 +1083,9 @@ fn authorize_batch_channel_update(
 }
 
 fn validate_batch_channel_runtime_config(channel: &BatchChannel) -> Result<(), String> {
-    if !same_address(&channel.channel_config.token, JPYC_POLYGON_ADDRESS) {
+    if !configured_token_address()
+        .is_ok_and(|token| same_address(&channel.channel_config.token, &token))
+    {
         return Err("batch channel token must be JPYC on Polygon".to_string());
     }
     let receiver_authorizer = batch_receiver_authorizer_address()?;
@@ -898,368 +1105,6 @@ fn validate_batch_channel_runtime_config(channel: &BatchChannel) -> Result<(), S
         );
     }
     Ok(())
-}
-
-fn batch_pending_delta_amount(
-    current: Option<&BatchChannel>,
-    next: &BatchChannel,
-) -> Result<Option<String>, String> {
-    let Some(pending) = next.pending_request.as_ref() else {
-        return Ok(None);
-    };
-    if let Some(current) = current {
-        if let Some(current_pending) = current.pending_request.as_ref() {
-            if current_pending.pending_id == pending.pending_id {
-                if current_pending.signed_max_claimable != pending.signed_max_claimable
-                    || current_pending.expires_at != pending.expires_at
-                    || current.signed_max_claimable != next.signed_max_claimable
-                {
-                    return Err(
-                        "batch channel pendingRequest must not change for the same pendingId"
-                            .to_string(),
-                    );
-                }
-                return Ok(None);
-            }
-        }
-    }
-    if pending.expires_at <= now_seconds().saturating_mul(1_000) {
-        return Err("batch payment intent bind requires live pendingRequest".to_string());
-    }
-    if next.signed_max_claimable != pending.signed_max_claimable {
-        return Err(
-            "batch channel signedMaxClaimable must match pendingRequest.signedMaxClaimable when binding"
-                .to_string(),
-        );
-    }
-    let pending_signed = pending
-        .signed_max_claimable
-        .parse::<u128>()
-        .map_err(|_| "pending signedMaxClaimable must be a uint128 integer".to_string())?;
-    let current_charged = current
-        .map(|channel| channel.charged_cumulative_amount.as_str())
-        .unwrap_or("0")
-        .parse::<u128>()
-        .map_err(|_| "current chargedCumulativeAmount must be a uint128 integer".to_string())?;
-    if pending_signed <= current_charged {
-        return Err(
-            "batch payment intent amount must increase chargedCumulativeAmount".to_string(),
-        );
-    }
-    Ok(Some((pending_signed - current_charged).to_string()))
-}
-
-#[cfg(not(test))]
-fn bind_batch_payment_intent_for_pending(
-    current: Option<&BatchChannel>,
-    next: &BatchChannel,
-) -> Result<Option<String>, String> {
-    let Some(amount) = batch_pending_delta_amount(current, next)? else {
-        return Ok(None);
-    };
-    let pending = next
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
-    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let receiver = normalize_evm_address("channelConfig.receiver", &next.channel_config.receiver)?;
-    let payer = normalize_evm_address("channelConfig.payer", &next.channel_config.payer)?;
-    let nonce = require_payment_intent_nonce(&next.channel_config.salt)?;
-    let now = sqlite_now_seconds();
-    init_sqlite_db()?;
-    SqliteDb::update(|connection| {
-        let intents = connection.query_map(
-            "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, pending_id, status, created_at, updated_at
-             FROM payment_intents
-             WHERE receiver_address = ?1
-               AND payer_address = ?2
-               AND amount = ?3
-               AND nonce = ?4
-               AND status = 'created'
-               AND pending_id IS NULL",
-            params![receiver, payer, amount, nonce],
-            batch_payment_intent_from_row,
-        )?;
-        if intents.len() != 1 {
-            return Err(SqliteDbError::Constraint(
-                "batch payment intent match must be unique".to_string(),
-            ));
-        }
-        let intent_id = intents[0].intent_id.clone();
-        connection.execute(
-            "UPDATE payment_intents
-             SET status = 'bound', pending_id = ?2, updated_at = ?3
-             WHERE intent_id = ?1",
-            params![intent_id, pending_id, now],
-        )?;
-        Ok(intent_id)
-    })
-    .map_err(sqlite_error)
-    .map(Some)
-}
-
-#[cfg(test)]
-fn bind_batch_payment_intent_for_pending(
-    current: Option<&BatchChannel>,
-    next: &BatchChannel,
-) -> Result<Option<String>, String> {
-    let Some(amount) = batch_pending_delta_amount(current, next)? else {
-        return Ok(None);
-    };
-    let pending = next
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
-    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let receiver = normalize_evm_address("channelConfig.receiver", &next.channel_config.receiver)?;
-    let payer = normalize_evm_address("channelConfig.payer", &next.channel_config.payer)?;
-    let nonce = require_payment_intent_nonce(&next.channel_config.salt)?;
-    let matches = TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-        intents
-            .borrow()
-            .values()
-            .filter(|intent| {
-                intent.receiver_address == receiver
-                    && intent.payer_address == payer
-                    && intent.amount == amount
-                    && intent.nonce == nonce
-                    && intent.status == "created"
-                    && intent.pending_id.is_none()
-            })
-            .map(|intent| intent.intent_id.clone())
-            .collect::<Vec<_>>()
-    });
-    if matches.len() != 1 {
-        return Err("sqlite error: batch payment intent match must be unique".to_string());
-    }
-    let intent_id = matches[0].clone();
-    TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-        let mut intents = intents.borrow_mut();
-        let intent = intents
-            .get_mut(&intent_id)
-            .ok_or_else(|| "sqlite error: payment intent not found".to_string())?;
-        intent.status = "bound".to_string();
-        intent.pending_id = Some(pending_id);
-        intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
-        Ok::<_, String>(())
-    })?;
-    Ok(Some(intent_id))
-}
-
-#[cfg(not(test))]
-fn bind_batch_payment_intent_and_insert_channel_binding(
-    channel_id: &str,
-    channel: &BatchChannel,
-) -> Result<String, String> {
-    let Some(amount) = batch_pending_delta_amount(None, channel)? else {
-        return Err("batch channel create requires pendingRequest".to_string());
-    };
-    let pending = channel
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
-    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let receiver =
-        normalize_evm_address("channelConfig.receiver", &channel.channel_config.receiver)?;
-    let payer = normalize_evm_address("channelConfig.payer", &channel.channel_config.payer)?;
-    let token = normalize_evm_address("channelConfig.token", &channel.channel_config.token)?;
-    let nonce = require_payment_intent_nonce(&channel.channel_config.salt)?;
-    let now = sqlite_now_seconds();
-    let channel_id = channel_id.to_ascii_lowercase();
-    init_sqlite_db()?;
-    SqliteDb::update(|connection| {
-        let intents = connection.query_map(
-            "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, pending_id, status, created_at, updated_at
-             FROM payment_intents
-             WHERE receiver_address = ?1
-               AND payer_address = ?2
-               AND amount = ?3
-               AND nonce = ?4
-               AND status = 'created'
-               AND pending_id IS NULL",
-            params![receiver, payer, amount, nonce],
-            batch_payment_intent_from_row,
-        )?;
-        if intents.len() != 1 {
-            return Err(SqliteDbError::Constraint(
-                "batch payment intent match must be unique".to_string(),
-            ));
-        }
-        let intent_id = intents[0].intent_id.clone();
-        connection.execute(
-            "INSERT INTO batch_channel_bindings(
-                 channel_id, receiver_address, payer_address, token_address,
-                 intent_id, created_at, updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![channel_id, receiver, payer, token, intent_id, now],
-        )?;
-        connection.execute(
-            "UPDATE payment_intents
-             SET status = 'bound', pending_id = ?2, updated_at = ?3
-             WHERE intent_id = ?1",
-            params![intent_id, pending_id, now],
-        )?;
-        Ok(intent_id)
-    })
-    .map_err(sqlite_error)
-}
-
-#[cfg(test)]
-fn bind_batch_payment_intent_and_insert_channel_binding(
-    channel_id: &str,
-    channel: &BatchChannel,
-) -> Result<String, String> {
-    let Some(amount) = batch_pending_delta_amount(None, channel)? else {
-        return Err("batch channel create requires pendingRequest".to_string());
-    };
-    let pending = channel
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch payment intent bind requires pendingRequest".to_string())?;
-    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let receiver =
-        normalize_evm_address("channelConfig.receiver", &channel.channel_config.receiver)?;
-    let payer = normalize_evm_address("channelConfig.payer", &channel.channel_config.payer)?;
-    let token = normalize_evm_address("channelConfig.token", &channel.channel_config.token)?;
-    let nonce = require_payment_intent_nonce(&channel.channel_config.salt)?;
-    let intent_id = TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-        let intents = intents.borrow();
-        let matches = intents
-            .values()
-            .filter(|intent| {
-                intent.receiver_address == receiver
-                    && intent.payer_address == payer
-                    && intent.amount == amount
-                    && intent.nonce == nonce
-                    && intent.status == "created"
-                    && intent.pending_id.is_none()
-            })
-            .map(|intent| intent.intent_id.clone())
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err("sqlite error: batch payment intent match must be unique".to_string());
-        }
-        Ok::<_, String>(matches[0].clone())
-    })?;
-    TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
-        let mut bindings = bindings.borrow_mut();
-        let channel_id = channel_id.to_ascii_lowercase();
-        if bindings.contains_key(&channel_id) {
-            return Err("sqlite error: batch channel binding already exists".to_string());
-        }
-        bindings.insert(channel_id, (receiver, payer, token, intent_id.clone()));
-        Ok(())
-    })?;
-    TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-        let mut intents = intents.borrow_mut();
-        let intent = intents
-            .get_mut(&intent_id)
-            .ok_or_else(|| "sqlite error: payment intent not found".to_string())?;
-        intent.status = "bound".to_string();
-        intent.pending_id = Some(pending_id);
-        intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
-        Ok::<_, String>(())
-    })?;
-    Ok(intent_id)
-}
-
-#[cfg(not(test))]
-fn mark_bound_payment_intent_paid_for_pending(
-    current: Option<&BatchChannel>,
-    next: &BatchChannel,
-) -> Result<(), String> {
-    let Some(current) = current else {
-        return Ok(());
-    };
-    let current_charged = current
-        .charged_cumulative_amount
-        .parse::<u128>()
-        .map_err(|_| "current chargedCumulativeAmount must be a uint128 integer".to_string())?;
-    let next_charged = next
-        .charged_cumulative_amount
-        .parse::<u128>()
-        .map_err(|_| "next chargedCumulativeAmount must be a uint128 integer".to_string())?;
-    if next_charged <= current_charged {
-        return Ok(());
-    }
-    let pending = current
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch channel charge increase requires pendingRequest".to_string())?;
-    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    let now = sqlite_now_seconds();
-    init_sqlite_db()?;
-    SqliteDb::update(|connection| {
-        let intent = connection.query_optional(
-            "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, pending_id, status, created_at, updated_at
-             FROM payment_intents
-             WHERE pending_id = ?1 AND status = 'bound'",
-            params![pending_id.clone()],
-            batch_payment_intent_from_row,
-        )?;
-        let Some(intent) = intent else {
-            return Err(SqliteDbError::Constraint(
-                "bound payment intent not found for pendingRequest".to_string(),
-            ));
-        };
-        connection.execute(
-            "UPDATE payment_intents
-             SET status = 'paid', updated_at = ?2
-             WHERE intent_id = ?1",
-            params![intent.intent_id, now],
-        )?;
-        Ok(())
-    })
-    .map_err(sqlite_error)
-}
-
-#[cfg(test)]
-fn mark_bound_payment_intent_paid_for_pending(
-    current: Option<&BatchChannel>,
-    next: &BatchChannel,
-) -> Result<(), String> {
-    let Some(current) = current else {
-        return Ok(());
-    };
-    let current_charged = current
-        .charged_cumulative_amount
-        .parse::<u128>()
-        .map_err(|_| "current chargedCumulativeAmount must be a uint128 integer".to_string())?;
-    let next_charged = next
-        .charged_cumulative_amount
-        .parse::<u128>()
-        .map_err(|_| "next chargedCumulativeAmount must be a uint128 integer".to_string())?;
-    if next_charged <= current_charged {
-        return Ok(());
-    }
-    let pending = current
-        .pending_request
-        .as_ref()
-        .ok_or_else(|| "batch channel charge increase requires pendingRequest".to_string())?;
-    let pending_id = require_sqlite_text("pendingRequest.pendingId", &pending.pending_id, 512)?;
-    TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-        let mut intents = intents.borrow_mut();
-        let matches = intents
-            .values_mut()
-            .filter(|intent| {
-                intent.pending_id.as_deref() == Some(pending_id.as_str())
-                    && intent.status == "bound"
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(
-                "sqlite error: bound payment intent not found for pendingRequest".to_string(),
-            );
-        }
-        let intent = matches.into_iter().next().expect("one intent");
-        intent.status = "paid".to_string();
-        intent.updated_at = u64::try_from(sqlite_now_seconds()).unwrap_or(u64::MAX);
-        Ok(())
-    })
 }
 
 fn put_nonce_state(from: &str, state: NonceState) {
@@ -1304,6 +1149,43 @@ fn clear_seller_credits() {
         let mut items = items.borrow_mut();
         for key in keys {
             items.remove(&key);
+        }
+    });
+}
+
+fn clear_seller_acceptance_challenges() {
+    SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+fn encode_seller_acceptance_challenge(value: &SellerAcceptanceChallenge) -> Vec<u8> {
+    serde_json::to_vec(value).expect("seller acceptance challenge must encode")
+}
+
+fn decode_seller_acceptance_challenge(bytes: Vec<u8>) -> SellerAcceptanceChallenge {
+    serde_json::from_slice(&bytes).expect("seller acceptance challenge must decode")
+}
+
+fn purge_expired_seller_acceptance_challenges(now: u64) {
+    SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+        let expired = items
+            .borrow()
+            .iter()
+            .filter(|entry| decode_seller_acceptance_challenge(entry.value()).expires_at < now)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for seller in expired {
+            items.remove(&seller);
         }
     });
 }
@@ -1378,8 +1260,6 @@ fn clear_batch_channels() {
 
 #[cfg(test)]
 fn clear_batch_sqlite() {
-    TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| bindings.borrow_mut().clear());
-    TEST_BATCH_PAYMENT_INTENTS.with(|intents| intents.borrow_mut().clear());
     TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| scopes.borrow_mut().clear());
     TEST_BATCH_SELLERS.with(|sellers| sellers.borrow_mut().clear());
 }
@@ -1421,20 +1301,44 @@ fn migrate_legacy_state(state: StableState) {
 
 fn route(request: HttpRequest, updated: bool) -> HttpResponse {
     match (request.method.as_str(), path(&request.url).as_str()) {
+        ("OPTIONS", _) => HttpResponse {
+            status_code: 204,
+            headers: vec![
+                HeaderField("access-control-allow-origin".to_string(), "*".to_string()),
+                HeaderField(
+                    "access-control-allow-methods".to_string(),
+                    "GET,POST,OPTIONS".to_string(),
+                ),
+                HeaderField(
+                    "access-control-allow-headers".to_string(),
+                    "content-type,payment-signature".to_string(),
+                ),
+            ],
+            body: Vec::new(),
+            upgrade: None,
+        },
         ("GET", "/health") => json_response(200, &health()),
         ("GET", "/supported") => supported_response(),
-        ("GET", "/seller-credit") if payment_signature_header(&request).is_some() && !updated => {
-            HttpResponse {
-                status_code: 202,
-                headers: vec![HeaderField(
-                    "content-type".to_string(),
-                    "text/plain".to_string(),
-                )],
-                body: b"upgrade required".to_vec(),
-                upgrade: Some(true),
-            }
-        }
+        ("GET", "/seller-credit-balance") => seller_credit_balance_http(&request),
+        ("GET", "/seller-acceptance") => seller_acceptance_status_http(&request),
+        ("GET", "/seller-settlements") => seller_settlements_http(&request),
+        ("POST", "/seller-acceptance/challenge") if !updated => upgrade_response(),
+        ("POST", "/seller-acceptance") if !updated => upgrade_response(),
         ("GET", "/seller-credit") => {
+            if let Err(message) = seller_credit_request_parameters(&request) {
+                return json_response(400, &retryable_error("invalid_request", &message, false));
+            }
+            if payment_signature_header(&request).is_some() && !updated {
+                return HttpResponse {
+                    status_code: 202,
+                    headers: vec![HeaderField(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )],
+                    body: b"upgrade required".to_vec(),
+                    upgrade: Some(true),
+                };
+            }
             seller_credit_required_response(&request).unwrap_or_else(|message| {
                 json_response(400, &retryable_error("invalid_request", &message, false))
             })
@@ -1461,6 +1365,18 @@ fn route(request: HttpRequest, updated: bool) -> HttpResponse {
     }
 }
 
+fn upgrade_response() -> HttpResponse {
+    HttpResponse {
+        status_code: 202,
+        headers: vec![HeaderField(
+            "content-type".to_string(),
+            "text/plain".to_string(),
+        )],
+        body: b"upgrade required".to_vec(),
+        upgrade: Some(true),
+    }
+}
+
 fn supported_response() -> HttpResponse {
     let version = match env("JPYC_EIP712_VERSION") {
         Ok(version) => version,
@@ -1476,7 +1392,7 @@ fn supported_response() -> HttpResponse {
         response.kinds.push(SupportedKind {
             x402_version: 2,
             scheme: BATCH_SCHEME.to_string(),
-            network: NETWORK.to_string(),
+            network: configured_network(),
             extra: serde_json::json!({
                 "receiverAuthorizer": receiver_authorizer,
                 "withdrawDelay": withdraw_delay,
@@ -1726,7 +1642,8 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     let untrusted_payer = body.payment_payload.payload.authorization.from.clone();
     if let Err(err) = validate_request_before_signature(&body) {
         trace.step("settle.cheap_validation", 0);
-        let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+        let response =
+            failed_settlement(&configured_network(), &err.reason, &err.message, err.payer);
         return json_response_with_cost(402, &response, &trace);
     }
     trace.step("settle.cheap_validation", 0);
@@ -1746,7 +1663,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         trace.step("settle.version_validation", 0);
         return json_response_with_cost(
             402,
-            &failed_settlement(NETWORK, &err.reason, &err.message, err.payer),
+            &failed_settlement(&configured_network(), &err.reason, &err.message, err.payer),
             &trace,
         );
     }
@@ -1764,11 +1681,25 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         );
     }
     trace.step("settle.seller_authorization", 0);
+    if let Err(message) = require_current_seller_acceptance(&body.payment_requirements.pay_to) {
+        trace.step("settle.seller_acceptance", 0);
+        return json_response_with_cost(
+            403,
+            &settle_error(
+                "seller_acceptance_required",
+                &message,
+                Some(untrusted_payer),
+            ),
+            &trace,
+        );
+    }
+    trace.step("settle.seller_acceptance", 0);
     let payer = match validate_request_signature(&body) {
         Ok(payer) => payer,
         Err(err) => {
             trace.step("settle.signature_validation", 0);
-            let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+            let response =
+                failed_settlement(&configured_network(), &err.reason, &err.message, err.payer);
             return json_response_with_cost(402, &response, &trace);
         }
     };
@@ -2097,6 +2028,19 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
             );
         }
     };
+    if let Err(message) = require_current_seller_acceptance(&verified.receiver) {
+        trace.step("batch_settle.seller_acceptance", 0);
+        return json_response_with_cost(
+            403,
+            &settle_error(
+                "seller_acceptance_required",
+                &message,
+                verified.payer.clone(),
+            ),
+            trace,
+        );
+    }
+    trace.step("batch_settle.seller_acceptance", 0);
     trace.step("batch_settle.validation", 0);
     let payer = verified.payer.clone();
     let key = match batch_settlement_key(&body) {
@@ -2256,7 +2200,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
         }
     };
     trace.step("batch_settle.calldata", 0);
-    insert_settlement(
+    insert_batch_settlement(
         &key,
         SettlementRecord::checking(
             payer.clone().unwrap_or_else(|| verified.receiver.clone()),
@@ -2311,7 +2255,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
                     ttl,
                 })
                 .await;
-                let record = insert_settlement(&key, record);
+                let record = insert_batch_settlement(&key, record);
                 release_active_settlement(&active_scope, &key);
                 return json_response_with_cost(record.status_code(), &record.response, trace);
             }
@@ -2359,7 +2303,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
                     now_seconds(),
                     ttl,
                 );
-                insert_settlement(&key, record);
+                insert_batch_settlement(&key, record);
                 broadcast
             }
             Err(SettlementSendError::GasTooExpensive) => {
@@ -2401,7 +2345,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
                 ttl,
             })
             .await;
-            let record = insert_settlement(&key, record);
+            let record = insert_batch_settlement(&key, record);
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(record.status_code(), &record.response, trace)
         }
@@ -2416,7 +2360,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
                 now_seconds(),
                 ttl,
             );
-            let record = insert_settlement(&key, record);
+            let record = insert_batch_settlement(&key, record);
             json_response_with_cost(202, &record.response, trace)
         }
         ContractSettlementOutcome::Failed { tx, message } => {
@@ -2429,7 +2373,7 @@ async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> H
                 now_seconds(),
                 ttl,
             );
-            let record = insert_settlement(&key, record);
+            let record = insert_batch_settlement(&key, record);
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(502, &record.response, trace)
         }
@@ -2750,7 +2694,7 @@ async fn cached_batch_settlement_response(
                 ttl,
             })
             .await;
-            let record = insert_settlement(key, record);
+            let record = insert_batch_settlement(key, record);
             release_active_settlement_by_key(key);
             json_response_with_cost(record.status_code(), &record.response, trace)
         }
@@ -2766,7 +2710,7 @@ async fn cached_batch_settlement_response(
                 now_seconds(),
                 ttl,
             );
-            let record = insert_settlement(key, record);
+            let record = insert_batch_settlement(key, record);
             release_active_settlement_by_key(key);
             json_response_with_cost(502, &record.response, trace)
         }
@@ -2775,10 +2719,10 @@ async fn cached_batch_settlement_response(
 
 async fn seller_credit_http(request: HttpRequest) -> HttpResponse {
     let mut trace = CostTrace::for_request(&request);
-    let seller = match seller_from_request(&request) {
+    let (seller, topup_amount) = match seller_credit_request_parameters(&request) {
         Ok(value) => value,
         Err(message) => {
-            trace.step("seller_credit.parse_seller", 0);
+            trace.step("seller_credit.parse_parameters", 0);
             return json_response_with_cost(
                 400,
                 &retryable_error("invalid_request", &message, false),
@@ -2786,7 +2730,7 @@ async fn seller_credit_http(request: HttpRequest) -> HttpResponse {
             );
         }
     };
-    trace.step("seller_credit.parse_seller", 0);
+    trace.step("seller_credit.parse_parameters", 0);
     let signature = match payment_signature_header(&request) {
         Some(value) => value,
         None => {
@@ -2847,7 +2791,7 @@ async fn seller_credit_http(request: HttpRequest) -> HttpResponse {
         );
     }
     trace.step("seller_credit.resource_validation", 0);
-    let requirements = match seller_credit_requirements(&resource) {
+    let requirements = match seller_credit_requirements(&resource, topup_amount) {
         Ok(value) => value,
         Err(message) => {
             trace.step("seller_credit.requirements", 0);
@@ -2876,7 +2820,8 @@ async fn settle_seller_credit_payment(
         Ok(payer) => payer,
         Err(err) => {
             trace.step("seller_credit.local_validation", 0);
-            let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+            let response =
+                failed_settlement(&configured_network(), &err.reason, &err.message, err.payer);
             return json_response_with_cost(402, &response, trace);
         }
     };
@@ -3322,7 +3267,7 @@ async fn batch_success_response(
     let mut response = SettleResponse {
         success: true,
         transaction: tx.clone(),
-        network: NETWORK.to_string(),
+        network: configured_network(),
         payer,
         amount: Some(requirements.amount.clone()),
         error_reason: None,
@@ -3523,9 +3468,17 @@ fn verify_error(reason: &str, message: &str, payer: Option<String>) -> VerifyRes
 fn configured_batch_settlement_contract() -> Result<String, String> {
     let value = env("BATCH_SETTLEMENT_CONTRACT")?;
     let normalized = normalize_evm_address("BATCH_SETTLEMENT_CONTRACT", &value)?;
-    if !same_address(&normalized, CANONICAL_BATCH_SETTLEMENT_CONTRACT) {
+    let expected = if configured_network_profile()? == "amoy" {
+        normalize_evm_address(
+            "AMOY_BATCH_SETTLEMENT_CONTRACT",
+            &env("AMOY_BATCH_SETTLEMENT_CONTRACT")?,
+        )?
+    } else {
+        CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string()
+    };
+    if !same_address(&normalized, &expected) {
         return Err(format!(
-            "BATCH_SETTLEMENT_CONTRACT must equal official @x402/evm BATCH_SETTLEMENT_ADDRESS {CANONICAL_BATCH_SETTLEMENT_CONTRACT}"
+            "BATCH_SETTLEMENT_CONTRACT does not match the selected NETWORK_PROFILE"
         ));
     }
     Ok(normalized)
@@ -3556,7 +3509,7 @@ fn rpc_config() -> Result<RpcConfig, String> {
     let min_confirmations =
         optional_positive_u64("SETTLE_MIN_CONFIRMATIONS", DEFAULT_MIN_CONFIRMATIONS)?;
     Ok(RpcConfig {
-        services: env("POLYGON_RPC_SERVICES")?,
+        url: env("POLYGON_RPC_URL")?,
         max_gas,
         max_settlement_fee_wei,
         min_confirmations,
@@ -3564,10 +3517,24 @@ fn rpc_config() -> Result<RpcConfig, String> {
 }
 
 fn health() -> impl Serialize {
+    let profile = configured_network_profile();
+    let token = configured_token_address();
+    let batch_contract = configured_batch_settlement_contract();
+    let (terms, privacy, asset_boundary) = acceptance_versions();
     serde_json::json!({
-        "ok": true,
-        "network": NETWORK,
-        "facilitatorAddress": facilitator_address()
+        "ok": profile.is_ok() && token.is_ok(),
+        "network": configured_network(),
+        "networkProfile": profile.clone().ok(),
+        "chainId": configured_chain_id(),
+        "token": token.clone().ok(),
+        "facilitatorAddress": facilitator_address(),
+        "polygonRpcConfigured": env("POLYGON_RPC_URL").is_ok(),
+        "sellerSettlementFeeAmount": seller_settlement_fee_amount().ok().map(|value| value.to_string()),
+        "batchSettlementFeeAmount": batch_settlement_fee_amount(),
+        "receiverAuthorizer": batch_receiver_authorizer_address().ok(),
+        "batchSettlementContract": batch_contract.ok(),
+        "readiness": profile.is_ok() && token.is_ok() && env("POLYGON_RPC_URL").is_ok(),
+        "documentVersions": { "terms": terms, "privacy": privacy, "assetBoundary": asset_boundary }
     })
 }
 
@@ -3660,12 +3627,13 @@ fn instruction_counter_now() -> u64 {
 }
 
 fn settle_error(reason: &str, message: &str, payer: Option<String>) -> SettleResponse {
-    failed_settlement(NETWORK, reason, message, payer)
+    failed_settlement(&configured_network(), reason, message, payer)
 }
 
 fn seller_credit_required_response(request: &HttpRequest) -> Result<HttpResponse, String> {
+    let (_, amount) = seller_credit_request_parameters(request)?;
     let resource = seller_credit_resource(request)?;
-    let requirements = seller_credit_requirements(&resource)?;
+    let requirements = seller_credit_requirements(&resource, amount)?;
     let payment = PaymentRequiredResponse {
         x402_version: 2,
         error: "Payment required".to_string(),
@@ -3678,6 +3646,13 @@ fn seller_credit_required_response(request: &HttpRequest) -> Result<HttpResponse
         .headers
         .push(HeaderField("payment-required".to_string(), header));
     Ok(response)
+}
+
+fn seller_credit_request_parameters(request: &HttpRequest) -> Result<(String, u128), String> {
+    Ok((
+        seller_from_request(request)?,
+        seller_credit_topup_amount(request)?,
+    ))
 }
 
 fn seller_credit_paid_response(
@@ -3703,15 +3678,18 @@ fn seller_credit_paid_response(
     response
 }
 
-fn seller_credit_requirements(resource: &ResourceInfo) -> Result<PaymentRequirements, String> {
+fn seller_credit_requirements(
+    resource: &ResourceInfo,
+    amount: u128,
+) -> Result<PaymentRequirements, String> {
     if resource.url.trim().is_empty() {
         return Err("seller credit resource URL is empty".to_string());
     }
     Ok(PaymentRequirements {
         scheme: "exact".to_string(),
-        network: NETWORK.to_string(),
-        asset: JPYC_POLYGON_ADDRESS.to_string(),
-        amount: seller_credit_topup_amount()?.to_string(),
+        network: configured_network(),
+        asset: configured_token_address()?,
+        amount: amount.to_string(),
         pay_to: normalize_evm_address("SELLER_CREDIT_PAY_TO", &env("SELLER_CREDIT_PAY_TO")?)?,
         max_timeout_seconds: optional_positive_u64("SELLER_CREDIT_MAX_TIMEOUT_SECONDS", 60)?,
         extra: serde_json::json!({
@@ -3731,8 +3709,7 @@ fn seller_credit_resource(request: &HttpRequest) -> Result<ResourceInfo, String>
 }
 
 fn seller_from_request(request: &HttpRequest) -> Result<String, String> {
-    let value = query_param(&request.url, "seller")
-        .ok_or_else(|| "missing seller query parameter".to_string())?;
+    let value = unique_query_param(&request.url, "seller")?;
     normalize_evm_address("seller", &value)
 }
 
@@ -3932,8 +3909,52 @@ fn normalize_evm_address(label: &str, value: &str) -> Result<String, String> {
     parse_address(value, label).map(|address| address_hex(&address))
 }
 
-fn seller_credit_topup_amount() -> Result<u128, String> {
-    required_positive_u128("SELLER_CREDIT_TOPUP_AMOUNT")
+const JPYC_ATOMIC_UNITS: u128 = 1_000_000_000_000_000_000;
+const SELLER_CREDIT_MAX_TOPUP_ATOMS: u128 = 10_000 * JPYC_ATOMIC_UNITS;
+
+fn seller_credit_topup_amount(request: &HttpRequest) -> Result<u128, String> {
+    let value = unique_query_param(&request.url, "amount")?;
+    parse_jpyc_decimal(&value)
+}
+
+fn parse_jpyc_decimal(value: &str) -> Result<u128, String> {
+    let invalid = || {
+        "amount must be a decimal JPYC value from 1 to 10000 with at most 18 fractional digits"
+            .to_string()
+    };
+    if value.is_empty() || value.starts_with(['+', '-']) || value.contains(['e', 'E']) {
+        return Err(invalid());
+    }
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.chars().all(|ch| ch.is_ascii_digit())
+        || fraction.is_some_and(|part| {
+            part.is_empty() || part.len() > 18 || !part.chars().all(|ch| ch.is_ascii_digit())
+        })
+    {
+        return Err(invalid());
+    }
+    let whole = integer.parse::<u128>().map_err(|_| invalid())?;
+    let fractional = match fraction {
+        Some(part) => {
+            let digits = part.parse::<u128>().map_err(|_| invalid())?;
+            digits
+                .checked_mul(10u128.pow((18 - part.len()) as u32))
+                .ok_or_else(invalid)?
+        }
+        None => 0,
+    };
+    let atoms = whole
+        .checked_mul(JPYC_ATOMIC_UNITS)
+        .and_then(|value| value.checked_add(fractional))
+        .ok_or_else(invalid)?;
+    if !(JPYC_ATOMIC_UNITS..=SELLER_CREDIT_MAX_TOPUP_ATOMS).contains(&atoms) {
+        return Err(invalid());
+    }
+    Ok(atoms)
 }
 
 fn seller_settlement_fee_amount() -> Result<u128, String> {
@@ -4037,6 +4058,340 @@ fn seller_credit(seller: String) -> u128 {
         .ok()
         .map(|seller| seller_credit_balance_for(&seller))
         .unwrap_or(0)
+}
+
+#[query]
+fn seller_acceptance(seller: String) -> Option<SellerAcceptance> {
+    let seller = normalize_evm_address("seller", &seller).ok()?;
+    current_seller_acceptance(&seller)
+}
+
+fn current_seller_acceptance(seller: &str) -> Option<SellerAcceptance> {
+    SELLER_ACCEPTANCES
+        .with(|items| items.borrow().get(&seller.to_string()))
+        .map(|bytes| decode_stable::<SellerAcceptance>(bytes))
+        .map(|mut value| {
+            value.superseded = !acceptance_versions_current(&value);
+            value
+        })
+}
+
+fn acceptance_versions() -> (String, String, String) {
+    (
+        env("SELLER_TERMS_VERSION").unwrap_or_else(|_| "2026-07-13-draft".to_string()),
+        env("PRIVACY_VERSION").unwrap_or_else(|_| "2026-07-13-draft".to_string()),
+        env("ASSET_BOUNDARY_VERSION").unwrap_or_else(|_| "2026-07-13-draft".to_string()),
+    )
+}
+
+fn acceptance_versions_current(value: &SellerAcceptance) -> bool {
+    let (terms, privacy, asset) = acceptance_versions();
+    if configured_network_profile().as_deref() == Ok("polygon")
+        && validate_polygon_production_values(
+            &env("SELLER_SETTLEMENT_FEE_AMOUNT").unwrap_or_default(),
+            &env("BATCH_SETTLEMENT_FEE_AMOUNT").unwrap_or_default(),
+            &terms,
+            &privacy,
+            &asset,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    value.status == "active"
+        && value.terms_version == terms
+        && value.privacy_version == privacy
+        && value.asset_boundary_version == asset
+}
+
+fn require_current_seller_acceptance(seller: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if !TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow()) {
+        return Ok(());
+    }
+    current_seller_acceptance(seller)
+        .filter(acceptance_versions_current)
+        .map(|_| ())
+        .ok_or_else(|| "seller must accept the current legal document versions".to_string())
+}
+
+fn seller_credit_balance_http(request: &HttpRequest) -> HttpResponse {
+    match seller_from_request(request) {
+        Ok(seller) => json_response(
+            200,
+            &serde_json::json!({
+                "seller": seller,
+                "creditAtoms": seller_credit_balance_for(&seller).to_string()
+            }),
+        ),
+        Err(message) => json_response(400, &retryable_error("invalid_request", &message, false)),
+    }
+}
+
+fn seller_acceptance_status_http(request: &HttpRequest) -> HttpResponse {
+    match seller_from_request(request) {
+        Ok(seller) => json_response(200, &current_seller_acceptance(&seller)),
+        Err(message) => json_response(400, &retryable_error("invalid_request", &message, false)),
+    }
+}
+
+fn seller_acceptance_challenge_http(request: &HttpRequest) -> HttpResponse {
+    let seller = match seller_from_request(request) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &retryable_error("invalid_request", &message, false))
+        }
+    };
+    let now = now_seconds();
+    let at_capacity = SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+        let items = items.borrow();
+        !items.contains_key(&seller) && items.len() >= MAX_SELLER_ACCEPTANCE_CHALLENGES
+    });
+    if at_capacity {
+        purge_expired_seller_acceptance_challenges(now);
+        let still_at_capacity = SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+            let items = items.borrow();
+            !items.contains_key(&seller) && items.len() >= MAX_SELLER_ACCEPTANCE_CHALLENGES
+        });
+        if still_at_capacity {
+            return json_response(
+                429,
+                &retryable_error(
+                    "challenge_capacity_reached",
+                    "seller acceptance challenge capacity reached; retry after existing challenges expire",
+                    true,
+                ),
+            );
+        }
+    }
+    let expires_at = now.saturating_add(300);
+    let seed = format!("{}|{}|{}", seller, now_nanos(), facilitator_canister_id());
+    let nonce = format!("0x{}", hex::encode(keccak256(seed.as_bytes())));
+    let message = seller_acceptance_message(&seller, &nonce, expires_at);
+    let challenge = SellerAcceptanceChallenge {
+        seller,
+        nonce: nonce.clone(),
+        expires_at,
+        message,
+    };
+    SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+        items.borrow_mut().insert(
+            challenge.seller.clone(),
+            encode_seller_acceptance_challenge(&challenge),
+        )
+    });
+    json_response(200, &challenge)
+}
+
+fn seller_acceptance_message(seller: &str, nonce: &str, expires_at: u64) -> String {
+    let (terms, privacy, asset) = acceptance_versions();
+    format!(
+        "IC_JPYC_FACILITATOR_SELLER_ACCEPTANCE_V1\nseller={seller}\ncanisterId={}\npublicOrigin={}\nchainId={}\ntermsVersion={terms}\nprivacyVersion={privacy}\nassetBoundaryVersion={asset}\nnonce={nonce}\nexpiresAt={expires_at}",
+        facilitator_canister_id(),
+        env("FACILITATOR_PUBLIC_ORIGIN").unwrap_or_default(),
+        configured_chain_id()
+    )
+}
+
+fn seller_acceptance_submit_http(request: &HttpRequest) -> HttpResponse {
+    let submission = match serde_json::from_slice::<SellerAcceptanceSubmission>(&request.body) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                400,
+                &retryable_error(
+                    "invalid_request",
+                    &format!("invalid JSON body: {error}"),
+                    false,
+                ),
+            )
+        }
+    };
+    let seller = match normalize_evm_address("seller", &submission.seller) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &retryable_error("invalid_request", &message, false))
+        }
+    };
+    let stored = SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().get(&seller));
+    let Some(stored) = stored.map(decode_seller_acceptance_challenge) else {
+        return json_response(
+            409,
+            &retryable_error(
+                "invalid_nonce",
+                "acceptance nonce is missing or already used",
+                false,
+            ),
+        );
+    };
+    if stored.seller != seller
+        || stored.nonce != submission.nonce
+        || stored.expires_at != submission.expires_at
+        || stored.message != submission.message
+    {
+        return json_response(
+            400,
+            &retryable_error(
+                "invalid_challenge",
+                "acceptance challenge does not match",
+                false,
+            ),
+        );
+    }
+    if stored.expires_at < now_seconds()
+        || stored.message != seller_acceptance_message(&seller, &stored.nonce, stored.expires_at)
+    {
+        SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow_mut().remove(&seller));
+        return json_response(
+            410,
+            &retryable_error(
+                "expired_challenge",
+                "acceptance challenge expired or document versions changed",
+                true,
+            ),
+        );
+    }
+    let recovered = match recover_eip191_signer(&stored.message, &submission.signature) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(402, &retryable_error("invalid_signature", &message, false))
+        }
+    };
+    if !same_address(&recovered, &seller) {
+        return json_response(
+            402,
+            &retryable_error(
+                "invalid_signature",
+                "signature does not match seller",
+                false,
+            ),
+        );
+    }
+    if let Err(message) = activate_batch_seller(&seller) {
+        return json_response(
+            500,
+            &retryable_error("seller_activation_failed", &message, true),
+        );
+    }
+    SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow_mut().remove(&seller));
+    let (terms_version, privacy_version, asset_boundary_version) = acceptance_versions();
+    let acceptance = SellerAcceptance {
+        seller: seller.clone(),
+        status: "active".to_string(),
+        terms_version,
+        privacy_version,
+        asset_boundary_version,
+        accepted_at: now_seconds(),
+        superseded: false,
+    };
+    SELLER_ACCEPTANCES.with(|items| {
+        items
+            .borrow_mut()
+            .insert(seller, encode_stable(&acceptance))
+    });
+    json_response(200, &acceptance)
+}
+
+fn activate_batch_seller(receiver: &str) -> Result<(), String> {
+    let now = sqlite_now_seconds();
+    #[cfg(test)]
+    {
+        TEST_BATCH_SELLERS.with(|sellers| {
+            let mut sellers = sellers.borrow_mut();
+            let created_at = sellers
+                .get(receiver)
+                .map(|seller| seller.created_at)
+                .unwrap_or_else(|| u64::try_from(now).unwrap_or(u64::MAX));
+            sellers.insert(
+                receiver.to_string(),
+                BatchSeller {
+                    receiver_address: receiver.to_string(),
+                    status: "active".to_string(),
+                    created_at,
+                    updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+                },
+            );
+        });
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| connection.execute(
+            "INSERT INTO sellers(receiver_address, status, created_at, updated_at) VALUES (?1, 'active', ?2, ?2) ON CONFLICT(receiver_address) DO UPDATE SET status = 'active', updated_at = excluded.updated_at",
+            params![receiver, now],
+        ).map(|_| ())).map_err(sqlite_error)
+    }
+}
+
+fn now_nanos() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ic_cdk::api::time()
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+    {
+        1_700_000_000_000_000_000
+    }
+    #[cfg(test)]
+    {
+        TEST_ACCEPTANCE_NONCE_SEQUENCE.with(|sequence| {
+            let next = sequence.borrow().saturating_add(1);
+            *sequence.borrow_mut() = next;
+            1_700_000_000_000_000_000u64.saturating_add(next)
+        })
+    }
+}
+
+fn facilitator_canister_id() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ic_cdk::api::canister_self().to_text()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "aaaaa-aa".to_string()
+    }
+}
+
+pub(crate) fn configured_chain_id() -> u64 {
+    configured_network_profile()
+        .ok()
+        .filter(|value| value == "amoy")
+        .map(|_| 80_002)
+        .unwrap_or(137)
+}
+
+pub(crate) fn configured_network_profile() -> Result<String, String> {
+    let profile = env("NETWORK_PROFILE").unwrap_or_else(|_| "polygon".to_string());
+    match profile.as_str() {
+        "polygon" => Ok(profile),
+        "amoy" => {
+            normalize_evm_address("AMOY_JPYC_ADDRESS", &env("AMOY_JPYC_ADDRESS")?)?;
+            normalize_evm_address(
+                "AMOY_BATCH_SETTLEMENT_CONTRACT",
+                &env("AMOY_BATCH_SETTLEMENT_CONTRACT")?,
+            )?;
+            Ok(profile)
+        }
+        _ => Err("NETWORK_PROFILE must be polygon or amoy".to_string()),
+    }
+}
+
+pub(crate) fn configured_network() -> String {
+    if configured_network_profile().as_deref() == Ok("amoy") {
+        "eip155:80002".to_string()
+    } else {
+        NETWORK.to_string()
+    }
+}
+
+pub(crate) fn configured_token_address() -> Result<String, String> {
+    if configured_network_profile()? == "amoy" {
+        normalize_evm_address("AMOY_JPYC_ADDRESS", &env("AMOY_JPYC_ADDRESS")?)
+    } else {
+        Ok(JPYC_POLYGON_ADDRESS.to_string())
+    }
 }
 
 #[query]
@@ -4190,134 +4545,6 @@ fn batch_set_writer_receiver_scope(
     }
 }
 
-#[update]
-fn batch_create_payment_intent(
-    intent_id: String,
-    receiver: String,
-    payer: String,
-    resource_url: String,
-    amount: String,
-    nonce: String,
-) -> Result<BatchPaymentIntent, String> {
-    require_controller_or_trap();
-    let intent_id = require_sqlite_text("intent_id", &intent_id, 512)?;
-    let receiver = normalize_evm_address("receiver", &receiver)?;
-    let payer = normalize_evm_address("payer", &payer)?;
-    let resource_url = require_sqlite_text("resource_url", &resource_url, 2_048)?;
-    let amount = require_payment_intent_amount(&amount)?;
-    let nonce = require_payment_intent_nonce(&nonce)?;
-    let status = "created".to_string();
-    let now = sqlite_now_seconds();
-    #[cfg(test)]
-    {
-        let intent = BatchPaymentIntent {
-            intent_id: intent_id.clone(),
-            receiver_address: receiver,
-            payer_address: payer,
-            resource_url,
-            amount,
-            nonce,
-            pending_id: None,
-            status,
-            created_at: u64::try_from(now).unwrap_or(u64::MAX),
-            updated_at: u64::try_from(now).unwrap_or(u64::MAX),
-        };
-        TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-            intents.borrow_mut().insert(intent_id, intent.clone());
-        });
-        return Ok(intent);
-    }
-    #[cfg(not(test))]
-    {
-        init_sqlite_db()?;
-        SqliteDb::update(|connection| {
-            connection.execute(
-                "INSERT INTO payment_intents(
-                 intent_id, receiver_address, payer_address, resource_url,
-                 amount, nonce, status, created_at, updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-                params![
-                    intent_id,
-                    receiver,
-                    payer,
-                    resource_url,
-                    amount,
-                    nonce,
-                    status,
-                    now
-                ],
-            )?;
-            connection.query_one(
-                "SELECT intent_id, receiver_address, payer_address, resource_url,
-	                    amount, nonce, pending_id, status, created_at, updated_at
-	             FROM payment_intents WHERE intent_id = ?1",
-                params![intent_id],
-                batch_payment_intent_from_row,
-            )
-        })
-        .map_err(sqlite_error)
-    }
-}
-
-#[update]
-fn batch_mark_payment_intent(
-    intent_id: String,
-    status: String,
-) -> Result<BatchPaymentIntent, String> {
-    require_controller_or_trap();
-    let intent_id = require_sqlite_text("intent_id", &intent_id, 512)?;
-    let status = require_payment_intent_status(&status)?;
-    let now = sqlite_now_seconds();
-    #[cfg(test)]
-    {
-        return TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-            let mut intents = intents.borrow_mut();
-            let Some(intent) = intents.get_mut(&intent_id) else {
-                return Err("sqlite error: row not found".to_string());
-            };
-            if !can_transition_payment_intent_status(&intent.status, &status) {
-                return Err("payment intent status transition is not allowed".to_string());
-            }
-            intent.status = status;
-            intent.updated_at = u64::try_from(now).unwrap_or(u64::MAX);
-            Ok(intent.clone())
-        });
-    }
-    #[cfg(not(test))]
-    {
-        init_sqlite_db()?;
-        SqliteDb::update(|connection| {
-            let current = connection
-                .query_optional(
-                    "SELECT intent_id, receiver_address, payer_address, resource_url,
-                        amount, nonce, pending_id, status, created_at, updated_at
-                     FROM payment_intents WHERE intent_id = ?1",
-                    params![intent_id.clone()],
-                    batch_payment_intent_from_row,
-                )?
-                .ok_or_else(|| SqliteDbError::Constraint("row not found".to_string()))?;
-            if !can_transition_payment_intent_status(&current.status, &status) {
-                return Err(SqliteDbError::Constraint(
-                    "payment intent status transition is not allowed".to_string(),
-                ));
-            }
-            connection.execute(
-                "UPDATE payment_intents SET status = ?2, updated_at = ?3 WHERE intent_id = ?1",
-                params![intent_id, status, now],
-            )?;
-            connection.query_one(
-                "SELECT intent_id, receiver_address, payer_address, resource_url,
-                    amount, nonce, pending_id, status, created_at, updated_at
-                 FROM payment_intents WHERE intent_id = ?1",
-                params![intent_id],
-                batch_payment_intent_from_row,
-            )
-        })
-        .map_err(sqlite_error)
-    }
-}
-
 #[query]
 fn batch_writer_receiver_scope(
     writer: Principal,
@@ -4385,31 +4612,6 @@ fn batch_writer_receiver_scopes(limit: Option<u64>) -> Vec<BatchWriterReceiverSc
         )
         })
         .unwrap_or_default()
-    }
-}
-
-#[query]
-fn batch_payment_intent(intent_id: String) -> Option<BatchPaymentIntent> {
-    let intent_id = require_sqlite_text("intent_id", &intent_id, 512).ok()?;
-    #[cfg(test)]
-    {
-        return TEST_BATCH_PAYMENT_INTENTS
-            .with(|intents| intents.borrow().get(&intent_id).cloned());
-    }
-    #[cfg(not(test))]
-    {
-        init_sqlite_db().ok()?;
-        SqliteDb::query(|connection| {
-            connection.query_optional(
-                "SELECT intent_id, receiver_address, payer_address, resource_url,
-	                    amount, nonce, pending_id, status, created_at, updated_at
-	             FROM payment_intents WHERE intent_id = ?1",
-                params![intent_id],
-                batch_payment_intent_from_row,
-            )
-        })
-        .ok()
-        .flatten()
     }
 }
 
@@ -4538,37 +4740,6 @@ fn batch_update_channel(
                     channel: current,
                     current_revision,
                     message: Some("batch channel storage limit reached".to_string()),
-                };
-            }
-            if current.is_none() {
-                if let Err(message) =
-                    bind_batch_payment_intent_and_insert_channel_binding(&key, &channel)
-                {
-                    return BatchChannelUpdateResult {
-                        status: "invalid".to_string(),
-                        channel: current,
-                        current_revision,
-                        message: Some(message),
-                    };
-                }
-            } else if let Err(message) =
-                bind_batch_payment_intent_for_pending(current.as_ref(), &channel)
-            {
-                return BatchChannelUpdateResult {
-                    status: "invalid".to_string(),
-                    channel: current,
-                    current_revision,
-                    message: Some(message),
-                };
-            }
-            if let Err(message) =
-                mark_bound_payment_intent_paid_for_pending(current.as_ref(), &channel)
-            {
-                return BatchChannelUpdateResult {
-                    status: "invalid".to_string(),
-                    channel: current,
-                    current_revision,
-                    message: Some(message),
                 };
             }
             channel.channel_id = key.clone();
@@ -4725,6 +4896,24 @@ fn query_param(url: &str, name: &str) -> Option<String> {
     })
 }
 
+fn unique_query_param(url: &str, name: &str) -> Result<String, String> {
+    let query = url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default();
+    let values: Vec<&str> = query
+        .split('&')
+        .map(|part| part.split_once('=').unwrap_or((part, "")))
+        .filter_map(|(key, value)| (key == name).then_some(value))
+        .collect();
+    match values.as_slice() {
+        [] => Err(format!("missing {name} query parameter")),
+        [value] if !value.is_empty() => Ok((*value).to_string()),
+        [..] if values.len() > 1 => Err(format!("duplicate {name} query parameter")),
+        _ => Err(format!("{name} query parameter must not be empty")),
+    }
+}
+
 fn env(name: &str) -> Result<String, String> {
     if let Some(value) = ENV.with(|env| env.borrow().get(&name.to_string())) {
         if !value.trim().is_empty() {
@@ -4782,7 +4971,7 @@ fn settlement_key(body: &FacilitatorRequest) -> Result<String, String> {
     let signature = parse_hex(&body.payment_payload.payload.signature, Some(65))?;
     let signature_hash = keccak256(&signature);
     let identity = [
-        NETWORK.to_string(),
+        configured_network(),
         body.payment_requirements.asset.to_ascii_lowercase(),
         auth.from.to_ascii_lowercase(),
         auth.nonce.to_ascii_lowercase(),
@@ -4797,13 +4986,177 @@ fn settlement_key(body: &FacilitatorRequest) -> Result<String, String> {
 }
 
 fn insert_settlement(key: &str, mut record: SettlementRecord) -> SettlementRecord {
+    let extra = record.response.extra.get_or_insert_with(BTreeMap::new);
+    extra
+        .entry("settlementKind".to_string())
+        .or_insert_with(|| "exact".to_string());
+    extra
+        .entry("settlementFee".to_string())
+        .or_insert_with(|| seller_settlement_fee_amount().unwrap_or(0).to_string());
+    extra.insert(
+        "confirmations".to_string(),
+        if record.response.success {
+            rpc_config()
+                .map(|config| config.min_confirmations)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+        .to_string(),
+    );
     attach_settlement_key(key, &mut record);
+    if let Some(seller) = record.pay_to.clone() {
+        let seller = seller.to_ascii_lowercase();
+        let index_key = format!("{seller}|{:020}|{key}", record.created_at);
+        SELLER_SETTLEMENT_INDEX.with(|items| {
+            items.borrow_mut().insert(index_key, key.to_string());
+        });
+    }
     SETTLEMENTS.with(|items| {
         items
             .borrow_mut()
             .insert(key.to_string(), encode_stable(&record));
     });
     record
+}
+
+fn rebuild_seller_settlement_index() {
+    let records = SETTLEMENTS.with(|items| {
+        items
+            .borrow()
+            .iter()
+            .filter_map(|entry| {
+                decode_stable_result::<SettlementRecord>(entry.value())
+                    .ok()
+                    .map(|record| (entry.key().clone(), record))
+            })
+            .collect::<Vec<_>>()
+    });
+    SELLER_SETTLEMENT_INDEX.with(|items| {
+        let mut items = items.borrow_mut();
+        for (key, record) in records {
+            if let Some(seller) = record.pay_to {
+                let index_key = format!(
+                    "{}|{:020}|{}",
+                    seller.to_ascii_lowercase(),
+                    record.created_at,
+                    key
+                );
+                items.insert(index_key, key);
+            }
+        }
+    });
+}
+
+fn insert_batch_settlement(key: &str, mut record: SettlementRecord) -> SettlementRecord {
+    let extra = record.response.extra.get_or_insert_with(BTreeMap::new);
+    extra.insert("settlementKind".to_string(), "batch".to_string());
+    if let Some(fee) = batch_settlement_fee_amount() {
+        extra.insert("settlementFee".to_string(), fee);
+    }
+    insert_settlement(key, record)
+}
+
+#[query]
+fn seller_settlements(
+    seller: String,
+    cursor: Option<String>,
+    limit: Option<u64>,
+) -> SellerSettlementPage {
+    let Ok(seller) = normalize_evm_address("seller", &seller) else {
+        return SellerSettlementPage {
+            items: Vec::new(),
+            next_cursor: None,
+        };
+    };
+    seller_settlements_page(&seller, cursor.as_deref(), limit.unwrap_or(20))
+}
+
+fn seller_settlements_page(seller: &str, cursor: Option<&str>, limit: u64) -> SellerSettlementPage {
+    let limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let prefix = format!("{}|", seller.to_ascii_lowercase());
+    let mut indexed = SELLER_SETTLEMENT_INDEX.with(|items| {
+        items
+            .borrow()
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>()
+    });
+    indexed.sort_by(|left, right| right.0.cmp(&left.0));
+    if let Some(cursor) = cursor {
+        indexed.retain(|(key, _)| key.as_str() < cursor);
+    }
+    let has_more = indexed.len() > limit;
+    indexed.truncate(limit);
+    let items = indexed
+        .iter()
+        .filter_map(|(_, key)| get_settlement(key).map(|record| settlement_item(key, record)))
+        .collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| indexed.last().map(|item| item.0.clone()))
+        .flatten();
+    SellerSettlementPage { items, next_cursor }
+}
+
+fn settlement_item(key: &str, record: SettlementRecord) -> SellerSettlementItem {
+    let kind = record
+        .response
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get("settlementKind"))
+        .cloned()
+        .unwrap_or_else(|| "exact".to_string());
+    let fee = record
+        .response
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get("settlementFee"))
+        .cloned()
+        .unwrap_or_else(|| {
+            if kind == "batch" {
+                batch_settlement_fee_amount().unwrap_or_else(|| "0".to_string())
+            } else {
+                seller_settlement_fee_amount().unwrap_or(0).to_string()
+            }
+        });
+    SellerSettlementItem {
+        key: key.to_string(),
+        kind,
+        status: record.status,
+        payer: record.response.payer.unwrap_or_default(),
+        seller: record.pay_to.unwrap_or_default(),
+        amount: record.response.amount.unwrap_or_default(),
+        fee,
+        transaction: record.response.transaction,
+        confirmations: record
+            .response
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("confirmations"))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        failure_reason: record.response.error_reason,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn seller_settlements_http(request: &HttpRequest) -> HttpResponse {
+    let seller = match seller_from_request(request) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &retryable_error("invalid_request", &message, false))
+        }
+    };
+    let cursor = query_param(&request.url, "cursor");
+    let limit = query_param(&request.url, "limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+    json_response(
+        200,
+        &seller_settlements_page(&seller, cursor.as_deref(), limit),
+    )
 }
 
 fn attach_settlement_key(key: &str, record: &mut SettlementRecord) {
@@ -4825,7 +5178,7 @@ fn purge_expired_settlements(now: u64) {
             .iter()
             .filter(|entry| {
                 let record = decode_stable::<SettlementRecord>(entry.value());
-                record.is_expired(now) && !record.is_broadcast()
+                record.is_expired(now) && record.status == "checking"
             })
             .map(|entry| entry.key().clone())
             .collect::<Vec<_>>()
@@ -5189,7 +5542,6 @@ mod tests {
         set_env_value("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test");
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("SELLER_CREDIT_PAY_TO", CREDIT_PAY_TO);
-        set_env_value("SELLER_CREDIT_TOPUP_AMOUNT", "1000");
         set_env_value("SELLER_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("SELLER_CREDIT_MAX_TIMEOUT_SECONDS", "60");
     }
@@ -5197,7 +5549,7 @@ mod tests {
     fn seller_credit_request() -> HttpRequest {
         HttpRequest {
             method: "GET".to_string(),
-            url: format!("/seller-credit?seller={SELLER}"),
+            url: format!("/seller-credit?seller={SELLER}&amount=100"),
             headers: vec![],
             body: vec![],
             certificate_version: None,
@@ -5212,7 +5564,7 @@ mod tests {
                 scheme: "exact".to_string(),
                 network: NETWORK.to_string(),
                 asset: JPYC_POLYGON_ADDRESS.to_string(),
-                amount: "1000".to_string(),
+                amount: (100 * JPYC_ATOMIC_UNITS).to_string(),
                 pay_to: CREDIT_PAY_TO.to_lowercase(),
                 max_timeout_seconds: 60,
                 extra: serde_json::json!({
@@ -5226,7 +5578,7 @@ mod tests {
                 authorization: crate::types::Eip3009Authorization {
                     from: from.to_string(),
                     to: CREDIT_PAY_TO.to_lowercase(),
-                    value: "1000".to_string(),
+                    value: (100 * JPYC_ATOMIC_UNITS).to_string(),
                     valid_after: "0".to_string(),
                     valid_before: "9999999999".to_string(),
                     nonce: format!("0x{}", "22".repeat(32)),
@@ -5298,7 +5650,7 @@ mod tests {
     #[test]
     fn rpc_config_uses_default_settlement_fee_cap() {
         clear_env_values();
-        set_env_value("POLYGON_RPC_SERVICES", "https://polygon.example");
+        set_env_value("POLYGON_RPC_URL", "https://polygon.example");
         let config = rpc_config().unwrap();
         assert_eq!(
             config.max_settlement_fee_wei,
@@ -5311,7 +5663,7 @@ mod tests {
     fn rpc_config_rejects_invalid_settlement_fee_cap() {
         for value in ["0", "not-a-number"] {
             clear_env_values();
-            set_env_value("POLYGON_RPC_SERVICES", "https://polygon.example");
+            set_env_value("POLYGON_RPC_URL", "https://polygon.example");
             set_env_value("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", value);
             match rpc_config() {
                 Ok(_) => panic!("invalid settlement fee cap must fail"),
@@ -5361,10 +5713,103 @@ mod tests {
         assert_eq!(value["x402Version"], 2);
         assert_eq!(
             value["resource"]["url"],
-            format!("https://canister.example.test/seller-credit?seller={SELLER}")
+            format!("https://canister.example.test/seller-credit?seller={SELLER}&amount=100")
         );
-        assert_eq!(value["accepts"][0]["amount"], "1000");
+        assert_eq!(
+            value["accepts"][0]["amount"],
+            (100 * JPYC_ATOMIC_UNITS).to_string()
+        );
         assert_eq!(value["accepts"][0]["payTo"], CREDIT_PAY_TO.to_lowercase());
+    }
+
+    #[test]
+    fn parses_seller_credit_amount_as_18_decimal_jpyc() {
+        for (input, expected) in [
+            ("1", JPYC_ATOMIC_UNITS),
+            ("100", 100 * JPYC_ATOMIC_UNITS),
+            ("10000", SELLER_CREDIT_MAX_TOPUP_ATOMS),
+            ("1.000000000000000001", JPYC_ATOMIC_UNITS + 1),
+            ("0001.5", JPYC_ATOMIC_UNITS + JPYC_ATOMIC_UNITS / 2),
+        ] {
+            assert_eq!(parse_jpyc_decimal(input).unwrap(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_seller_credit_amounts() {
+        for input in [
+            "",
+            "0",
+            "0.999999999999999999",
+            "10000.000000000000000001",
+            "10001",
+            "1e2",
+            "1E2",
+            "+1",
+            "-1",
+            ".1",
+            "1.",
+            "1.0000000000000000000",
+        ] {
+            assert!(parse_jpyc_decimal(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_empty_and_duplicate_seller_credit_query_parameters() {
+        for url in [
+            format!("/seller-credit?seller={SELLER}"),
+            format!("/seller-credit?seller={SELLER}&amount="),
+            format!("/seller-credit?seller={SELLER}&amount=1&amount=2"),
+            format!("/seller-credit?seller={SELLER}&amount=1&amount"),
+            format!("/seller-credit?seller={SELLER}&amount&amount=1"),
+            format!("/seller-credit?seller={SELLER}&seller={SELLER}&amount=1"),
+            format!("/seller-credit?seller={SELLER}&seller&amount=1"),
+            format!("/seller-credit?seller&seller={SELLER}&amount=1"),
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                url,
+                headers: vec![],
+                body: vec![],
+                certificate_version: None,
+            };
+            assert_eq!(run_ready(seller_credit_http(request)).status_code, 400);
+        }
+    }
+
+    #[test]
+    fn seller_credit_query_route_validates_parameters_before_402_or_upgrade() {
+        set_test_env();
+        let valid = seller_credit_request();
+        assert_eq!(route(valid.clone(), false).status_code, 402);
+
+        let mut valid_with_debug = valid.clone();
+        valid_with_debug.url.push_str("&debugCost=1");
+        assert_eq!(route(valid_with_debug, false).status_code, 402);
+
+        for url in [
+            "/seller-credit?amount=1".to_string(),
+            "/seller-credit?seller=&amount=1".to_string(),
+            "/seller-credit?seller=invalid&amount=1".to_string(),
+            format!("/seller-credit?seller={SELLER}&seller&amount=1"),
+        ] {
+            let mut request = valid.clone();
+            request.url = url;
+            assert_eq!(route(request.clone(), false).status_code, 400);
+            request.headers.push(HeaderField(
+                "payment-signature".to_string(),
+                "invalid".to_string(),
+            ));
+            assert_eq!(route(request, false).status_code, 400);
+        }
+
+        let mut paid = valid;
+        paid.headers.push(HeaderField(
+            "payment-signature".to_string(),
+            "upgrade".to_string(),
+        ));
+        assert_eq!(route(paid, false).status_code, 202);
     }
 
     #[test]
@@ -5421,7 +5866,7 @@ mod tests {
         set_test_env();
         set_env_value("FACILITATOR_DEBUG_COST", "1");
         let mut request = seller_credit_request();
-        request.url = format!("/seller-credit?seller={SELLER}&debugCost=1");
+        request.url = format!("/seller-credit?seller={SELLER}&amount=100&debugCost=1");
         let payload = seller_credit_payload("0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993");
         request.headers.push(HeaderField(
             "payment-signature".to_string(),
@@ -5463,7 +5908,6 @@ mod tests {
         let seller = normalize_evm_address("seller", SELLER).unwrap();
         clear_seller_credits();
         clear_credited_settlements();
-        remove_env_value("SELLER_CREDIT_TOPUP_AMOUNT");
         let record = SettlementRecord::settled(
             "0xtx".to_string(),
             seller.clone(),
@@ -5748,6 +6192,36 @@ mod hardening_tests {
         format!("0x{}", hex::encode(bytes))
     }
 
+    fn acceptance_challenge_request(seller: &str) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            url: format!("/seller-acceptance/challenge?seller={seller}"),
+            headers: vec![],
+            body: b"{}".to_vec(),
+            certificate_version: None,
+        }
+    }
+
+    fn acceptance_submission_request(
+        challenge: &SellerAcceptanceChallenge,
+        private_key: &str,
+    ) -> HttpRequest {
+        let submission = serde_json::json!({
+            "seller": challenge.seller,
+            "nonce": challenge.nonce,
+            "expiresAt": challenge.expires_at,
+            "message": challenge.message,
+            "signature": sign_message(private_key, &challenge.message),
+        });
+        HttpRequest {
+            method: "POST".to_string(),
+            url: "/seller-acceptance".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&submission).unwrap(),
+            certificate_version: None,
+        }
+    }
+
     fn sign_eip3009(body: &mut FacilitatorRequest) {
         let key = SigningKey::from_slice(&parse_hex(PAYER_PRIVATE_KEY, Some(32)).unwrap()).unwrap();
         let digest = crate::eip712::eip3009_digest(&body.payment_payload).unwrap();
@@ -5894,26 +6368,6 @@ mod hardening_tests {
             expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
         });
         channel
-    }
-
-    fn register_payment_intent_for_channel(channel: &BatchChannel) -> String {
-        let pending = channel.pending_request.as_ref().unwrap();
-        register_payment_intent_for_channel_amount(channel, &pending.signed_max_claimable)
-    }
-
-    fn register_payment_intent_for_channel_amount(channel: &BatchChannel, amount: &str) -> String {
-        let pending = channel.pending_request.as_ref().unwrap();
-        let intent_id = format!("intent-{}", pending.pending_id);
-        batch_create_payment_intent(
-            intent_id.clone(),
-            channel.channel_config.receiver.clone(),
-            channel.channel_config.payer.clone(),
-            "https://example.test/report".to_string(),
-            amount.to_string(),
-            channel.channel_config.salt.clone(),
-        )
-        .unwrap();
-        intent_id
     }
 
     fn test_batch_channel_config() -> crate::batch::BatchChannelConfig {
@@ -7224,7 +7678,6 @@ mod hardening_tests {
         assert_eq!(missing_delete.status, "unchanged");
         assert_eq!(missing_delete.current_revision, None);
 
-        register_payment_intent_for_channel(&channel);
         let created = batch_update_channel(
             channel_id.clone(),
             None,
@@ -7413,8 +7866,6 @@ mod hardening_tests {
         )
         .unwrap();
         let channel = test_initial_batch_channel(&channel_id, "100");
-        register_payment_intent_for_channel(&channel);
-
         let created = batch_update_channel(
             channel_id.clone(),
             None,
@@ -7682,7 +8133,6 @@ mod hardening_tests {
             config.salt = format!("0x{}", salt.repeat(32));
             let id = compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
             let channel = test_initial_batch_channel_for_config(&id, config, "100");
-            register_payment_intent_for_channel(&channel);
             let created = batch_update_channel(
                 id.clone(),
                 None,
@@ -7750,378 +8200,11 @@ mod hardening_tests {
                         replacement_config,
                         "100",
                     );
-                    register_payment_intent_for_channel(&channel);
                     channel
                 }),
             },
         );
         assert_eq!(replacement.status, "updated");
-    }
-
-    #[test]
-    fn batch_sqlite_admin_apis_manage_scope_seller_and_intent() {
-        clear_env_values();
-        let writer = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
-
-        let seller = batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
-        assert_eq!(seller.receiver_address, PAY_TO.to_ascii_lowercase());
-        assert_eq!(seller.status, "active");
-
-        let scope = batch_set_writer_receiver_scope(writer, PAY_TO.to_string(), true).unwrap();
-        assert_eq!(scope.writer_principal, writer);
-        assert_eq!(scope.receiver_address, PAY_TO.to_ascii_lowercase());
-        assert!(scope.enabled);
-        assert_eq!(batch_writer_receiver_scope_count(), 1);
-        let disabled = batch_set_seller(PAY_TO.to_string(), "disabled".to_string()).unwrap();
-        assert_eq!(disabled.status, "disabled");
-        assert_eq!(batch_writer_receiver_scope_count(), 0);
-        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
-        assert_eq!(batch_writer_receiver_scope_count(), 1);
-        assert_eq!(
-            batch_writer_receiver_scope(writer, PAY_TO.to_string()).unwrap(),
-            scope
-        );
-        assert_eq!(batch_writer_receiver_scopes(Some(10)).len(), 1);
-
-        let intent = batch_create_payment_intent(
-            "intent-1".to_string(),
-            PAY_TO.to_string(),
-            PAYER.to_string(),
-            "https://example.test/report".to_string(),
-            "100".to_string(),
-            format!("0x{}", "33".repeat(32)),
-        )
-        .unwrap();
-        assert_eq!(intent.receiver_address, PAY_TO.to_ascii_lowercase());
-        assert_eq!(intent.payer_address, PAYER.to_ascii_lowercase());
-        assert_eq!(intent.nonce, format!("0x{}", "33".repeat(32)));
-        assert_eq!(intent.status, "created");
-
-        let bound = batch_mark_payment_intent("intent-1".to_string(), "bound".to_string()).unwrap();
-        assert_eq!(bound.status, "bound");
-        let marked = batch_mark_payment_intent("intent-1".to_string(), "paid".to_string()).unwrap();
-        assert_eq!(marked.status, "paid");
-        assert_eq!(
-            batch_payment_intent("intent-1".to_string()).unwrap().status,
-            "paid"
-        );
-        assert_eq!(
-            batch_mark_payment_intent("intent-1".to_string(), "bound".to_string()).unwrap_err(),
-            "payment intent status transition is not allowed"
-        );
-        assert_eq!(
-            batch_mark_payment_intent("intent-1".to_string(), "cancelled".to_string()).unwrap_err(),
-            "payment intent status transition is not allowed"
-        );
-        assert_eq!(
-            batch_set_seller(PAY_TO.to_string(), "suspended".to_string()).unwrap_err(),
-            "seller status must be active or disabled"
-        );
-        assert_eq!(
-            batch_mark_payment_intent("intent-1".to_string(), "unknown".to_string()).unwrap_err(),
-            "payment intent status must be created, bound, paid, or cancelled"
-        );
-        assert_eq!(
-            batch_create_payment_intent(
-                "intent-bad".to_string(),
-                PAY_TO.to_string(),
-                PAYER.to_string(),
-                "https://example.test/report".to_string(),
-                "0".to_string(),
-                format!("0x{}", "33".repeat(32)),
-            )
-            .unwrap_err(),
-            "amount must be a positive integer"
-        );
-    }
-
-    #[test]
-    fn batch_channel_create_requires_matching_created_payment_intent() {
-        clear_batch_channels();
-        clear_env_values();
-        set_default_batch_channel_runtime_config();
-        let channel_id = compute_batch_channel_id(
-            &test_batch_channel_config(),
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        )
-        .unwrap();
-
-        let missing = test_initial_batch_channel(&channel_id, "100");
-        let result = batch_update_channel(
-            channel_id.clone(),
-            None,
-            BatchChannelUpdate {
-                channel: Some(missing),
-            },
-        );
-        assert_eq!(result.status, "invalid");
-        assert_eq!(
-            result.message,
-            Some("sqlite error: batch payment intent match must be unique".to_string())
-        );
-
-        let intent_mismatch_cases: [(&str, fn(&mut BatchPaymentIntent), &str); 5] = [
-            (
-                "101",
-                |intent: &mut BatchPaymentIntent| intent.status = "cancelled".to_string(),
-                "sqlite error: batch payment intent match must be unique",
-            ),
-            (
-                "102",
-                |intent: &mut BatchPaymentIntent| {
-                    intent.receiver_address = PAYER.to_ascii_lowercase()
-                },
-                "sqlite error: batch payment intent match must be unique",
-            ),
-            (
-                "103",
-                |intent: &mut BatchPaymentIntent| {
-                    intent.payer_address = PAY_TO.to_ascii_lowercase()
-                },
-                "sqlite error: batch payment intent match must be unique",
-            ),
-            (
-                "104",
-                |intent: &mut BatchPaymentIntent| intent.amount = "999".to_string(),
-                "sqlite error: batch payment intent match must be unique",
-            ),
-            (
-                "105",
-                |intent: &mut BatchPaymentIntent| intent.nonce = format!("0x{}", "44".repeat(32)),
-                "sqlite error: batch payment intent match must be unique",
-            ),
-        ];
-        for (amount, mutate, expected) in intent_mismatch_cases {
-            let channel = test_initial_batch_channel(&channel_id, amount);
-            let intent_id = register_payment_intent_for_channel(&channel);
-            TEST_BATCH_PAYMENT_INTENTS.with(|intents| {
-                mutate(intents.borrow_mut().get_mut(&intent_id).unwrap());
-            });
-            let result = batch_update_channel(
-                channel_id.clone(),
-                None,
-                BatchChannelUpdate {
-                    channel: Some(channel),
-                },
-            );
-            assert_eq!(result.status, "invalid");
-            assert_eq!(result.message, Some(expected.to_string()));
-        }
-
-        let channel = test_initial_batch_channel(&channel_id, "200");
-        let pending_id = channel.pending_request.as_ref().unwrap().pending_id.clone();
-        let intent_id = register_payment_intent_for_channel(&channel);
-        let created = batch_update_channel(
-            channel_id.clone(),
-            None,
-            BatchChannelUpdate {
-                channel: Some(channel),
-            },
-        );
-        assert_eq!(created.status, "updated");
-        assert_eq!(
-            batch_payment_intent(intent_id.clone()).unwrap().status,
-            "bound"
-        );
-        assert_eq!(
-            batch_payment_intent(intent_id.clone()).unwrap().pending_id,
-            Some(pending_id)
-        );
-        TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
-            let binding = bindings.borrow().get(&channel_id).cloned().unwrap();
-            assert_eq!(binding.0, PAY_TO.to_ascii_lowercase());
-            assert_eq!(binding.1, PAYER.to_ascii_lowercase());
-            assert_eq!(binding.3, intent_id);
-        });
-    }
-
-    #[test]
-    fn batch_channel_create_binding_conflict_leaves_intent_created() {
-        clear_batch_channels();
-        clear_env_values();
-        set_default_batch_channel_runtime_config();
-        let channel_id = compute_batch_channel_id(
-            &test_batch_channel_config(),
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        )
-        .unwrap();
-        let channel = test_initial_batch_channel(&channel_id, "200");
-        let intent_id = register_payment_intent_for_channel(&channel);
-        TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
-            bindings.borrow_mut().insert(
-                channel_id.clone(),
-                (
-                    PAY_TO.to_ascii_lowercase(),
-                    PAYER.to_ascii_lowercase(),
-                    JPYC_POLYGON_ADDRESS.to_ascii_lowercase(),
-                    "intent-existing".to_string(),
-                ),
-            );
-        });
-
-        let created = batch_update_channel(
-            channel_id.clone(),
-            None,
-            BatchChannelUpdate {
-                channel: Some(channel),
-            },
-        );
-        assert_eq!(created.status, "invalid");
-        assert_eq!(
-            created.message,
-            Some("sqlite error: batch channel binding already exists".to_string())
-        );
-        let intent = batch_payment_intent(intent_id).unwrap();
-        assert_eq!(intent.status, "created");
-        assert_eq!(intent.pending_id, None);
-        TEST_BATCH_CHANNEL_BINDINGS.with(|bindings| {
-            let binding = bindings.borrow().get(&channel_id).cloned().unwrap();
-            assert_eq!(binding.3, "intent-existing");
-        });
-    }
-
-    #[test]
-    fn batch_channel_existing_pending_binds_and_consumption_marks_intent_paid() {
-        clear_batch_channels();
-        clear_env_values();
-        set_default_batch_channel_runtime_config();
-        let channel_id = compute_batch_channel_id(
-            &test_batch_channel_config(),
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        )
-        .unwrap();
-
-        let initial = test_initial_batch_channel(&channel_id, "100");
-        let initial_intent_id = register_payment_intent_for_channel(&initial);
-        let created = batch_update_channel(
-            channel_id.clone(),
-            None,
-            BatchChannelUpdate {
-                channel: Some(initial),
-            },
-        );
-        assert_eq!(created.status, "updated");
-        assert_eq!(
-            batch_payment_intent(initial_intent_id.clone())
-                .unwrap()
-                .pending_id,
-            Some("request-100".to_string())
-        );
-
-        let consumed = batch_update_channel(
-            channel_id.clone(),
-            Some(1),
-            BatchChannelUpdate {
-                channel: Some(test_batch_channel(&channel_id, "100")),
-            },
-        );
-        assert_eq!(consumed.status, "updated");
-        assert_eq!(
-            batch_payment_intent(initial_intent_id).unwrap().status,
-            "paid"
-        );
-
-        let mut reserved = test_batch_channel(&channel_id, "100");
-        reserved.signed_max_claimable = "150".to_string();
-        reserved.signature = crate::batch::sign_batch_voucher_for_test(
-            &channel_id,
-            "150",
-            PAYER_PRIVATE_KEY,
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        );
-        reserved.pending_request = Some(crate::batch::BatchPendingRequest {
-            pending_id: "request-150".to_string(),
-            signed_max_claimable: "150".to_string(),
-            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
-        });
-        let reserved_intent_id = register_payment_intent_for_channel_amount(&reserved, "50");
-        let reserved_update = batch_update_channel(
-            channel_id.clone(),
-            Some(2),
-            BatchChannelUpdate {
-                channel: Some(reserved),
-            },
-        );
-        assert_eq!(reserved_update.status, "updated");
-        let reserved_intent = batch_payment_intent(reserved_intent_id).unwrap();
-        assert_eq!(reserved_intent.status, "bound");
-        assert_eq!(reserved_intent.pending_id, Some("request-150".to_string()));
-    }
-
-    #[test]
-    fn batch_channel_existing_pending_rejects_same_pending_mutation() {
-        clear_batch_channels();
-        clear_env_values();
-        set_default_batch_channel_runtime_config();
-        let channel_id = compute_batch_channel_id(
-            &test_batch_channel_config(),
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        )
-        .unwrap();
-        let initial = test_initial_batch_channel(&channel_id, "100");
-        let intent_id = register_payment_intent_for_channel(&initial);
-        let created = batch_update_channel(
-            channel_id.clone(),
-            None,
-            BatchChannelUpdate {
-                channel: Some(initial),
-            },
-        );
-        assert_eq!(created.status, "updated");
-
-        let mut amount_mutation = batch_channel(channel_id.clone()).unwrap();
-        amount_mutation.pending_request = Some(crate::batch::BatchPendingRequest {
-            pending_id: "request-100".to_string(),
-            signed_max_claimable: "150".to_string(),
-            expires_at: amount_mutation.pending_request.as_ref().unwrap().expires_at,
-        });
-        amount_mutation.signed_max_claimable = "150".to_string();
-        amount_mutation.signature = crate::batch::sign_batch_voucher_for_test(
-            &channel_id,
-            "150",
-            PAYER_PRIVATE_KEY,
-            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
-        );
-        let rejected_amount = batch_update_channel(
-            channel_id.clone(),
-            Some(1),
-            BatchChannelUpdate {
-                channel: Some(amount_mutation),
-            },
-        );
-        assert_eq!(rejected_amount.status, "invalid");
-        assert_eq!(
-            rejected_amount.message,
-            Some("batch channel pendingRequest must not change for the same pendingId".to_string())
-        );
-
-        let mut expiry_mutation = batch_channel(channel_id.clone()).unwrap();
-        let pending = expiry_mutation.pending_request.as_mut().unwrap();
-        pending.expires_at = pending.expires_at.saturating_add(1_000);
-        let rejected_expiry = batch_update_channel(
-            channel_id.clone(),
-            Some(1),
-            BatchChannelUpdate {
-                channel: Some(expiry_mutation),
-            },
-        );
-        assert_eq!(rejected_expiry.status, "invalid");
-        assert_eq!(
-            rejected_expiry.message,
-            Some("batch channel pendingRequest must not change for the same pendingId".to_string())
-        );
-
-        let intent = batch_payment_intent(intent_id).unwrap();
-        assert_eq!(intent.status, "bound");
-        assert_eq!(intent.pending_id, Some("request-100".to_string()));
-        assert_eq!(
-            batch_channel(channel_id)
-                .unwrap()
-                .pending_request
-                .unwrap()
-                .signed_max_claimable,
-            "100"
-        );
     }
 
     #[test]
@@ -8161,7 +8244,6 @@ mod hardening_tests {
             let channel_id =
                 compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
             let channel = test_initial_batch_channel_for_config(&channel_id, config, "100");
-            register_payment_intent_for_channel(&channel);
             let result = batch_update_channel(
                 channel_id,
                 None,
@@ -8410,6 +8492,39 @@ mod hardening_tests {
         assert!(!steps
             .iter()
             .any(|step| step["name"] == "settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn exact_settle_rejects_seller_without_current_acceptance() {
+        clear_settlement_state();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        let mut body = request_with_seller_auth();
+        sign_eip3009(&mut body);
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = true);
+
+        let response = run_ready(settle_http(settle_request(&body)));
+
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = false);
+        assert_eq!(response.status_code, 403);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["errorReason"], "seller_acceptance_required");
+    }
+
+    #[test]
+    fn batch_settle_rejects_seller_without_current_acceptance() {
+        clear_settlement_state();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = true);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = false);
+        assert_eq!(response.status_code, 403);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["errorReason"], "seller_acceptance_required");
     }
 
     #[test]
@@ -9070,6 +9185,406 @@ mod hardening_tests {
         assert_eq!(trace.steps.len(), 1);
         assert_eq!(trace.steps[0].name, "seller_credit.replace_config");
         assert_eq!(trace.steps[0].rpc_calls, 0);
+    }
+
+    #[test]
+    fn network_profile_is_atomic_and_rejects_mixed_contracts() {
+        clear_env_values();
+        let token = "0x1000000000000000000000000000000000000001";
+        let contract = "0x2000000000000000000000000000000000000002";
+        apply_network_profile("amoy", token, contract).unwrap();
+        assert_eq!(configured_network(), "eip155:80002");
+        assert!(same_address(&configured_token_address().unwrap(), token));
+        assert_eq!(configured_chain_id(), 80_002);
+        assert!(apply_network_profile("amoy", JPYC_POLYGON_ADDRESS, contract).is_err());
+    }
+
+    #[test]
+    fn polygon_profile_transition_rejects_preview_values_without_partial_apply() {
+        clear_env_values();
+        let token = "0x1000000000000000000000000000000000000001";
+        let contract = "0x2000000000000000000000000000000000000002";
+        apply_network_profile("amoy", token, contract).unwrap();
+        set_env_value("SELLER_SETTLEMENT_FEE_AMOUNT", "1");
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "1");
+        set_env_value("SELLER_TERMS_VERSION", "terms-draft");
+        set_env_value("PRIVACY_VERSION", "privacy-draft");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-draft");
+
+        let update = RuntimeProfileUpdate {
+            profile: "polygon".to_string(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: "1".to_string(),
+            batch_settlement_fee_amount: "1".to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-draft".to_string(),
+            asset_boundary_version: "asset-draft".to_string(),
+        };
+        assert!(set_runtime_profile(update).is_err());
+        assert_eq!(configured_network_profile().unwrap(), "amoy");
+        assert!(same_address(&configured_token_address().unwrap(), token));
+    }
+
+    #[test]
+    fn runtime_profile_validates_every_field_before_apply() {
+        clear_env_values();
+        let preview = RuntimeProfileUpdate {
+            profile: "amoy".to_string(),
+            token: "0x1000000000000000000000000000000000000001".to_string(),
+            batch_contract: "0x2000000000000000000000000000000000000002".to_string(),
+            seller_settlement_fee_amount: "1".to_string(),
+            batch_settlement_fee_amount: "1".to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-draft".to_string(),
+            asset_boundary_version: "asset-draft".to_string(),
+        };
+        set_runtime_profile(preview).unwrap();
+        let invalid = RuntimeProfileUpdate {
+            profile: "polygon".to_string(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: JPYC_ATOMIC_UNITS.to_string(),
+            batch_settlement_fee_amount: (10 * JPYC_ATOMIC_UNITS).to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+        };
+        assert!(set_runtime_profile(invalid).is_err());
+        assert_eq!(configured_network_profile().unwrap(), "amoy");
+        assert_eq!(env("SELLER_SETTLEMENT_FEE_AMOUNT").unwrap(), "1");
+
+        let production = RuntimeProfileUpdate {
+            profile: "polygon".to_string(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: JPYC_ATOMIC_UNITS.to_string(),
+            batch_settlement_fee_amount: (10 * JPYC_ATOMIC_UNITS).to_string(),
+            terms_version: "terms-v1".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+        };
+        set_runtime_profile(production).unwrap();
+        assert_eq!(configured_network_profile().unwrap(), "polygon");
+        assert_eq!(env("SELLER_TERMS_VERSION").unwrap(), "terms-v1");
+    }
+
+    #[test]
+    fn raw_set_env_cannot_bypass_atomic_runtime_profile() {
+        for name in [
+            "NETWORK_PROFILE",
+            "BATCH_SETTLEMENT_CONTRACT",
+            "SELLER_SETTLEMENT_FEE_AMOUNT",
+            "BATCH_SETTLEMENT_FEE_AMOUNT",
+            "SELLER_TERMS_VERSION",
+            "PRIVACY_VERSION",
+            "ASSET_BOUNDARY_VERSION",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| set_env(name.to_string(), "unsafe".to_string()))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn polygon_acceptance_never_treats_draft_versions_as_current() {
+        clear_env_values();
+        set_env_value("NETWORK_PROFILE", "polygon");
+        set_env_value(
+            "SELLER_SETTLEMENT_FEE_AMOUNT",
+            &JPYC_ATOMIC_UNITS.to_string(),
+        );
+        set_env_value(
+            "BATCH_SETTLEMENT_FEE_AMOUNT",
+            &(10 * JPYC_ATOMIC_UNITS).to_string(),
+        );
+        set_env_value("SELLER_TERMS_VERSION", "terms-draft");
+        set_env_value("PRIVACY_VERSION", "privacy-v1");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-v1");
+        let acceptance = SellerAcceptance {
+            seller: PAY_TO.to_string(),
+            status: "active".to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+            accepted_at: 1,
+            superseded: false,
+        };
+        assert!(!acceptance_versions_current(&acceptance));
+    }
+
+    #[test]
+    fn acceptance_message_binds_domain_versions_and_nonce() {
+        clear_env_values();
+        set_env_value("FACILITATOR_PUBLIC_ORIGIN", "https://facilitator.example");
+        set_env_value("SELLER_TERMS_VERSION", "terms-v2");
+        set_env_value("PRIVACY_VERSION", "privacy-v3");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-v4");
+        let message = seller_acceptance_message(PAY_TO, "0x1234", 1_700_000_300);
+        assert!(message.contains("canisterId=aaaaa-aa"));
+        assert!(message.contains("publicOrigin=https://facilitator.example"));
+        assert!(message.contains("chainId=137"));
+        assert!(message.contains("termsVersion=terms-v2"));
+        assert!(message.contains("privacyVersion=privacy-v3"));
+        assert!(message.contains("assetBoundaryVersion=asset-v4"));
+        assert!(message.contains("nonce=0x1234"));
+    }
+
+    #[test]
+    fn acceptance_challenge_reissue_replaces_previous_nonce() {
+        clear_seller_acceptance_challenges();
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let first_response =
+            seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let first: SellerAcceptanceChallenge =
+            serde_json::from_slice(&first_response.body).unwrap();
+        let second_response =
+            seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let second: SellerAcceptanceChallenge =
+            serde_json::from_slice(&second_response.body).unwrap();
+
+        assert_ne!(first.nonce, second.nonce);
+        assert_eq!(
+            SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().len()),
+            1
+        );
+        let rejected = seller_acceptance_submit_http(&acceptance_submission_request(
+            &first,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(rejected.status_code, 400);
+        let stored = SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+            items
+                .borrow()
+                .get(&seller)
+                .map(decode_seller_acceptance_challenge)
+                .unwrap()
+        });
+        assert_eq!(stored.nonce, second.nonce);
+    }
+
+    #[test]
+    fn acceptance_challenge_capacity_is_bounded_and_reclaims_expired_entries() {
+        clear_seller_acceptance_challenges();
+        let now = now_seconds();
+        for index in 1..=MAX_SELLER_ACCEPTANCE_CHALLENGES {
+            let seller = format!("0x{index:040x}");
+            let challenge = SellerAcceptanceChallenge {
+                seller: seller.clone(),
+                nonce: format!("0x{index:064x}"),
+                expires_at: now + 300,
+                message: "active".to_string(),
+            };
+            SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+                items
+                    .borrow_mut()
+                    .insert(seller, encode_seller_acceptance_challenge(&challenge));
+            });
+        }
+        let next_seller = format!("0x{:040x}", MAX_SELLER_ACCEPTANCE_CHALLENGES + 1);
+        let full = seller_acceptance_challenge_http(&acceptance_challenge_request(&next_seller));
+        assert_eq!(full.status_code, 429);
+
+        let expired_seller = "0x0000000000000000000000000000000000000001".to_string();
+        SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+            let expired = SellerAcceptanceChallenge {
+                seller: expired_seller.clone(),
+                nonce: format!("0x{:064x}", 1),
+                expires_at: now - 1,
+                message: "expired".to_string(),
+            };
+            items
+                .borrow_mut()
+                .insert(expired_seller, encode_seller_acceptance_challenge(&expired));
+        });
+        let reclaimed =
+            seller_acceptance_challenge_http(&acceptance_challenge_request(&next_seller));
+        assert_eq!(reclaimed.status_code, 200);
+        assert_eq!(
+            SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().len()),
+            MAX_SELLER_ACCEPTANCE_CHALLENGES
+        );
+    }
+
+    #[test]
+    fn acceptance_challenge_success_and_expiry_consume_transient_state() {
+        clear_seller_acceptance_challenges();
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let response = seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let challenge: SellerAcceptanceChallenge = serde_json::from_slice(&response.body).unwrap();
+        let accepted = seller_acceptance_submit_http(&acceptance_submission_request(
+            &challenge,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(accepted.status_code, 200);
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+
+        let expired = SellerAcceptanceChallenge {
+            seller: seller.clone(),
+            nonce: format!("0x{}", "ab".repeat(32)),
+            expires_at: now_seconds() - 1,
+            message: seller_acceptance_message(
+                &seller,
+                &format!("0x{}", "ab".repeat(32)),
+                now_seconds() - 1,
+            ),
+        };
+        SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+            items
+                .borrow_mut()
+                .insert(seller.clone(), encode_seller_acceptance_challenge(&expired));
+        });
+        let rejected = seller_acceptance_submit_http(&acceptance_submission_request(
+            &expired,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(rejected.status_code, 410);
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+    }
+
+    #[test]
+    fn upgrade_cleanup_removes_challenges_but_keeps_acceptances() {
+        clear_seller_acceptance_challenges();
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let challenge = SellerAcceptanceChallenge {
+            seller: seller.clone(),
+            nonce: format!("0x{}", "cd".repeat(32)),
+            expires_at: now_seconds() + 300,
+            message: "pending".to_string(),
+        };
+        SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+            items.borrow_mut().insert(
+                seller.clone(),
+                encode_seller_acceptance_challenge(&challenge),
+            );
+        });
+        let acceptance = SellerAcceptance {
+            seller: seller.clone(),
+            status: "active".to_string(),
+            terms_version: "terms-v1".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+            accepted_at: now_seconds(),
+            superseded: false,
+        };
+        SELLER_ACCEPTANCES.with(|items| {
+            items
+                .borrow_mut()
+                .insert(seller.clone(), encode_stable(&acceptance));
+        });
+
+        finalize_post_upgrade_state();
+
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+        assert!(SELLER_ACCEPTANCES.with(|items| items.borrow().contains_key(&seller)));
+    }
+
+    #[test]
+    fn seller_settlement_history_is_filtered_and_newest_first() {
+        clear_settlements();
+        SELLER_SETTLEMENT_INDEX.with(|items| {
+            let keys = items
+                .borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            let mut items = items.borrow_mut();
+            for key in keys {
+                items.remove(&key);
+            }
+        });
+        insert_settlement(
+            "older",
+            SettlementRecord::settled(
+                "0x1".to_string(),
+                PAYER.to_string(),
+                PAY_TO.to_string(),
+                "10".to_string(),
+                10,
+                60,
+            ),
+        );
+        insert_settlement(
+            "newer",
+            SettlementRecord::settled(
+                "0x2".to_string(),
+                PAYER.to_string(),
+                PAY_TO.to_string(),
+                "20".to_string(),
+                20,
+                60,
+            ),
+        );
+        let page = seller_settlements_page(&PAY_TO.to_ascii_lowercase(), None, 20);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
+    }
+
+    #[test]
+    fn seller_settlement_index_is_backfilled_from_existing_stable_records() {
+        clear_settlements();
+        SELLER_SETTLEMENT_INDEX.with(|items| {
+            let keys = items
+                .borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            let mut items = items.borrow_mut();
+            for key in keys {
+                items.remove(&key);
+            }
+        });
+        let record = SettlementRecord::settled(
+            "0x1".to_string(),
+            PAYER.to_string(),
+            PAY_TO.to_string(),
+            "10".to_string(),
+            10,
+            60,
+        );
+        SETTLEMENTS.with(|items| {
+            items
+                .borrow_mut()
+                .insert("legacy".to_string(), encode_stable(&record));
+        });
+
+        rebuild_seller_settlement_index();
+
+        let page = seller_settlements_page(&PAY_TO.to_ascii_lowercase(), None, 20);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].key, "legacy");
+    }
+
+    #[test]
+    fn polygon_profile_rejects_draft_legal_versions_and_below_floor_fees() {
+        set_env_value("NETWORK_PROFILE", "polygon");
+        assert!(validate_env_update("SELLER_TERMS_VERSION", "2026-07-13-draft").is_err());
+        assert!(validate_env_update("PRIVACY_VERSION", "").is_err());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "999").is_err());
+        assert!(validate_env_update("BATCH_SETTLEMENT_FEE_AMOUNT", "999").is_err());
+        assert!(validate_env_update("SELLER_TERMS_VERSION", "2026-07-13").is_ok());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "1000000000000000000").is_ok());
+    }
+
+    #[test]
+    fn amoy_profile_allows_draft_versions_and_test_fees() {
+        set_env_value("NETWORK_PROFILE", "amoy");
+        set_env_value(
+            "AMOY_JPYC_ADDRESS",
+            "0x1000000000000000000000000000000000000001",
+        );
+        set_env_value(
+            "AMOY_BATCH_SETTLEMENT_CONTRACT",
+            "0x2000000000000000000000000000000000000002",
+        );
+        assert!(validate_env_update("SELLER_TERMS_VERSION", "2026-07-13-draft").is_ok());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "1").is_ok());
     }
 }
 

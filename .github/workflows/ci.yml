@@ -24,6 +24,13 @@ jobs:
       - run: cargo clippy -p jpyc_x402_facilitator -- -D warnings
       - run: npm test
       - run: npm run build
+        env:
+          VITE_APP_ENV: preview
+          VITE_CHAIN_ID: "80002"
+          VITE_FACILITATOR_URL: https://preview.invalid
+          VITE_SELLER_TERMS_VERSION: 2026-07-13-draft
+          VITE_PRIVACY_VERSION: 2026-07-13-draft
+          VITE_ASSET_BOUNDARY_VERSION: 2026-07-13-draft
       - run: npm audit --audit-level=high
       - run: cargo install candid-extractor --version 0.1.6 --locked
       - run: npm run did:generate

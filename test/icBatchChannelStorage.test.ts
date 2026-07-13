@@ -67,18 +67,8 @@ describe("IcBatchChannelStorage", () => {
       pending_id: "text",
       signed_max_claimable: "text"
     });
-    expect(recordFields(did, "BatchPaymentIntent")).toEqual({
-      amount: "text",
-      created_at: "nat64",
-      intent_id: "text",
-      nonce: "text",
-      payer_address: "text",
-      pending_id: "opt text",
-      receiver_address: "text",
-      resource_url: "text",
-      status: "text",
-      updated_at: "nat64"
-    });
+    expect(did).not.toContain("BatchPaymentIntent");
+    expect(did).not.toContain("batch_create_payment_intent");
   });
 
   it("implements get/list/updateChannel over the canister CAS API", async () => {

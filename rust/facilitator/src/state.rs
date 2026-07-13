@@ -2,7 +2,6 @@
 use candid::{CandidType, Deserialize as CandidDeserialize};
 
 use crate::facilitator::{failed_settlement, successful_settlement};
-use crate::hexutil::NETWORK;
 use crate::rpc::BatchChannelSnapshot;
 use crate::types::SettleResponse;
 
@@ -95,7 +94,12 @@ impl SettlementRecord {
         now: u64,
         ttl: u64,
     ) -> Self {
-        let mut response = failed_settlement(NETWORK, "settlement_failed", &message, Some(payer));
+        let mut response = failed_settlement(
+            &crate::configured_network(),
+            "settlement_failed",
+            &message,
+            Some(payer),
+        );
         response.transaction = tx;
         Self::new("failed", response, Some(pay_to), now, ttl)
     }
@@ -156,7 +160,8 @@ fn pending_response(
     payer: String,
     amount: String,
 ) -> SettleResponse {
-    let mut response = failed_settlement(NETWORK, reason, message, Some(payer));
+    let mut response =
+        failed_settlement(&crate::configured_network(), reason, message, Some(payer));
     response.transaction = tx.to_string();
     response.amount = Some(amount);
     response

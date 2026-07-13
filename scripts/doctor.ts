@@ -34,9 +34,8 @@ const CANISTER_ENVS = [
   FACILITATOR_SIGNER_ENV,
   "FACILITATOR_PUBLIC_ORIGIN",
   "JPYC_EIP712_VERSION",
-  "POLYGON_RPC_SERVICES",
+  "POLYGON_RPC_URL",
   "SELLER_CREDIT_PAY_TO",
-  "SELLER_CREDIT_TOPUP_AMOUNT",
   "SELLER_SETTLEMENT_FEE_AMOUNT"
 ];
 const BUYER_ENVS = [BUYER_SIGNER_ENV, "JPYC_EIP712_VERSION", "POLYGON_RPC_URL", "SELLER_EVM_ADDRESS", "X402_TARGET_URL"];
@@ -134,10 +133,6 @@ export function isHttpsOrigin(value: string): boolean {
     return false;
   }
 }
-export function isSingleHttpsRpcServices(value: string): boolean {
-  const services = value.split(",").map((item) => item.trim()).filter((item) => item !== "");
-  return services.length === 1 && isHttpsOrigin(services[0] ?? "");
-}
 export function isPositiveIntegerString(value: string): boolean {
   return /^[1-9][0-9]*$/.test(value);
 }
@@ -151,9 +146,8 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   const maxGas = env.FACILITATOR_MAX_GAS;
   const maxSettlementFeeWei = env.FACILITATOR_MAX_SETTLEMENT_FEE_WEI;
   const publicOrigin = env.FACILITATOR_PUBLIC_ORIGIN;
-  const rpcServices = env.POLYGON_RPC_SERVICES;
+  const rpcUrl = env.POLYGON_RPC_URL;
   const sellerCreditPayTo = env.SELLER_CREDIT_PAY_TO;
-  const sellerCreditTopupAmount = env.SELLER_CREDIT_TOPUP_AMOUNT;
   const sellerSettlementFeeAmount = env.SELLER_SETTLEMENT_FEE_AMOUNT;
   const settleTimeout = env.SETTLE_CONFIRMATION_TIMEOUT_SECONDS;
   const settleMinConfirmations = env.SETTLE_MIN_CONFIRMATIONS;
@@ -174,17 +168,14 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   if (publicOrigin && !isHttpsOrigin(publicOrigin)) {
     checks.push(fail("env-format:FACILITATOR_PUBLIC_ORIGIN", "HTTPS origin ではない"));
   }
-  if (rpcServices && !isSingleHttpsRpcServices(rpcServices)) {
-    checks.push(fail("env-format:POLYGON_RPC_SERVICES", "単一 HTTPS RPC URL ではない"));
+  if (rpcUrl && !isPolygonRpcUrl(rpcUrl)) {
+    checks.push(fail("env-format:POLYGON_RPC_URL", "userinfo/fragment なしの HTTPS URL ではない"));
   }
   if (sellerCreditPayTo && (!isEvmAddress(sellerCreditPayTo) || isZeroAddress(sellerCreditPayTo))) {
     checks.push(fail("env-format:SELLER_CREDIT_PAY_TO", "non-zero 0x-prefixed 20-byte EVM address ではない"));
   }
-  if (sellerCreditTopupAmount && !isPositiveIntegerString(sellerCreditTopupAmount)) {
-    checks.push(fail("env-format:SELLER_CREDIT_TOPUP_AMOUNT", "正の integer string ではない"));
-  }
-  if (sellerSettlementFeeAmount && !isPositiveIntegerString(sellerSettlementFeeAmount)) {
-    checks.push(fail("env-format:SELLER_SETTLEMENT_FEE_AMOUNT", "正の integer string ではない"));
+  if (sellerSettlementFeeAmount && (!isPositiveIntegerString(sellerSettlementFeeAmount) || BigInt(sellerSettlementFeeAmount) < 10n ** 18n)) {
+    checks.push(fail("env-format:SELLER_SETTLEMENT_FEE_AMOUNT", "1 JPYC (1e18 atomic units) 以上の integer string ではない"));
   }
   if (settleTimeout && !isPositiveIntegerString(settleTimeout)) {
     checks.push(fail("env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "正の integer string ではない"));

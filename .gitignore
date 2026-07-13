@@ -17,10 +17,12 @@ dist/*
 !.env.example
 .dev.vars
 .dev.vars.*
+.amoy/
 
 # Cloudflare local state/config
 .wrangler/
-wrangler.jsonc
+web/dist/
+/wrangler.jsonc
 
 # Logs and OS files
 *.log
