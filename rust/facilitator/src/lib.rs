@@ -534,8 +534,8 @@ fn required_positive_u128_value(name: &str, value: &str) -> Result<u128, String>
 fn apply_network_profile(profile: &str, token: &str, batch_contract: &str) -> Result<(), String> {
     match profile {
         "polygon" => {
-            if !same_address(&token, JPYC_POLYGON_ADDRESS)
-                || !same_address(&batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
+            if !same_address(token, JPYC_POLYGON_ADDRESS)
+                || !same_address(batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
             {
                 return Err(
                     "polygon profile requires the pinned JPYC and official batch contract"
@@ -550,8 +550,8 @@ fn apply_network_profile(profile: &str, token: &str, batch_contract: &str) -> Re
             );
         }
         "amoy" => {
-            let token = normalize_evm_address("token", &token)?;
-            let batch_contract = normalize_evm_address("batch_contract", &batch_contract)?;
+            let token = normalize_evm_address("token", token)?;
+            let batch_contract = normalize_evm_address("batch_contract", batch_contract)?;
             if same_address(&token, JPYC_POLYGON_ADDRESS)
                 || same_address(&batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
             {
@@ -3477,9 +3477,9 @@ fn configured_batch_settlement_contract() -> Result<String, String> {
         CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string()
     };
     if !same_address(&normalized, &expected) {
-        return Err(format!(
-            "BATCH_SETTLEMENT_CONTRACT does not match the selected NETWORK_PROFILE"
-        ));
+        return Err(
+            "BATCH_SETTLEMENT_CONTRACT does not match the selected NETWORK_PROFILE".to_string(),
+        );
     }
     Ok(normalized)
 }
@@ -4069,7 +4069,7 @@ fn seller_acceptance(seller: String) -> Option<SellerAcceptance> {
 fn current_seller_acceptance(seller: &str) -> Option<SellerAcceptance> {
     SELLER_ACCEPTANCES
         .with(|items| items.borrow().get(&seller.to_string()))
-        .map(|bytes| decode_stable::<SellerAcceptance>(bytes))
+        .map(decode_stable::<SellerAcceptance>)
         .map(|mut value| {
             value.superseded = !acceptance_versions_current(&value);
             value

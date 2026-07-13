@@ -16,6 +16,7 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
+          components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - run: npm ci
       - run: npm run lint:hidden-unicode

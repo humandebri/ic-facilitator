@@ -599,7 +599,7 @@ async fn rpc_value(config: &RpcConfig, method: &str, params: Value) -> Result<Va
 
 fn parse_rpc_value(method: &str, text: &str) -> Result<Value, String> {
     let value: Value =
-        serde_json::from_str(&text).map_err(|_| format!("invalid rpc json: {text}"))?;
+        serde_json::from_str(text).map_err(|_| format!("invalid rpc json: {text}"))?;
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || value.get("id").and_then(Value::as_u64) != Some(1)
     {
