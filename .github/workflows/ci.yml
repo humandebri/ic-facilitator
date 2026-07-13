@@ -16,6 +16,7 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - run: npm ci
