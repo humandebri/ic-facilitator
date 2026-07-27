@@ -29,6 +29,7 @@ pub const MAX_BATCH_CHANNELS_STORED: u64 = MAX_BATCH_CHANNELS_LIST as u64;
 pub const MAX_BATCH_CHANNELS_STORED: u64 = 2;
 pub const MAX_BATCH_CHANNEL_ID_BYTES: usize = 32;
 pub const MAX_BATCH_STRING_BYTES: usize = 512;
+pub const MAX_BATCH_CLAIMS: usize = 100;
 
 const DOMAIN_TYPE: &str =
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
@@ -365,6 +366,7 @@ pub fn validate_batch_settle_request_with_charged(
         return Err("x402Version must be 2".to_string());
     }
     let payload = batch_payload(&request.payment_payload.payload)?;
+    validate_batch_claim_count(&payload)?;
     validate_payload_metadata(&request.payment_payload)?;
     validate_payload_kind_fields(&payload)?;
     match payload.kind.as_str() {
@@ -696,6 +698,19 @@ fn validate_deposit_authorization(deposit: &BatchDeposit) -> Result<(), String> 
 
 pub fn batch_payload(value: &Value) -> Result<BatchRequestPayload, String> {
     serde_json::from_value(value.clone()).map_err(|err| format!("invalid batch payload: {err}"))
+}
+
+pub fn validate_batch_claim_count(payload: &BatchRequestPayload) -> Result<(), String> {
+    if payload
+        .claims
+        .as_ref()
+        .is_some_and(|claims| claims.len() > MAX_BATCH_CLAIMS)
+    {
+        return Err(format!(
+            "batch claims exceed the maximum of {MAX_BATCH_CLAIMS}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn voucher_channel_id(payload: &BatchRequestPayload) -> Result<&str, String> {
@@ -1222,7 +1237,7 @@ fn erc3009_domain_separator(requirements: &PaymentRequirements) -> Result<[u8; 3
     encoded.extend_from_slice(&keccak256(DOMAIN_TYPE.as_bytes()));
     encoded.extend_from_slice(&keccak256(name.as_bytes()));
     encoded.extend_from_slice(&keccak256(version.as_bytes()));
-    encoded.extend_from_slice(&u256_word(137));
+    encoded.extend_from_slice(&u256_word(crate::configured_chain_id() as u128));
     encoded.extend_from_slice(&address_word(&verifying_contract));
     Ok(keccak256(&encoded))
 }
@@ -1240,8 +1255,10 @@ fn deposit_authorization_hash(
     let value = parse_u256_decimal(amount, "deposit.amount")?;
     let valid_after = parse_u256_decimal(&authorization.valid_after, "validAfter")?;
     let valid_before = parse_u256_decimal(&authorization.valid_before, "validBefore")?;
-    let nonce =
+    let channel_id = channel_config_hash(config)?;
+    let salt =
         parse_hex(&authorization.salt, Some(32)).map_err(|err| format!("deposit salt: {err}"))?;
+    let nonce = deposit_authorization_nonce(&channel_id, &salt);
     let mut encoded = Vec::with_capacity(224);
     encoded.extend_from_slice(&keccak256(RECEIVE_WITH_AUTHORIZATION_TYPE.as_bytes()));
     encoded.extend_from_slice(&address_word(&from));
@@ -1253,13 +1270,20 @@ fn deposit_authorization_hash(
     Ok(keccak256(&encoded))
 }
 
+fn deposit_authorization_nonce(channel_id: &[u8], salt: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(64);
+    input.extend_from_slice(channel_id);
+    input.extend_from_slice(salt);
+    keccak256(&input)
+}
+
 fn batch_domain_separator(contract: &str) -> Result<[u8; 32], String> {
     let verifying_contract = parse_address(contract, "BATCH_SETTLEMENT_CONTRACT")?;
     let mut encoded = Vec::with_capacity(160);
     encoded.extend_from_slice(&keccak256(DOMAIN_TYPE.as_bytes()));
     encoded.extend_from_slice(&keccak256(BATCH_DOMAIN_NAME.as_bytes()));
     encoded.extend_from_slice(&keccak256(BATCH_DOMAIN_VERSION.as_bytes()));
-    encoded.extend_from_slice(&u256_word(137));
+    encoded.extend_from_slice(&u256_word(crate::configured_chain_id() as u128));
     encoded.extend_from_slice(&address_word(&verifying_contract));
     Ok(keccak256(&encoded))
 }
@@ -2018,6 +2042,20 @@ mod tests {
     }
 
     #[test]
+    fn batch_claim_count_is_bounded_at_one_hundred() {
+        let request = claim_request("100", "75", PAYER_PRIVATE_KEY);
+        let mut payload = batch_payload(&request.payment_payload.payload).unwrap();
+        let claim = payload.claims.as_ref().unwrap()[0].clone();
+        payload.claims = Some(vec![claim.clone(); MAX_BATCH_CLAIMS]);
+        assert!(validate_batch_claim_count(&payload).is_ok());
+        payload.claims = Some(vec![claim; MAX_BATCH_CLAIMS + 1]);
+        assert_eq!(
+            validate_batch_claim_count(&payload),
+            Err("batch claims exceed the maximum of 100".to_string())
+        );
+    }
+
+    #[test]
     fn batch_deposit_requires_eip3009_authorization_before_rpc() {
         let mut deposit = request("25", PAYER_PRIVATE_KEY);
         set_deposit_payload(&mut deposit, "100");
@@ -2284,4 +2322,16 @@ mod tests {
             "invalid_batch_settlement_evm_eip712_version"
         );
     }
+}
+#[test]
+fn deposit_nonce_matches_official_sdk_abi_encoding_fixture() {
+    let channel_id = [0x11; 32];
+    let salt = [0x22; 32];
+    assert_eq!(
+        format!(
+            "0x{}",
+            hex::encode(deposit_authorization_nonce(&channel_id, &salt))
+        ),
+        "0x3e92e0db88d6afea9edc4eedf62fffa4d92bcdfc310dccbe943747fe8302e871"
+    );
 }

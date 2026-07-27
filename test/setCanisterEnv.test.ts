@@ -14,7 +14,7 @@ function fakeIcpDir(): { readonly dir: string; readonly logPath: string } {
   const dir = mkdtempSync(join(tmpdir(), "ic-facilitator-env-"));
   const logPath = join(dir, "icp.log");
   const fakeIcp = join(dir, "icp");
-  writeFileSync(fakeIcp, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$ICP_FAKE_LOG\"\n");
+  writeFileSync(fakeIcp, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$ICP_FAKE_LOG\"\nif [[ \"$*\" == *\"set_runtime_configuration\"* ]]; then printf '%s\\n' \"${ICP_FAKE_RESULT:-(variant { ok })}\"; fi\n");
   chmodSync(fakeIcp, 0o755);
   return { dir, logPath };
 }
@@ -353,6 +353,7 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).toContain('set_env ("SELLER_CREDIT_PAY_TO", "0x2000000000000000000000000000000000000402")');
       expect(log).not.toContain('set_env ("SELLER_CREDIT_TOPUP_AMOUNT"');
       expect(log).toContain('seller_settlement_fee_amount = "1000000000000000000"');
+      expect(log).toContain("claim_fee_schedule = null");
       expect(log).toContain('terms_version = "2026-07-13"');
       expect(log).not.toContain("JPYC_POLYGON_ADDRESS");
       expect(log).toContain('set_env ("FACILITATOR_MAX_GAS", "500000")');
@@ -364,6 +365,36 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).not.toContain('set_env ("BATCH_SETTLEMENT_CONTRACT"');
       expect(log).not.toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS"');
       expect(log).not.toContain('set_env ("BATCH_SETTLEMENT_FEE_AMOUNT"');
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it("fails when the atomic runtime configuration returns a Candid err variant", () => {
+    const { dir, logPath } = fakeIcpDir();
+    try {
+      const result = spawnSync("bash", ["scripts/set_canister_env.sh", "local"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
+          ICP_FAKE_LOG: logPath,
+          ICP_FAKE_RESULT: '(variant { err = "invalid schedule" })',
+          JPYC_EIP712_VERSION: "1",
+          POLYGON_RPC_URL: "https://polygon.example",
+          SELLER_CREDIT_PAY_TO: sellerCreditPayTo,
+          SELLER_SETTLEMENT_FEE_AMOUNT: "1000000000000000000",
+          SELLER_TERMS_VERSION: "2026-07-13",
+          PRIVACY_VERSION: "2026-07-13",
+          ASSET_BOUNDARY_VERSION: "2026-07-13",
+          PATH: `${dir}:${process.env.PATH ?? ""}`,
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("canister update returned a Candid error");
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
@@ -432,7 +463,7 @@ describe("set_canister_env facilitator validation", () => {
       expect(log).toContain(`set_env ("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "${batchReceiverAuthorizerKey}")`);
       expect(log).toContain(`batch_contract = "${batchSettlementContract}"`);
       expect(log).toContain('set_env ("BATCH_WITHDRAW_DELAY_SECONDS", "900")');
-      expect(log).toContain('batch_settlement_fee_amount = "10000000000000000000"');
+      expect(log).toContain('claim_fee_amount = "10000000000000000000"');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }

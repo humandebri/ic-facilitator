@@ -35,6 +35,26 @@ const batchEnvNamesOutput = `(
   vec { "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"; "BATCH_SETTLEMENT_CONTRACT"; "BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_WITHDRAW_DELAY_SECONDS"; },
 )`;
 const readinessChannelId = `0x${"00".repeat(32)}`;
+const claimFeeScheduleEnv = {
+  BATCH_CLAIM_1_FEE_AMOUNT: "11000000000000000000",
+  BATCH_CLAIM_10_FEE_AMOUNT: "12000000000000000000",
+  BATCH_CLAIM_50_FEE_AMOUNT: "13000000000000000000",
+  BATCH_CLAIM_100_FEE_AMOUNT: "14000000000000000000",
+  BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT: "21000000000000000000",
+  BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT: "22000000000000000000",
+  BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT: "23000000000000000000",
+  BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT: "24000000000000000000",
+} as const;
+const claimFeeScheduleOutput = `(opt record {
+  claim_1_fee_amount = "11000000000000000000";
+  claim_10_fee_amount = "12000000000000000000";
+  claim_50_fee_amount = "13000000000000000000";
+  claim_100_fee_amount = "14000000000000000000";
+  refund_with_claim_1_fee_amount = "21000000000000000000";
+  refund_with_claim_10_fee_amount = "22000000000000000000";
+  refund_with_claim_50_fee_amount = "23000000000000000000";
+  refund_with_claim_100_fee_amount = "24000000000000000000";
+})`;
 
 const settledAbi = parseAbi([
   "event Settled(address indexed receiver,address indexed token,address indexed sender,uint128 amount)"
@@ -350,6 +370,9 @@ function batchStorageQueryOutput(args: readonly string[]): { readonly output: st
   if (args.includes("batch_settlement_fee_amount")) {
     return { output: `(opt "10000000000000000000")`, status: 0 };
   }
+  if (args.includes("batch_claim_fee_schedule")) {
+    return { output: "(null)", status: 0 };
+  }
   if (args.includes("batch_channel_count")) {
     return { output: "(0 : nat64)", status: 0 };
   }
@@ -412,6 +435,43 @@ function batchDeletedChannelRecord(id = channelId): string {
 }
 
 describe("batch production readiness", () => {
+  it("compares configured claim fees with the exact Candid schedule field names", async () => {
+    const configuredEnv = { ...env(), ...claimFeeScheduleEnv };
+    const commandRunner = (command: string, args: readonly string[], cwd = "") => {
+      if (command === "icp" && args.includes("batch_claim_fee_schedule")) {
+        return { output: claimFeeScheduleOutput, status: 0 };
+      }
+      return passingCommandRunner(command, args, cwd);
+    };
+    const report = await buildBatchProductionReadinessReport({
+      batchPreflightReader: preflightReader,
+      commandRunner,
+      env: configuredEnv,
+      fileReader: fileReader(),
+      fetchFn: fetchForBatchSupported(),
+      requireBatchReceipt: false,
+    });
+    expect(report.stages.find((stage) => stage.name === "canister:batch-claim-fee-schedule")).toEqual({
+      detail: "edge@ic claim fee schedule matches",
+      name: "canister:batch-claim-fee-schedule",
+      status: "ok",
+    });
+
+    const mismatch = await buildBatchProductionReadinessReport({
+      batchPreflightReader: preflightReader,
+      commandRunner,
+      env: { ...configuredEnv, BATCH_CLAIM_50_FEE_AMOUNT: "13000000000000000001" },
+      fileReader: fileReader(),
+      fetchFn: fetchForBatchSupported(),
+      requireBatchReceipt: false,
+    });
+    expect(mismatch.stages.find((stage) => stage.name === "canister:batch-claim-fee-schedule")).toEqual({
+      detail: "claim_50_fee_amount: expected 13000000000000000001, got 13000000000000000000",
+      name: "canister:batch-claim-fee-schedule",
+      status: "fail",
+    });
+  });
+
   it("keeps the committed DID as a constructorless service", () => {
     const did = didBytes.toString("utf8");
     expect(did).toContain("service : {");
@@ -546,7 +606,7 @@ describe("batch production readiness", () => {
     });
     expect(missing.ready).toBe(false);
     expect(missing.stages).toContainEqual({
-      detail: "BATCH_SETTLEMENT_FEE_AMOUNT is required",
+      detail: "effective claim-100 fee is required",
       name: "batch:settlement-fee",
       status: "fail"
     });
@@ -561,7 +621,7 @@ describe("batch production readiness", () => {
     });
     expect(invalid.ready).toBe(false);
     expect(invalid.stages).toContainEqual({
-      detail: "BATCH_SETTLEMENT_FEE_AMOUNT must be a positive integer string",
+      detail: "effective claim-100 fee must be a positive integer string",
       name: "batch:settlement-fee",
       status: "fail"
     });
@@ -577,7 +637,7 @@ describe("batch production readiness", () => {
     });
     expect(overflow.ready).toBe(false);
     expect(overflow.stages).toContainEqual({
-      detail: "BATCH_SETTLEMENT_FEE_AMOUNT must fit uint128",
+      detail: "effective claim-100 fee must fit uint128",
       name: "batch:settlement-fee",
       status: "fail"
     });

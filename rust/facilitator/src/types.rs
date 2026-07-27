@@ -236,6 +236,10 @@ pub fn json_response(status_code: u16, value: &impl Serialize) -> HttpResponse {
             HeaderField("content-type".to_string(), "application/json".to_string()),
             HeaderField("cache-control".to_string(), "no-store".to_string()),
             HeaderField("access-control-allow-origin".to_string(), "*".to_string()),
+            HeaderField(
+                "access-control-expose-headers".to_string(),
+                "payment-required, payment-response".to_string(),
+            ),
         ],
         body,
         upgrade: None,
@@ -252,6 +256,10 @@ pub fn text_response(status_code: u16, text: &str) -> HttpResponse {
             ),
             HeaderField("cache-control".to_string(), "no-store".to_string()),
             HeaderField("access-control-allow-origin".to_string(), "*".to_string()),
+            HeaderField(
+                "access-control-expose-headers".to_string(),
+                "payment-required, payment-response".to_string(),
+            ),
         ],
         body: text.as_bytes().to_vec(),
         upgrade: None,
@@ -294,5 +302,19 @@ mod tests {
         assert_eq!(value["extra"]["settlementKey"], "0xabc");
         assert_eq!(value["extra"]["chargedAmount"], "7");
         assert_eq!(value["extra"]["channelState"]["balance"], "1000");
+    }
+
+    #[test]
+    fn browser_responses_expose_x402_headers() {
+        for response in [
+            json_response(200, &serde_json::json!({ "ok": true })),
+            text_response(200, "ok"),
+        ] {
+            assert!(response.headers.iter().any(|header| {
+                header.0 == "access-control-expose-headers"
+                    && header.1.contains("payment-required")
+                    && header.1.contains("payment-response")
+            }));
+        }
     }
 }

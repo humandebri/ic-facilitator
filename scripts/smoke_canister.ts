@@ -146,6 +146,41 @@ function requireOfficialBatchSettlementContract(env: NodeJS.ProcessEnv): string 
   return value;
 }
 
+const BATCH_ACTION_FEE_ENV_NAMES = [
+  "BATCH_DEPOSIT_FEE_AMOUNT",
+  "BATCH_CLAIM_FEE_AMOUNT",
+  "BATCH_SETTLE_FEE_AMOUNT",
+  "BATCH_REFUND_FEE_AMOUNT"
+] as const;
+const BATCH_CLAIM_SCHEDULE_ENV_NAMES = [
+  "BATCH_CLAIM_1_FEE_AMOUNT", "BATCH_CLAIM_10_FEE_AMOUNT", "BATCH_CLAIM_50_FEE_AMOUNT", "BATCH_CLAIM_100_FEE_AMOUNT",
+  "BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT", "BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT", "BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT", "BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT"
+] as const;
+const MIN_BATCH_ACTION_FEE_ATOMS = 500000000000000000n;
+
+function checkBatchActionFeeEnv(env: NodeJS.ProcessEnv): void {
+  const configured = BATCH_ACTION_FEE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  if (!configured) return;
+  for (const name of BATCH_ACTION_FEE_ENV_NAMES) {
+    const value = requireUint128Env(env, name);
+    if (BigInt(value) < MIN_BATCH_ACTION_FEE_ATOMS) {
+      throw new Error(`${name} must be at least 500000000000000000 (0.5 JPYC)`);
+    }
+  }
+}
+
+function checkBatchClaimFeeScheduleEnv(env: NodeJS.ProcessEnv): void {
+  const configured = BATCH_CLAIM_SCHEDULE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  if (!configured) return;
+  const values = BATCH_CLAIM_SCHEDULE_ENV_NAMES.map((name) => [name, requireUint128Env(env, name)] as const);
+  for (let index = 1; index < values.length; index += 1) {
+    if (index === 4) continue;
+    const previous = BigInt(values[index - 1]![1]);
+    const current = BigInt(values[index]![1]);
+    if (current < previous) throw new Error(`${values[index]![0]} must not be lower than the previous tier`);
+  }
+}
+
 async function json(response: Response, expectedStatus: number): Promise<unknown> {
   const text = await response.text();
   if (response.status !== expectedStatus) {
@@ -177,6 +212,8 @@ function checkBatchSupport(kinds: readonly unknown[], env: NodeJS.ProcessEnv): v
   const expectedDelay = expectedWithdrawDelay(env);
   const expectedVersion = requireEnvString(env, "JPYC_EIP712_VERSION");
   requireUint128Env(env, "BATCH_SETTLEMENT_FEE_AMOUNT");
+  checkBatchActionFeeEnv(env);
+  checkBatchClaimFeeScheduleEnv(env);
   requireOfficialBatchSettlementContract(env);
   const batch = kinds.find((item) => {
     const kind = requireRecord(item, "supported.kind");
@@ -278,8 +315,8 @@ export async function checkCanisterSmoke(options: CanisterSmokeOptions = {}): Pr
   }
   const expectedSellerFee = readEnv(env, "SELLER_SETTLEMENT_FEE_AMOUNT")?.trim();
   if (expectedSellerFee) {
-    if (!/^[1-9][0-9]*$/.test(expectedSellerFee) || BigInt(expectedSellerFee) < 10n ** 18n) {
-      throw new Error("SELLER_SETTLEMENT_FEE_AMOUNT must be at least 1000000000000000000");
+    if (!/^[1-9][0-9]*$/.test(expectedSellerFee) || BigInt(expectedSellerFee) < 5n * 10n ** 17n) {
+      throw new Error("SELLER_SETTLEMENT_FEE_AMOUNT must be at least 500000000000000000");
     }
     if (health.sellerSettlementFeeAmount !== expectedSellerFee) {
       throw new Error(`health.sellerSettlementFeeAmount mismatch: expected ${expectedSellerFee}, got ${String(health.sellerSettlementFeeAmount)}`);

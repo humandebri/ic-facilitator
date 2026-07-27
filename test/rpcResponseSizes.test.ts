@@ -4,7 +4,8 @@ import {
   jsonUtf8Bytes,
   measureResponse,
   recommendedResponseBytes,
-  responseCyclesSaved
+  responseCyclesSaved,
+  validateJsonRpcResponse
 } from "../scripts/rpc_response_sizes";
 
 describe("RPC response size measurement", () => {
@@ -61,5 +62,31 @@ describe("RPC response size measurement", () => {
     expect(result.rawResponseBytes).toBeGreaterThan(20_000);
     expect(result.recommendedResponseBytes).toBeGreaterThan(20_000);
     expect(result.cyclesSavedFrom20Kb).toBe("0");
+  });
+
+  it("rejects JSON-RPC errors, null results, and mismatched receipt hashes", () => {
+    expect(() => validateJsonRpcResponse("eth_call", {
+      id: 1,
+      jsonrpc: "2.0",
+      error: { code: -1 },
+    })).toThrow("JSON-RPC error");
+    expect(() => validateJsonRpcResponse("eth_call", {
+      id: 1,
+      jsonrpc: "2.0",
+      result: null,
+    })).toThrow("missing non-null result");
+    expect(() => validateJsonRpcResponse("eth_getTransactionReceipt", {
+      id: 1,
+      jsonrpc: "2.0",
+      result: { transactionHash: "0xdef" },
+    }, "0xabc")).toThrow("transaction hash mismatch");
+  });
+
+  it("accepts a valid receipt envelope with the requested hash", () => {
+    expect(() => validateJsonRpcResponse("eth_getTransactionReceipt", {
+      id: 1,
+      jsonrpc: "2.0",
+      result: { transactionHash: "0xAbC" },
+    }, "0xabc")).not.toThrow();
   });
 });

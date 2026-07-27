@@ -367,6 +367,29 @@ describe("canister smoke", () => {
     ).rejects.toThrow("BATCH_SETTLEMENT_FEE_AMOUNT must fit uint128");
   });
 
+  it("requires a complete action fee profile when one action fee is configured", async () => {
+    await expect(
+      checkCanisterSmoke({
+        env: env({ BATCH_DEPOSIT_FEE_AMOUNT: "500000000000000000" }),
+        fetchFn: responseFor(supportedWithBatch()),
+        requireBatch: true
+      })
+    ).rejects.toThrow("missing env: BATCH_CLAIM_FEE_AMOUNT");
+
+    await expect(
+      checkCanisterSmoke({
+        env: env({
+          BATCH_DEPOSIT_FEE_AMOUNT: "500000000000000000",
+          BATCH_CLAIM_FEE_AMOUNT: "500000000000000000",
+          BATCH_SETTLE_FEE_AMOUNT: "500000000000000000",
+          BATCH_REFUND_FEE_AMOUNT: "500000000000000000"
+        }),
+        fetchFn: responseFor(supportedWithBatch()),
+        requireBatch: true
+      })
+    ).resolves.toMatchObject({ facilitatorAddress });
+  });
+
   it("requires a public HTTPS origin for mainnet batch smoke", async () => {
     const failFetch: typeof fetch = async () => {
       throw new Error("fetch should not be called");

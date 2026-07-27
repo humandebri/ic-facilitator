@@ -81,14 +81,46 @@ export function measureResponse(
   };
 }
 
-async function rpc(url: string, method: string, params: readonly unknown[]): Promise<JsonRpcResponse> {
+export function validateJsonRpcResponse(
+  method: string,
+  response: JsonRpcResponse,
+  expectedReceiptHash?: string
+): void {
+  if (response.jsonrpc !== "2.0" || response.id !== 1) {
+    throw new Error(`${method}: invalid JSON-RPC envelope`);
+  }
+  if (response.error !== undefined) {
+    throw new Error(`${method}: JSON-RPC error ${JSON.stringify(response.error)}`);
+  }
+  if (response.result === undefined || response.result === null) {
+    throw new Error(`${method}: missing non-null result`);
+  }
+  if (expectedReceiptHash) {
+    if (typeof response.result !== "object" || !("transactionHash" in response.result)) {
+      throw new Error(`${method}: receipt transactionHash is missing`);
+    }
+    const actual = String((response.result as { transactionHash?: unknown }).transactionHash ?? "");
+    if (actual.toLowerCase() !== expectedReceiptHash.toLowerCase()) {
+      throw new Error(`${method}: receipt transaction hash mismatch`);
+    }
+  }
+}
+
+async function rpc(
+  url: string,
+  method: string,
+  params: readonly unknown[],
+  expectedReceiptHash?: string
+): Promise<JsonRpcResponse> {
   const response = await fetch(url, {
     body: JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }),
     headers: { "content-type": "application/json" },
     method: "POST"
   });
   if (!response.ok) throw new Error(`${method}: HTTP ${response.status}`);
-  return await response.json() as JsonRpcResponse;
+  const body = await response.json() as JsonRpcResponse;
+  validateJsonRpcResponse(method, body, expectedReceiptHash);
+  return body;
 }
 
 function transactionSamples(env: NodeJS.ProcessEnv): Array<readonly [string, string]> {
@@ -124,7 +156,7 @@ export async function collectRpcResponseSizes(
     measurements.push(measureResponse(
       label,
       "eth_getTransactionReceipt",
-      await rpc(url, "eth_getTransactionReceipt", [hash])
+      await rpc(url, "eth_getTransactionReceipt", [hash], hash)
     ));
   }
   const present = new Set(samples.map(([label]) => label));

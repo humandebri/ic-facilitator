@@ -6,6 +6,11 @@ import type { ClientEvmSigner } from "@x402/evm";
 import { parseUnits } from "viem";
 import { api } from "../api";
 import { Address, Notice, PageHeader, SellerNav } from "../components";
+import {
+  confirmedCreditMessage,
+  creditPaymentOutcome,
+  type PaidTopupResponse,
+} from "../credit_payment";
 import { config } from "../env";
 import { connectWallet, requireChain } from "../wallet";
 
@@ -16,6 +21,11 @@ type PreparedTopup = {
   payTo: string;
   asset: string;
   network: string;
+};
+
+type PendingTopup = {
+  url: string;
+  headers: Record<string, string>;
 };
 
 function validateAmount(value: string): string {
@@ -47,6 +57,7 @@ async function loadRequirements(seller: string, amount: string) {
 export function Credit() {
   const [amount, setAmount] = useState("100");
   const [prepared, setPrepared] = useState<PreparedTopup>();
+  const [pending, setPending] = useState<PendingTopup>();
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [amountError, setAmountError] = useState("");
@@ -70,27 +81,44 @@ export function Credit() {
     if (!prepared) return;
     setBusy(true); setError("");
     try {
-      const wallet = await connectWallet();
-      if (wallet.address.toLowerCase() !== prepared.seller.toLowerCase()) throw new Error("確認時と異なるSeller walletが接続されています。元のwalletへ戻してください。");
-      await requireChain(wallet.provider, config.chainId);
-      const current = await loadRequirements(wallet.address, prepared.amount);
-      const unchanged = current.amountAtoms === prepared.amountAtoms
-        && current.requirement.payTo.toLowerCase() === prepared.payTo.toLowerCase()
-        && current.requirement.asset.toLowerCase() === prepared.asset.toLowerCase()
-        && current.requirement.network === prepared.network;
-      if (!unchanged) throw new Error("確認後に支払い条件が変更されました。内容をもう一度確認してください。");
+      let payment = pending;
+      if (!payment) {
+        const wallet = await connectWallet();
+        if (wallet.address.toLowerCase() !== prepared.seller.toLowerCase()) throw new Error("確認時と異なるSeller walletが接続されています。元のwalletへ戻してください。");
+        await requireChain(wallet.provider, config.chainId);
+        const current = await loadRequirements(wallet.address, prepared.amount);
+        const unchanged = current.amountAtoms === prepared.amountAtoms
+          && current.requirement.payTo.toLowerCase() === prepared.payTo.toLowerCase()
+          && current.requirement.asset.toLowerCase() === prepared.asset.toLowerCase()
+          && current.requirement.network === prepared.network;
+        if (!unchanged) throw new Error("確認後に支払い条件が変更されました。内容をもう一度確認してください。");
 
-      const core = new x402Client();
-      const signer: ClientEvmSigner = { address: wallet.address, signTypedData: (args) => wallet.client.signTypedData({ account: wallet.address, ...args }) };
-      registerExactEvmScheme(core, { signer, networks: [`eip155:${config.chainId}` as Network] });
-      const client = new x402HTTPClient(core);
-      const payload = await client.createPaymentPayload(current.required);
-      const paid = await fetch(current.url, { headers: { Accept: "application/json", ...client.encodePaymentSignatureHeader(payload) } });
-      const body: unknown = await paid.json().catch(() => null);
-      if (!paid.ok) throw new Error(typeof body === "object" && body && "message" in body ? String(body.message) : `Creditを追加できませんでした（HTTP ${paid.status}）。`);
-      const credit = await api.credit(wallet.address);
+        const core = new x402Client();
+        const signer: ClientEvmSigner = { address: wallet.address, signTypedData: (args) => wallet.client.signTypedData({ account: wallet.address, ...args }) };
+        registerExactEvmScheme(core, { signer, networks: [`eip155:${config.chainId}` as Network] });
+        const client = new x402HTTPClient(core);
+        const payload = await client.createPaymentPayload(current.required);
+        payment = {
+          url: current.url,
+          headers: { Accept: "application/json", ...client.encodePaymentSignatureHeader(payload) },
+        };
+        setPending(payment);
+      }
+      const paid = await fetch(payment.url, { headers: payment.headers });
+      const body = await paid.json().catch(() => null) as PaidTopupResponse | null;
+      const outcome = creditPaymentOutcome(paid.status, body);
+      if (outcome.kind === "pending") {
+        const transaction = outcome.transaction;
+        setStatus(`Credit購入を確認中です。${transaction ? `Transaction: ${transaction}` : "同じ署名で確認を再試行してください。"}`);
+        return;
+      }
+      const creditAtoms = outcome.creditAtoms;
+      setPending(undefined);
       setPrepared(undefined);
-      setStatus(`Creditを追加しました。現在の残高は ${credit.creditAtoms} atomic unitsです。`);
+      setStatus(confirmedCreditMessage(creditAtoms));
+      void api.credit(prepared.seller).catch(() => {
+        setStatus(confirmedCreditMessage(creditAtoms, true));
+      });
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
   }
@@ -99,7 +127,7 @@ export function Credit() {
     {error&&<Notice tone="warning">{error}</Notice>}{status&&<Notice tone="success">{status}</Notice>}
     <div className="payment-card">
       <label htmlFor="credit-amount">追加する金額</label>
-      <span className="amount-input"><input id="credit-amount" name="creditAmount" type="text" inputMode="decimal" autoComplete="off" aria-describedby={amountError?"credit-amount-error":undefined} aria-invalid={Boolean(amountError)} value={amount} onChange={(event)=>{setAmount(event.target.value);setPrepared(undefined);setAmountError("");}}/><b>JPYC</b></span>
+      <span className="amount-input"><input id="credit-amount" name="creditAmount" type="text" inputMode="decimal" autoComplete="off" disabled={Boolean(pending)} aria-describedby={amountError?"credit-amount-error":undefined} aria-invalid={Boolean(amountError)} value={amount} onChange={(event)=>{setAmount(event.target.value);setPrepared(undefined);setPending(undefined);setAmountError("");}}/><b>JPYC</b></span>
       {amountError&&<p id="credit-amount-error" className="field-error" role="alert">{amountError}</p>}
       {!prepared?<>
         <dl><div><dt>用途</dt><dd>Facilitatorの決済手数料のみ</dd></div><div><dt>追加予定</dt><dd>{amount||"0"} JPYC相当</dd></div><div><dt>Gas</dt><dd>Settlement送信時はFacilitatorが負担</dd></div></dl>
@@ -109,7 +137,7 @@ export function Credit() {
         <p className="eyebrow">SIGNATURE PREVIEW</p><h2>この内容で署名します</h2>
         <dl><div><dt>支払額</dt><dd><strong>{prepared.amount} JPYC</strong></dd></div><div><dt>送金先</dt><dd><Address value={prepared.payTo}/></dd></div><div><dt>Token</dt><dd><Address value={prepared.asset}/></dd></div><div><dt>Network</dt><dd>{prepared.network}</dd></div><div><dt>用途</dt><dd>Facilitatorの決済手数料のみ</dd></div></dl>
         <Notice>Credit購入後、Settlement transactionをbroadcastした後の手数料は原則返還されません。同じ支払い署名を再送してもCreditは二重加算されません。</Notice>
-        <div className="confirm-actions"><button className="button secondary" disabled={busy} onClick={()=>setPrepared(undefined)}>金額を変更</button><button className="button" disabled={busy} onClick={()=>void confirmAndPay()}>{busy?"Walletで署名中…":"表示内容を確認して署名"}</button></div>
+        <div className="confirm-actions"><button className="button secondary" disabled={busy||Boolean(pending)} onClick={()=>setPrepared(undefined)}>金額を変更</button><button className="button" disabled={busy} onClick={()=>void confirmAndPay()}>{busy?(pending?"確認中…":"Walletで署名中…"):(pending?"同じ署名で確認を再試行":"表示内容を確認して署名")}</button></div>
       </div>}
     </div>
   </section>;

@@ -28,6 +28,24 @@ export const REQUIRED_BATCH_ENV_NAMES = [
   "BATCH_WITHDRAW_DELAY_SECONDS"
 ];
 
+export const BATCH_ACTION_FEE_ENV_NAMES = [
+  "BATCH_DEPOSIT_FEE_AMOUNT",
+  "BATCH_CLAIM_FEE_AMOUNT",
+  "BATCH_SETTLE_FEE_AMOUNT",
+  "BATCH_REFUND_FEE_AMOUNT"
+] as const;
+
+export const BATCH_CLAIM_SCHEDULE_ENV_NAMES = [
+  "BATCH_CLAIM_1_FEE_AMOUNT",
+  "BATCH_CLAIM_10_FEE_AMOUNT",
+  "BATCH_CLAIM_50_FEE_AMOUNT",
+  "BATCH_CLAIM_100_FEE_AMOUNT",
+  "BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT",
+  "BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT",
+  "BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT",
+  "BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT"
+] as const;
+
 export type CanisterEnvSmokeResult = {
   readonly canister: string;
   readonly environment: string;
@@ -88,6 +106,18 @@ export function checkCanisterEnvNames(
   const missing = required.filter((name) => !names.includes(name));
   if (missing.length > 0) {
     throw new Error(`missing canister env names: ${missing.join(", ")}`);
+  }
+  if (options.requireBatch) {
+    const configuredActionNames = BATCH_ACTION_FEE_ENV_NAMES.filter((name) => names.includes(name));
+    if (configuredActionNames.length > 0 && configuredActionNames.length < BATCH_ACTION_FEE_ENV_NAMES.length) {
+      const missingActionNames = BATCH_ACTION_FEE_ENV_NAMES.filter((name) => !names.includes(name));
+      throw new Error(`partial batch action fee env names: ${missingActionNames.join(", ")}`);
+    }
+    const configuredScheduleNames = BATCH_CLAIM_SCHEDULE_ENV_NAMES.filter((name) => names.includes(name));
+    if (configuredScheduleNames.length > 0 && configuredScheduleNames.length < BATCH_CLAIM_SCHEDULE_ENV_NAMES.length) {
+      const missingScheduleNames = BATCH_CLAIM_SCHEDULE_ENV_NAMES.filter((name) => !names.includes(name));
+      throw new Error(`partial batch claim fee schedule env names: ${missingScheduleNames.join(", ")}`);
+    }
   }
   return { canister, environment, names };
 }

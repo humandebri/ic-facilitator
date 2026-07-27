@@ -183,7 +183,7 @@ describe("doctor helpers", () => {
     const logPath = join(dir, "icp.log");
     const fakeIcp = join(dir, "icp");
 
-    writeFileSync(fakeIcp, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$ICP_FAKE_LOG\"\n");
+    writeFileSync(fakeIcp, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$ICP_FAKE_LOG\"\nif [[ \"$*\" == *\"set_runtime_configuration\"* ]]; then printf '(variant { ok })\\n'; fi\n");
     chmodSync(fakeIcp, 0o755);
 
     try {

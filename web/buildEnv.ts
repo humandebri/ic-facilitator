@@ -8,3 +8,11 @@ export function requireFacilitatorUrl(value: string | undefined): string {
   }
   return value;
 }
+
+export function requireEvmAddress(name: string, value: string | undefined): string {
+  if (!value) throw new Error(`${name} is required`);
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value) || /^0x0{40}$/i.test(value)) {
+    throw new Error(`${name} must be a non-zero EVM address`);
+  }
+  return value;
+}

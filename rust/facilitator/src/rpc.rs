@@ -62,6 +62,11 @@ pub struct BroadcastedTransaction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettlementSendError {
     GasTooExpensive,
+    Ambiguous {
+        nonce: u128,
+        tx: String,
+        message: String,
+    },
     Other(String),
 }
 
@@ -113,19 +118,6 @@ impl BatchChannelSnapshot {
     }
 }
 
-pub async fn batch_unsettled_amount(
-    config: &RpcConfig,
-    contract: &[u8; 20],
-    receiver: &str,
-    token: &str,
-) -> Result<Option<String>, String> {
-    let state = batch_receiver_state(config, contract, receiver, token).await?;
-    if !settle_has_unsettled_amount(&state.total_claimed, &state.total_settled) {
-        return Ok(None);
-    }
-    decimal_sub(&state.total_claimed, &state.total_settled).map(Some)
-}
-
 pub async fn broadcast_settlement(
     config: &RpcConfig,
     private_key: &str,
@@ -170,7 +162,9 @@ pub async fn broadcast_settlement(
         },
         private_key,
     )?;
-    let tx = send_raw_transaction(config, &raw).await?;
+    let tx = send_raw_transaction(config, &raw)
+        .await
+        .map_err(|error| error.with_nonce(nonce))?;
     Ok(BroadcastedTransaction { nonce, tx })
 }
 
@@ -226,7 +220,9 @@ pub async fn broadcast_contract_transaction(
         },
         private_key,
     )?;
-    let tx = send_raw_transaction(config, &raw).await?;
+    let tx = send_raw_transaction(config, &raw)
+        .await
+        .map_err(|error| error.with_nonce(nonce))?;
     Ok(BroadcastedTransaction { nonce, tx })
 }
 
@@ -497,17 +493,32 @@ fn receipt_status_for_contract(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct BatchReceiverState {
-    total_claimed: String,
-    total_settled: String,
+pub struct BatchReceiverState {
+    pub total_claimed: String,
+    pub total_settled: String,
 }
 
-async fn batch_receiver_state(
+#[cfg(test)]
+thread_local! {
+    static TEST_BATCH_RECEIVER_STATE: std::cell::RefCell<Option<Result<BatchReceiverState, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_test_batch_receiver_state(value: Option<Result<BatchReceiverState, String>>) {
+    TEST_BATCH_RECEIVER_STATE.with(|state| *state.borrow_mut() = value);
+}
+
+pub async fn batch_receiver_state(
     config: &RpcConfig,
     contract: &[u8; 20],
     receiver: &str,
     token: &str,
 ) -> Result<BatchReceiverState, String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_BATCH_RECEIVER_STATE.with(|state| state.borrow().clone()) {
+        return value;
+    }
     let receiver = parse_address(receiver, "receiver")?;
     let token = parse_address(token, "token")?;
     let mut data = Vec::with_capacity(68);
@@ -614,23 +625,83 @@ fn parse_rpc_value(method: &str, text: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("{method}: missing result"))
 }
 
-async fn send_raw_transaction(config: &RpcConfig, raw: &str) -> Result<String, String> {
-    let fallback_hash = raw_transaction_hash(raw)?;
-    parse_hex(raw, None).map_err(|err| format!("eth_sendRawTransaction: {err}"))?;
-    match rpc_string(config, "eth_sendRawTransaction", json!([raw])).await {
-        Ok(returned_hash) if returned_hash.eq_ignore_ascii_case(&fallback_hash) => {
-            Ok(fallback_hash)
+enum RawTransactionSendError {
+    Ambiguous { tx: String, message: String },
+    Rejected(String),
+}
+
+impl RawTransactionSendError {
+    fn with_nonce(self, nonce: u128) -> SettlementSendError {
+        match self {
+            Self::Ambiguous { tx, message } => {
+                SettlementSendError::Ambiguous { nonce, tx, message }
+            }
+            Self::Rejected(message) => SettlementSendError::Other(message),
         }
-        Ok(returned_hash) => Err(format!(
-            "eth_sendRawTransaction: returned transaction hash mismatch: {returned_hash}"
-        )),
-        Err(message) if message.to_ascii_lowercase().contains("already known") => Ok(fallback_hash),
-        Err(message) => Err(message),
     }
 }
 
-fn raw_transaction_hash(raw: &str) -> Result<String, String> {
-    let bytes = crate::hexutil::parse_hex(raw, None)?;
+async fn send_raw_transaction(
+    config: &RpcConfig,
+    raw: &str,
+) -> Result<String, RawTransactionSendError> {
+    let fallback_hash = raw_transaction_hash(raw)?;
+    parse_hex(raw, None).map_err(|err| {
+        RawTransactionSendError::Rejected(format!("eth_sendRawTransaction: {err}"))
+    })?;
+    let method = "eth_sendRawTransaction";
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": [raw] });
+    let text = rpc_post(
+        config,
+        method,
+        &body,
+        SEND_RAW_TRANSACTION_RESPONSE_SIZE_BYTES,
+    )
+    .await
+    .map_err(|message| RawTransactionSendError::Ambiguous {
+        tx: fallback_hash.clone(),
+        message,
+    })?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|_| RawTransactionSendError::Ambiguous {
+            tx: fallback_hash.clone(),
+            message: format!("{method}: invalid JSON-RPC response"),
+        })?;
+    if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || value.get("id").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(RawTransactionSendError::Ambiguous {
+            tx: fallback_hash,
+            message: format!("{method}: invalid JSON-RPC envelope"),
+        });
+    }
+    if let Some(error) = value.get("error") {
+        let message = format!("{method}: {error}");
+        if message.to_ascii_lowercase().contains("already known") {
+            return Ok(fallback_hash);
+        }
+        return Err(RawTransactionSendError::Rejected(message));
+    }
+    match value.get("result").and_then(Value::as_str) {
+        Some(returned_hash) if returned_hash.eq_ignore_ascii_case(&fallback_hash) => {
+            Ok(fallback_hash)
+        }
+        Some(returned_hash) => Err(RawTransactionSendError::Ambiguous {
+            tx: fallback_hash,
+            message: format!(
+                "eth_sendRawTransaction: returned transaction hash mismatch: {returned_hash}"
+            ),
+        }),
+        None => Err(RawTransactionSendError::Ambiguous {
+            tx: fallback_hash,
+            message: format!("{method}: missing string result"),
+        }),
+    }
+}
+
+fn raw_transaction_hash(raw: &str) -> Result<String, RawTransactionSendError> {
+    let bytes = crate::hexutil::parse_hex(raw, None)
+        .map_err(|message| RawTransactionSendError::Rejected(message))?;
     Ok(format!(
         "0x{}",
         hex::encode(crate::hexutil::keccak256(&bytes))
@@ -920,6 +991,7 @@ fn decimal_add(left: &str, right: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| "decimal addition failed".to_string())
 }
 
+#[cfg(test)]
 fn decimal_sub(left: &str, right: &str) -> Result<String, String> {
     if !left.bytes().all(|byte| byte.is_ascii_digit())
         || !right.bytes().all(|byte| byte.is_ascii_digit())
@@ -956,6 +1028,7 @@ fn decimal_sub(left: &str, right: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| "decimal subtraction failed".to_string())
 }
 
+#[cfg(test)]
 fn settle_has_unsettled_amount(total_claimed: &str, total_settled: &str) -> bool {
     decimal_greater(total_claimed, total_settled)
 }

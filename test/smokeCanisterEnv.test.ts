@@ -15,6 +15,10 @@ const envNamesOutput = `(
 const batchEnvNamesOutput = `(
   vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "FACILITATOR_PUBLIC_ORIGIN"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_URL"; "SELLER_CREDIT_PAY_TO"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLE_MIN_CONFIRMATIONS"; "SETTLEMENT_CACHE_TTL_SECONDS"; "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"; "BATCH_SETTLEMENT_CONTRACT"; "BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_WITHDRAW_DELAY_SECONDS";},
 )`;
+const partialBatchActionEnvNamesOutput = batchEnvNamesOutput.replace(
+  '"BATCH_SETTLEMENT_FEE_AMOUNT";',
+  '"BATCH_SETTLEMENT_FEE_AMOUNT"; "BATCH_CLAIM_FEE_AMOUNT";'
+);
 
 describe("canister env smoke", () => {
   it("parses env_names output", () => {
@@ -50,6 +54,9 @@ describe("canister env smoke", () => {
 
     expect(() => checkCanisterEnvNames(envNamesOutput, "ic", "edge", { requireBatch: true })).toThrow(
       "missing canister env names: BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
+    );
+    expect(() => checkCanisterEnvNames(partialBatchActionEnvNamesOutput, "ic", "edge", { requireBatch: true })).toThrow(
+      "partial batch action fee env names: BATCH_DEPOSIT_FEE_AMOUNT"
     );
   });
 

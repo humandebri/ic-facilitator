@@ -182,6 +182,36 @@ require_polygon_rpc_url() {
   fi
 }
 
+require_contract_bytecode() {
+  local rpc_url="$1"
+  local contract="$2"
+  RPC_URL="$rpc_url" CONTRACT_ADDRESS="$contract" node --input-type=module <<'NODE'
+const response = await fetch(process.env.RPC_URL, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "eth_getCode",
+    params: [process.env.CONTRACT_ADDRESS, "latest"],
+  }),
+});
+if (!response.ok) {
+  console.error(`Amoy batch contract bytecode check returned HTTP ${response.status}`);
+  process.exit(1);
+}
+const body = await response.json();
+if (body?.jsonrpc !== "2.0" || body?.id !== 1 || body?.error || typeof body?.result !== "string") {
+  console.error("Amoy batch contract bytecode check returned an invalid JSON-RPC response");
+  process.exit(1);
+}
+if (/^0x0*$/i.test(body.result)) {
+  console.error("canonical Amoy batch contract has no bytecode; batch support remains disabled");
+  process.exit(1);
+}
+NODE
+}
+
 require_https_origin() {
   local name="$1"
   local value="$2"
@@ -310,35 +340,58 @@ set_env() {
   icp canister call --environment "$ENVIRONMENT" "$CANISTER" set_env "(\"$escaped_name\", \"$escaped_value\")"
 }
 
-set_runtime_profile() {
+require_candid_ok() {
+  local output="$1"
+  if [[ "$output" != *"variant { ok"* && "$output" != *"variant { Ok"* ]]; then
+    echo "canister update returned a Candid error: $output" >&2
+    return 1
+  fi
+}
+
+set_runtime_configuration() {
   local profile="$1"
   local token="$2"
   local contract="$3"
   local seller_fee="$4"
-  local batch_fee="$5"
-  local terms="$6"
-  local privacy="$7"
-  local asset_boundary="$8"
-  local escaped_profile escaped_token escaped_contract escaped_seller_fee escaped_batch_fee
+  local deposit_fee="$5"
+  local claim_fee="$6"
+  local settle_fee="$7"
+  local refund_fee="$8"
+  local schedule="$9"
+  local terms="${10}"
+  local privacy="${11}"
+  local asset_boundary="${12}"
+  local escaped_profile escaped_token escaped_contract escaped_seller_fee
+  local escaped_deposit escaped_claim escaped_settle escaped_refund
   local escaped_terms escaped_privacy escaped_asset_boundary
+  local output
   escaped_profile="$(candid_text "$profile")"
   escaped_token="$(candid_text "$token")"
   escaped_contract="$(candid_text "$contract")"
   escaped_seller_fee="$(candid_text "$seller_fee")"
-  escaped_batch_fee="$(candid_text "$batch_fee")"
+  escaped_deposit="$(candid_text "$deposit_fee")"
+  escaped_claim="$(candid_text "$claim_fee")"
+  escaped_settle="$(candid_text "$settle_fee")"
+  escaped_refund="$(candid_text "$refund_fee")"
   escaped_terms="$(candid_text "$terms")"
   escaped_privacy="$(candid_text "$privacy")"
   escaped_asset_boundary="$(candid_text "$asset_boundary")"
-  icp canister call --environment "$ENVIRONMENT" "$CANISTER" set_runtime_profile "(record {
+  output="$(icp canister call --environment "$ENVIRONMENT" "$CANISTER" set_runtime_configuration "(record {
     profile = \"$escaped_profile\";
     token = \"$escaped_token\";
     batch_contract = \"$escaped_contract\";
     seller_settlement_fee_amount = \"$escaped_seller_fee\";
-    batch_settlement_fee_amount = \"$escaped_batch_fee\";
+    deposit_fee_amount = \"$escaped_deposit\";
+    claim_fee_amount = \"$escaped_claim\";
+    settle_fee_amount = \"$escaped_settle\";
+    refund_fee_amount = \"$escaped_refund\";
+    claim_fee_schedule = $schedule;
     terms_version = \"$escaped_terms\";
     privacy_version = \"$escaped_privacy\";
     asset_boundary_version = \"$escaped_asset_boundary\";
-  })"
+  })")"
+  printf '%s\n' "$output"
+  require_candid_ok "$output"
 }
 
 cd "$ROOT"
@@ -357,11 +410,10 @@ case "$RESOLVED_NETWORK_PROFILE" in
     ;;
   amoy)
     required_env AMOY_JPYC_ADDRESS
-    required_env AMOY_BATCH_SETTLEMENT_CONTRACT
     require_nonzero_evm_address AMOY_JPYC_ADDRESS "$AMOY_JPYC_ADDRESS"
-    require_nonzero_evm_address AMOY_BATCH_SETTLEMENT_CONTRACT "$AMOY_BATCH_SETTLEMENT_CONTRACT"
     readonly RESOLVED_NETWORK_TOKEN="$AMOY_JPYC_ADDRESS"
-    BATCH_SETTLEMENT_CONTRACT="$AMOY_BATCH_SETTLEMENT_CONTRACT"
+    BATCH_SETTLEMENT_CONTRACT="${AMOY_BATCH_SETTLEMENT_CONTRACT:-$CANONICAL_BATCH_SETTLEMENT_CONTRACT}"
+    require_official_batch_settlement_contract "$BATCH_SETTLEMENT_CONTRACT"
     ;;
   *)
     echo "NETWORK_PROFILE must be polygon or amoy" >&2
@@ -379,13 +431,55 @@ readonly RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS="${SETTLE_CONFIRMATION_TIM
 readonly RESOLVED_SETTLE_MIN_CONFIRMATIONS="${SETTLE_MIN_CONFIRMATIONS:-$DEFAULT_SETTLE_MIN_CONFIRMATIONS}"
 readonly RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS="${SETTLEMENT_CACHE_TTL_SECONDS:-$DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS}"
 readonly RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS="${BATCH_WITHDRAW_DELAY_SECONDS:-$DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS}"
-readonly RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT="${BATCH_SETTLEMENT_FEE_AMOUNT:-10000000000000000000}"
+readonly LEGACY_BATCH_FEE_INPUT="${BATCH_SETTLEMENT_FEE_AMOUNT:-10000000000000000000}"
+readonly RESOLVED_BATCH_DEPOSIT_FEE_AMOUNT="${BATCH_DEPOSIT_FEE_AMOUNT:-$LEGACY_BATCH_FEE_INPUT}"
+readonly RESOLVED_BATCH_CLAIM_FEE_AMOUNT="${BATCH_CLAIM_FEE_AMOUNT:-$LEGACY_BATCH_FEE_INPUT}"
+readonly RESOLVED_BATCH_SETTLE_FEE_AMOUNT="${BATCH_SETTLE_FEE_AMOUNT:-$LEGACY_BATCH_FEE_INPUT}"
+readonly RESOLVED_BATCH_REFUND_FEE_AMOUNT="${BATCH_REFUND_FEE_AMOUNT:-$LEGACY_BATCH_FEE_INPUT}"
+readonly BATCH_CLAIM_SCHEDULE_ENV_NAMES=(
+  BATCH_CLAIM_1_FEE_AMOUNT
+  BATCH_CLAIM_10_FEE_AMOUNT
+  BATCH_CLAIM_50_FEE_AMOUNT
+  BATCH_CLAIM_100_FEE_AMOUNT
+  BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT
+  BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT
+  BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT
+  BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT
+)
+batch_claim_schedule_count=0
+for schedule_name in "${BATCH_CLAIM_SCHEDULE_ENV_NAMES[@]}"; do
+  if [[ -n "${!schedule_name:-}" ]]; then
+    batch_claim_schedule_count=$((batch_claim_schedule_count + 1))
+  fi
+done
+if [[ "$batch_claim_schedule_count" != "0" && "$batch_claim_schedule_count" != "8" ]]; then
+  echo "all eight batch claim fee schedule envs must be set together" >&2
+  exit 1
+fi
+if [[ "$batch_claim_schedule_count" == "8" ]]; then
+  readonly RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT="$BATCH_CLAIM_100_FEE_AMOUNT"
+else
+  readonly RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT="$RESOLVED_BATCH_CLAIM_FEE_AMOUNT"
+fi
+if [[ -n "${BATCH_SETTLEMENT_FEE_AMOUNT:-}" && "$BATCH_SETTLEMENT_FEE_AMOUNT" != "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" ]]; then
+  echo "BATCH_SETTLEMENT_FEE_AMOUNT must equal the effective claim-100 fee $RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" >&2
+  exit 1
+fi
 require_positive_integer FACILITATOR_MAX_GAS "$RESOLVED_FACILITATOR_MAX_GAS"
 require_positive_integer FACILITATOR_MAX_SETTLEMENT_FEE_WEI "$RESOLVED_FACILITATOR_MAX_SETTLEMENT_FEE_WEI"
 require_positive_integer SETTLE_CONFIRMATION_TIMEOUT_SECONDS "$RESOLVED_SETTLE_CONFIRMATION_TIMEOUT_SECONDS"
 require_positive_integer SETTLE_MIN_CONFIRMATIONS "$RESOLVED_SETTLE_MIN_CONFIRMATIONS"
 require_positive_integer SETTLEMENT_CACHE_TTL_SECONDS "$RESOLVED_SETTLEMENT_CACHE_TTL_SECONDS"
 require_uint128_integer BATCH_SETTLEMENT_FEE_AMOUNT "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT"
+require_uint128_integer BATCH_DEPOSIT_FEE_AMOUNT "$RESOLVED_BATCH_DEPOSIT_FEE_AMOUNT"
+require_uint128_integer BATCH_CLAIM_FEE_AMOUNT "$RESOLVED_BATCH_CLAIM_FEE_AMOUNT"
+require_uint128_integer BATCH_SETTLE_FEE_AMOUNT "$RESOLVED_BATCH_SETTLE_FEE_AMOUNT"
+require_uint128_integer BATCH_REFUND_FEE_AMOUNT "$RESOLVED_BATCH_REFUND_FEE_AMOUNT"
+if [[ "$batch_claim_schedule_count" == "8" ]]; then
+  for schedule_name in "${BATCH_CLAIM_SCHEDULE_ENV_NAMES[@]}"; do
+    require_uint128_integer "$schedule_name" "${!schedule_name}"
+  done
+fi
 if [[ -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
   required_env BATCH_SETTLEMENT_CONTRACT
   required_env BATCH_SETTLEMENT_FEE_AMOUNT
@@ -394,16 +488,35 @@ if [[ -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
   require_nonzero_evm_address BATCH_SETTLEMENT_CONTRACT "$BATCH_SETTLEMENT_CONTRACT"
   if [[ "$RESOLVED_NETWORK_PROFILE" == "polygon" ]]; then
     require_official_batch_settlement_contract "$BATCH_SETTLEMENT_CONTRACT"
+  else
+    require_contract_bytecode "$POLYGON_RPC_URL" "$BATCH_SETTLEMENT_CONTRACT"
   fi
   require_integer_range BATCH_WITHDRAW_DELAY_SECONDS "$RESOLVED_BATCH_WITHDRAW_DELAY_SECONDS" "$MIN_BATCH_WITHDRAW_DELAY_SECONDS" "$MAX_BATCH_WITHDRAW_DELAY_SECONDS"
   require_uint128_integer BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT"
   if [[ "${REQUIRE_PRODUCTION_FEES:-0}" == "1" ]]; then
-    require_uint_minimum BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT" "10000000000000000000"
+    require_uint_minimum BATCH_SETTLEMENT_FEE_AMOUNT "$BATCH_SETTLEMENT_FEE_AMOUNT" "500000000000000000"
   fi
 fi
 if [[ "$RESOLVED_NETWORK_PROFILE" == "polygon" || "${REQUIRE_PRODUCTION_FEES:-0}" == "1" ]]; then
-  require_uint_minimum SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT" "1000000000000000000"
-  require_uint_minimum BATCH_SETTLEMENT_FEE_AMOUNT "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" "10000000000000000000"
+  require_uint_minimum SELLER_SETTLEMENT_FEE_AMOUNT "$SELLER_SETTLEMENT_FEE_AMOUNT" "500000000000000000"
+  require_uint_minimum BATCH_SETTLEMENT_FEE_AMOUNT "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" "500000000000000000"
+  for action_fee_name in BATCH_DEPOSIT_FEE_AMOUNT BATCH_CLAIM_FEE_AMOUNT BATCH_SETTLE_FEE_AMOUNT BATCH_REFUND_FEE_AMOUNT; do
+    action_fee_value="${!action_fee_name:-}"
+    if [[ -z "$action_fee_value" ]]; then
+      case "$action_fee_name" in
+        BATCH_DEPOSIT_FEE_AMOUNT) action_fee_value="$RESOLVED_BATCH_DEPOSIT_FEE_AMOUNT" ;;
+        BATCH_CLAIM_FEE_AMOUNT) action_fee_value="$RESOLVED_BATCH_CLAIM_FEE_AMOUNT" ;;
+        BATCH_SETTLE_FEE_AMOUNT) action_fee_value="$RESOLVED_BATCH_SETTLE_FEE_AMOUNT" ;;
+        BATCH_REFUND_FEE_AMOUNT) action_fee_value="$RESOLVED_BATCH_REFUND_FEE_AMOUNT" ;;
+      esac
+    fi
+    require_uint_minimum "$action_fee_name" "$action_fee_value" "500000000000000000"
+  done
+  if [[ "$batch_claim_schedule_count" == "8" ]]; then
+    for schedule_name in "${BATCH_CLAIM_SCHEDULE_ENV_NAMES[@]}"; do
+      require_uint_minimum "$schedule_name" "${!schedule_name}" "500000000000000000"
+    done
+  fi
   for version_name in SELLER_TERMS_VERSION PRIVACY_VERSION ASSET_BOUNDARY_VERSION; do
     version_value="${!version_name:-}"
     if [[ -z "$version_value" || "$version_value" == *-draft ]]; then
@@ -427,15 +540,38 @@ case "$MODE" in
 esac
 
 set_env FACILITATOR_EVM_PRIVATE_KEY "$FACILITATOR_EVM_PRIVATE_KEY"
-set_runtime_profile \
+if [[ "$batch_claim_schedule_count" == "8" ]]; then
+  runtime_schedule="opt record {
+    claim_1_fee_amount = \"$(candid_text "$BATCH_CLAIM_1_FEE_AMOUNT")\";
+    claim_10_fee_amount = \"$(candid_text "$BATCH_CLAIM_10_FEE_AMOUNT")\";
+    claim_50_fee_amount = \"$(candid_text "$BATCH_CLAIM_50_FEE_AMOUNT")\";
+    claim_100_fee_amount = \"$(candid_text "$BATCH_CLAIM_100_FEE_AMOUNT")\";
+    refund_with_claim_1_fee_amount = \"$(candid_text "$BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT")\";
+    refund_with_claim_10_fee_amount = \"$(candid_text "$BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT")\";
+    refund_with_claim_50_fee_amount = \"$(candid_text "$BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT")\";
+    refund_with_claim_100_fee_amount = \"$(candid_text "$BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT")\";
+  }"
+else
+  runtime_schedule="null"
+fi
+set_runtime_configuration \
   "$RESOLVED_NETWORK_PROFILE" \
   "$RESOLVED_NETWORK_TOKEN" \
   "${BATCH_SETTLEMENT_CONTRACT:-$CANONICAL_BATCH_SETTLEMENT_CONTRACT}" \
   "$SELLER_SETTLEMENT_FEE_AMOUNT" \
-  "$RESOLVED_BATCH_SETTLEMENT_FEE_AMOUNT" \
+  "$RESOLVED_BATCH_DEPOSIT_FEE_AMOUNT" \
+  "$RESOLVED_BATCH_CLAIM_FEE_AMOUNT" \
+  "$RESOLVED_BATCH_SETTLE_FEE_AMOUNT" \
+  "$RESOLVED_BATCH_REFUND_FEE_AMOUNT" \
+  "$runtime_schedule" \
   "${SELLER_TERMS_VERSION:-2026-07-13-draft}" \
   "${PRIVACY_VERSION:-2026-07-13-draft}" \
   "${ASSET_BOUNDARY_VERSION:-2026-07-13-draft}"
+if [[ "$RESOLVED_NETWORK_PROFILE" == "amoy" && -n "${BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY:-}" ]]; then
+  set_env AMOY_BATCH_CONTRACT_CODE_VERIFIED "1"
+elif [[ "$MODE" == "--disable-batch" ]]; then
+  set_env AMOY_BATCH_CONTRACT_CODE_VERIFIED ""
+fi
 set_env JPYC_EIP712_VERSION "$JPYC_EIP712_VERSION"
 set_env POLYGON_RPC_URL "$POLYGON_RPC_URL"
 set_env FACILITATOR_PUBLIC_ORIGIN "$FACILITATOR_PUBLIC_ORIGIN"

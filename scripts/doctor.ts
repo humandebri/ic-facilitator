@@ -174,8 +174,8 @@ function canisterEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   if (sellerCreditPayTo && (!isEvmAddress(sellerCreditPayTo) || isZeroAddress(sellerCreditPayTo))) {
     checks.push(fail("env-format:SELLER_CREDIT_PAY_TO", "non-zero 0x-prefixed 20-byte EVM address ではない"));
   }
-  if (sellerSettlementFeeAmount && (!isPositiveIntegerString(sellerSettlementFeeAmount) || BigInt(sellerSettlementFeeAmount) < 10n ** 18n)) {
-    checks.push(fail("env-format:SELLER_SETTLEMENT_FEE_AMOUNT", "1 JPYC (1e18 atomic units) 以上の integer string ではない"));
+  if (sellerSettlementFeeAmount && (!isPositiveIntegerString(sellerSettlementFeeAmount) || BigInt(sellerSettlementFeeAmount) < 5n * 10n ** 17n)) {
+    checks.push(fail("env-format:SELLER_SETTLEMENT_FEE_AMOUNT", "0.5 JPYC (5e17 atomic units) 以上の integer string ではない"));
   }
   if (settleTimeout && !isPositiveIntegerString(settleTimeout)) {
     checks.push(fail("env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS", "正の integer string ではない"));

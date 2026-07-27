@@ -20,6 +20,10 @@ pub struct SettlementRecord {
     pub response: SettleResponse,
     pub pay_to: Option<String>,
     pub batch_pre_refund_snapshot: Option<BatchChannelSnapshot>,
+    pub settlement_kind: Option<String>,
+    pub charged_fee: Option<String>,
+    pub attempt_started_at: Option<u64>,
+    pub target_total_claimed: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
     pub expires_at: u64,
@@ -130,8 +134,35 @@ impl SettlementRecord {
         .filter(|settlement| !settlement.tx.trim().is_empty())
     }
 
+    #[cfg(test)]
     pub fn is_expired(&self, now: u64) -> bool {
         self.expires_at <= now
+    }
+
+    pub fn with_metadata(
+        mut self,
+        settlement_kind: &str,
+        charged_fee: Option<String>,
+        target_total_claimed: Option<String>,
+    ) -> Self {
+        self.settlement_kind = Some(settlement_kind.to_string());
+        self.charged_fee = charged_fee;
+        self.target_total_claimed = target_total_claimed;
+        if self.status == "checking" {
+            self.attempt_started_at = Some(self.created_at);
+        }
+        self
+    }
+
+    pub fn inherit_metadata_from(&mut self, previous: &Self) {
+        self.created_at = previous.created_at;
+        self.settlement_kind = previous.settlement_kind.clone();
+        self.charged_fee = previous.charged_fee.clone();
+        self.attempt_started_at = previous.attempt_started_at;
+        self.target_total_claimed = previous.target_total_claimed.clone();
+        if self.batch_pre_refund_snapshot.is_none() {
+            self.batch_pre_refund_snapshot = previous.batch_pre_refund_snapshot.clone();
+        }
     }
 
     fn new(
@@ -146,6 +177,10 @@ impl SettlementRecord {
             response,
             pay_to,
             batch_pre_refund_snapshot: None,
+            settlement_kind: None,
+            charged_fee: None,
+            attempt_started_at: (status == "checking").then_some(now),
+            target_total_claimed: None,
             created_at: now,
             updated_at: now,
             expires_at: now.saturating_add(ttl),
@@ -311,5 +346,9 @@ mod tests {
         let decoded: SettlementRecord = candid::decode_one(&bytes).unwrap();
 
         assert_eq!(decoded.batch_pre_refund_snapshot, None);
+        assert_eq!(decoded.settlement_kind, None);
+        assert_eq!(decoded.charged_fee, None);
+        assert_eq!(decoded.attempt_started_at, None);
+        assert_eq!(decoded.target_total_claimed, None);
     }
 }

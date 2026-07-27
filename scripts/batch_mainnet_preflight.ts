@@ -184,6 +184,58 @@ function batchSettlementFeeCheck(env: NodeJS.ProcessEnv): BatchMainnetPreflightC
   return ok("env:BATCH_SETTLEMENT_FEE_AMOUNT", amount);
 }
 
+const ACTION_FEE_ENV_NAMES = [
+  "BATCH_DEPOSIT_FEE_AMOUNT",
+  "BATCH_CLAIM_FEE_AMOUNT",
+  "BATCH_SETTLE_FEE_AMOUNT",
+  "BATCH_REFUND_FEE_AMOUNT"
+] as const;
+const MIN_ACTION_FEE_ATOMS = 500000000000000000n;
+const CLAIM_SCHEDULE_ENV_NAMES = [
+  "BATCH_CLAIM_1_FEE_AMOUNT", "BATCH_CLAIM_10_FEE_AMOUNT", "BATCH_CLAIM_50_FEE_AMOUNT", "BATCH_CLAIM_100_FEE_AMOUNT",
+  "BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT", "BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT", "BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT", "BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT"
+] as const;
+
+function batchActionFeeChecks(env: NodeJS.ProcessEnv): readonly BatchMainnetPreflightCheck[] {
+  const configured = ACTION_FEE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  if (!configured) return [];
+  return ACTION_FEE_ENV_NAMES.map((name) => {
+    const value = env[name]?.trim();
+    if (!value) return fail(`env:${name}`, "action別fee設定が有効なのに未設定");
+    if (!/^[1-9][0-9]*$/.test(value)) return fail(`env:${name}`, "positive integer ではない");
+    if (BigInt(value) > UINT128_MAX) return fail(`env:${name}`, "uint128 に収まらない");
+    if (BigInt(value) < MIN_ACTION_FEE_ATOMS) return fail(`env:${name}`, "0.5 JPYC (5e17 atomic units) 未満");
+    return ok(`env:${name}`, value);
+  });
+}
+
+function batchClaimScheduleChecks(env: NodeJS.ProcessEnv): readonly BatchMainnetPreflightCheck[] {
+  const configured = CLAIM_SCHEDULE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  if (!configured) return [];
+  const checks: BatchMainnetPreflightCheck[] = [];
+  let previous: bigint | undefined;
+  for (let index = 0; index < CLAIM_SCHEDULE_ENV_NAMES.length; index += 1) {
+    const name = CLAIM_SCHEDULE_ENV_NAMES[index]!;
+    const value = env[name]?.trim();
+    if (!value) {
+      checks.push(fail(`env:${name}`, "件数別fee設定が有効なのに未設定"));
+      continue;
+    }
+    if (!/^[1-9][0-9]*$/.test(value)) {
+      checks.push(fail(`env:${name}`, "positive integer ではない"));
+      continue;
+    }
+    const amount = BigInt(value);
+    if (amount > UINT128_MAX) checks.push(fail(`env:${name}`, "uint128 に収まらない"));
+    else if (amount < MIN_ACTION_FEE_ATOMS) checks.push(fail(`env:${name}`, "0.5 JPYC 未満"));
+    else if (index !== 4 && previous !== undefined && amount < previous) checks.push(fail(`env:${name}`, "件数tierが単調非減少ではない"));
+    else checks.push(ok(`env:${name}`, value));
+    if (index !== 3 && index !== 7) previous = amount;
+    if (index === 3) previous = undefined;
+  }
+  return checks;
+}
+
 function createReader(rpcUrl: string): BatchMainnetPreflightReader {
   const client = createPublicClient({
     chain: polygon,
@@ -285,7 +337,9 @@ export async function checkBatchMainnetPreflight(
     batchWithdrawDelayCheck(options.env),
     batchReceiverAuthorizerKeyCheck(options.env),
     batchAuthorizerKeySeparationCheck(options.env),
-    batchSettlementFeeCheck(options.env)
+    batchSettlementFeeCheck(options.env),
+    ...batchActionFeeChecks(options.env),
+    ...batchClaimScheduleChecks(options.env)
   ];
   const batchContract = batchContractCheck.address;
   const jpyc = DEFAULT_JPYC_POLYGON_ADDRESS;

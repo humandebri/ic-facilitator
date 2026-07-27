@@ -19,7 +19,7 @@ import {
 import type { BatchSettlementReceiptReader, BatchSettlementReceiptResult } from "./batch_settlement_receipt";
 import { loadDotenv } from "./env_file";
 import { checkCanisterSmoke } from "./smoke_canister";
-import { REQUIRED_BATCH_ENV_NAMES, parseEnvNames } from "./smoke_canister_env";
+import { BATCH_CLAIM_SCHEDULE_ENV_NAMES, REQUIRED_BATCH_ENV_NAMES, parseEnvNames } from "./smoke_canister_env";
 import { normalizeDidServiceConstructor } from "./generate_did";
 
 export type BatchProductionReadinessStatus = "fail" | "ok";
@@ -75,6 +75,16 @@ const MAX_BATCH_CHANNELS_LIST = 1_000n;
 const MAX_BATCH_STRING_BYTES = 512;
 const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const UINT128_MAX = (1n << 128n) - 1n;
+const BATCH_CLAIM_SCHEDULE_FIELDS = [
+  ["BATCH_CLAIM_1_FEE_AMOUNT", "claim_1_fee_amount"],
+  ["BATCH_CLAIM_10_FEE_AMOUNT", "claim_10_fee_amount"],
+  ["BATCH_CLAIM_50_FEE_AMOUNT", "claim_50_fee_amount"],
+  ["BATCH_CLAIM_100_FEE_AMOUNT", "claim_100_fee_amount"],
+  ["BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT", "refund_with_claim_1_fee_amount"],
+  ["BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT", "refund_with_claim_10_fee_amount"],
+  ["BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT", "refund_with_claim_50_fee_amount"],
+  ["BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT", "refund_with_claim_100_fee_amount"]
+] as const;
 const REQUIRED_BATCH_DID_METHODS = [
   "batch_channel",
   "batch_channel_count",
@@ -86,11 +96,16 @@ const REQUIRED_BATCH_DID_METHODS = [
   "batch_set_seller",
   "batch_set_writer_receiver_scope",
   "batch_settlement_contract",
+  "batch_deposit_fee_amount",
+  "batch_claim_fee_amount",
+  "batch_settle_fee_amount",
+  "batch_refund_fee_amount",
   "batch_settlement_fee_amount",
   "batch_update_channel",
   "batch_writer_receiver_scope",
   "batch_writer_receiver_scope_count",
-  "batch_writer_receiver_scopes"
+  "batch_writer_receiver_scopes",
+  "set_batch_fee_profile"
 ];
 const REQUIRED_BATCH_DID_SHAPES: readonly { readonly name: string; readonly pattern: RegExp }[] = [
   {
@@ -362,11 +377,16 @@ function missingBatchDidStorageItems(did: string): readonly string[] {
       { name: "method batch_set_seller signature", pattern: /\bbatch_set_seller\s*:\s*\(\s*text\s*,\s*text\s*\)\s*->\s*\(\s*Result(?:_\d+)?\s*,?\s*\)\s*;/ },
       { name: "method batch_set_writer_receiver_scope signature", pattern: /\bbatch_set_writer_receiver_scope\s*:\s*\(\s*principal\s*,\s*text\s*,\s*bool\s*\)\s*->\s*\(\s*Result(?:_\d+)?\s*,?\s*\)\s*;/ },
       { name: "method batch_settlement_contract signature", pattern: /\bbatch_settlement_contract\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
+      { name: "method batch_deposit_fee_amount signature", pattern: /\bbatch_deposit_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
+      { name: "method batch_claim_fee_amount signature", pattern: /\bbatch_claim_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
+      { name: "method batch_settle_fee_amount signature", pattern: /\bbatch_settle_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
+      { name: "method batch_refund_fee_amount signature", pattern: /\bbatch_refund_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
       { name: "method batch_settlement_fee_amount signature", pattern: /\bbatch_settlement_fee_amount\s*:\s*\(\s*\)\s*->\s*\(\s*opt\s+text\s*\)\s*query\s*;/ },
       { name: "method batch_update_channel signature", pattern: /\bbatch_update_channel\s*:\s*\(\s*text\s*,\s*opt\s+nat64\s*,\s*BatchChannelUpdate\s*\)\s*->\s*\(\s*BatchChannelUpdateResult\s*,?\s*\)\s*;/ },
       { name: "method batch_writer_receiver_scope signature", pattern: /\bbatch_writer_receiver_scope\s*:\s*\(\s*principal\s*,\s*text\s*\)\s*->\s*\(\s*opt\s+BatchWriterReceiverScope\s*,?\s*\)\s*query\s*;/ },
       { name: "method batch_writer_receiver_scope_count signature", pattern: /\bbatch_writer_receiver_scope_count\s*:\s*\(\s*\)\s*->\s*\(\s*nat64\s*\)\s*query\s*;/ },
       { name: "method batch_writer_receiver_scopes signature", pattern: /\bbatch_writer_receiver_scopes\s*:\s*\(\s*opt\s+nat64\s*\)\s*->\s*\(\s*vec\s+BatchWriterReceiverScope\s*,?\s*\)\s*query\s*;/ },
+      { name: "method set_batch_fee_profile signature", pattern: /\bset_batch_fee_profile\s*:\s*\(\s*BatchFeeProfileUpdate\s*\)\s*->\s*\(\s*Result(?:_\d+)?\s*,?\s*\)\s*;/ },
       { name: "method settlement signature", pattern: /\bsettlement\s*:\s*\(\s*text\s*\)\s*->\s*\(\s*opt\s+SettlementRecord\s*\)\s*query\s*;/ }
     ];
     for (const shape of serviceShapes) {
@@ -475,21 +495,83 @@ function crc32(bytes: readonly number[]): number {
 }
 
 function batchSettlementFeeStage(env: NodeJS.ProcessEnv): BatchProductionReadinessStage {
-  const value = env.BATCH_SETTLEMENT_FEE_AMOUNT;
+  const value = effectiveClaim100Fee(env);
   if (!value || value.trim() === "") {
-    return fail("batch:settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT is required");
+    return fail("batch:settlement-fee", "effective claim-100 fee is required");
   }
   const amount = value.trim();
   if (!/^[1-9][0-9]*$/.test(amount)) {
-    return fail("batch:settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT must be a positive integer string");
+    return fail("batch:settlement-fee", "effective claim-100 fee must be a positive integer string");
   }
   if (BigInt(amount) > UINT128_MAX) {
-    return fail("batch:settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT must fit uint128");
+    return fail("batch:settlement-fee", "effective claim-100 fee must fit uint128");
   }
-  if (BigInt(amount) < 10n ** 19n) {
-    return fail("batch:settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT must be at least 10000000000000000000");
+  if (BigInt(amount) < MIN_BATCH_ACTION_FEE_ATOMS) {
+    return fail("batch:settlement-fee", "effective claim-100 fee must be at least 500000000000000000");
   }
   return ok("batch:settlement-fee", amount);
+}
+
+function effectiveClaim100Fee(env: NodeJS.ProcessEnv): string | undefined {
+  return env.BATCH_CLAIM_100_FEE_AMOUNT?.trim()
+    || env.BATCH_CLAIM_FEE_AMOUNT?.trim()
+    || env.BATCH_SETTLEMENT_FEE_AMOUNT?.trim();
+}
+
+const BATCH_ACTION_FEE_NAMES = [
+  ["deposit", "BATCH_DEPOSIT_FEE_AMOUNT"],
+  ["claim", "BATCH_CLAIM_FEE_AMOUNT"],
+  ["settle", "BATCH_SETTLE_FEE_AMOUNT"],
+  ["refund", "BATCH_REFUND_FEE_AMOUNT"]
+] as const;
+const MIN_BATCH_ACTION_FEE_ATOMS = 500000000000000000n;
+
+function batchActionFeeStage(env: NodeJS.ProcessEnv): BatchProductionReadinessStage {
+  const fallback = env.BATCH_SETTLEMENT_FEE_AMOUNT?.trim();
+  const configured = BATCH_ACTION_FEE_NAMES.some(([, name]) => (env[name] ?? "").trim() !== "");
+  if (!configured) {
+    return fallback
+      ? ok("batch:action-fees", `legacy fallback=${fallback}`)
+      : fail("batch:action-fees", "action別fee未設定時はBATCH_SETTLEMENT_FEE_AMOUNT fallbackが必要");
+  }
+  const values = BATCH_ACTION_FEE_NAMES.map(([action, name]) => [action, name, env[name]?.trim()] as const);
+  const missing = values.find(([, , value]) => !value);
+  if (missing) {
+    return fail("batch:action-fees", `${missing[1]} is required when action-specific fees are configured`);
+  }
+  for (const [, name, value] of values) {
+    if (!value || !/^[1-9][0-9]*$/.test(value)) {
+      return fail("batch:action-fees", `${name} must be a positive integer string`);
+    }
+    if (BigInt(value) > UINT128_MAX) {
+      return fail("batch:action-fees", `${name} must fit uint128`);
+    }
+    if (BigInt(value) < MIN_BATCH_ACTION_FEE_ATOMS) {
+      return fail("batch:action-fees", `${name} must be at least 500000000000000000 (0.5 JPYC)`);
+    }
+  }
+  return ok("batch:action-fees", values.map(([action, , value]) => `${action}=${value}`).join(", "));
+}
+
+function batchClaimScheduleStage(env: NodeJS.ProcessEnv): BatchProductionReadinessStage {
+  const configured = BATCH_CLAIM_SCHEDULE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  if (!configured) return ok("batch:claim-fee-schedule", "件数別schedule未設定（legacy feeを使用）");
+  const values: bigint[] = [];
+  for (const name of BATCH_CLAIM_SCHEDULE_ENV_NAMES) {
+    const value = env[name]?.trim();
+    if (!value) return fail("batch:claim-fee-schedule", `${name} is required with the complete eight-value schedule`);
+    if (!/^[1-9][0-9]*$/.test(value)) return fail("batch:claim-fee-schedule", `${name} must be a positive integer string`);
+    const amount = BigInt(value);
+    if (amount > UINT128_MAX) return fail("batch:claim-fee-schedule", `${name} must fit uint128`);
+    if (amount < MIN_BATCH_ACTION_FEE_ATOMS) return fail("batch:claim-fee-schedule", `${name} must be at least 0.5 JPYC`);
+    values.push(amount);
+  }
+  for (const offset of [0, 4]) {
+    for (let index = offset + 1; index < offset + 4; index += 1) {
+      if (values[index]! < values[index - 1]!) return fail("batch:claim-fee-schedule", "each fee schedule must be non-decreasing by claim count");
+    }
+  }
+  return ok("batch:claim-fee-schedule", "claim/refund-with-claim count tiers are complete and valid");
 }
 
 function batchReceiptConfirmationsStage(env: NodeJS.ProcessEnv): BatchProductionReadinessStage {
@@ -682,9 +764,9 @@ function canisterSettlementFeeStage(
   runner: CommandRunner,
   cwd: string
 ): BatchProductionReadinessStage {
-  const expected = env.BATCH_SETTLEMENT_FEE_AMOUNT?.trim();
+  const expected = effectiveClaim100Fee(env);
   if (!expected) {
-    return fail("canister:batch-settlement-fee", "BATCH_SETTLEMENT_FEE_AMOUNT is required");
+    return fail("canister:batch-settlement-fee", "effective claim-100 fee is required");
   }
   const environment = env.ICP_ENVIRONMENT ?? DEFAULT_ICP_ENVIRONMENT;
   const canister = env.ICP_CANISTER ?? DEFAULT_ICP_CANISTER;
@@ -700,6 +782,60 @@ function canisterSettlementFeeStage(
     return fail("canister:batch-settlement-fee", `expected ${expected}, got ${actual}`);
   }
   return ok("canister:batch-settlement-fee", `${canister}@${environment} fee ${actual}`);
+}
+
+function canisterClaimFeeScheduleStage(
+  env: NodeJS.ProcessEnv,
+  runner: CommandRunner,
+  cwd: string
+): BatchProductionReadinessStage {
+  const configured = BATCH_CLAIM_SCHEDULE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  const environment = env.ICP_ENVIRONMENT ?? DEFAULT_ICP_ENVIRONMENT;
+  const canister = env.ICP_CANISTER ?? DEFAULT_ICP_CANISTER;
+  const result = runner("icp", ["canister", "call", canister, "batch_claim_fee_schedule", "()", "--environment", environment], cwd);
+  if (result.status !== 0) {
+    return fail("canister:batch-claim-fee-schedule", result.output || "failed to query batch_claim_fee_schedule");
+  }
+  if (!configured) {
+    return /^\s*\(\s*null\s*,?\s*\)\s*$/.test(result.output)
+      ? ok("canister:batch-claim-fee-schedule", "claim fee schedule is cleared")
+      : fail("canister:batch-claim-fee-schedule", "expected no claim fee schedule on canister");
+  }
+  for (const [name, field] of BATCH_CLAIM_SCHEDULE_FIELDS) {
+    const actual = quotedFieldValues(result.output, field)[0];
+    const expected = env[name]?.trim();
+    if (!expected || actual !== expected) {
+      return fail("canister:batch-claim-fee-schedule", `${field}: expected ${expected ?? "unset"}, got ${actual ?? "missing"}`);
+    }
+  }
+  return ok("canister:batch-claim-fee-schedule", `${canister}@${environment} claim fee schedule matches`);
+}
+
+function canisterActionFeeStage(
+  env: NodeJS.ProcessEnv,
+  runner: CommandRunner,
+  cwd: string
+): BatchProductionReadinessStage {
+  const actionQueries = [
+    ["deposit", "BATCH_DEPOSIT_FEE_AMOUNT", "batch_deposit_fee_amount"],
+    ["claim", "BATCH_CLAIM_FEE_AMOUNT", "batch_claim_fee_amount"],
+    ["settle", "BATCH_SETTLE_FEE_AMOUNT", "batch_settle_fee_amount"],
+    ["refund", "BATCH_REFUND_FEE_AMOUNT", "batch_refund_fee_amount"]
+  ] as const;
+  const configured = actionQueries.some(([, name]) => (env[name] ?? "").trim() !== "");
+  if (!configured) return ok("canister:batch-action-fees", "legacy BATCH_SETTLEMENT_FEE_AMOUNT fallback");
+  const environment = env.ICP_ENVIRONMENT ?? DEFAULT_ICP_ENVIRONMENT;
+  const canister = env.ICP_CANISTER ?? DEFAULT_ICP_CANISTER;
+  for (const [action, name, method] of actionQueries) {
+    const expected = env[name]?.trim();
+    if (!expected) return fail("canister:batch-action-fees", `${name} is required when action-specific fees are configured`);
+    const result = runner("icp", ["canister", "call", canister, method, "()", "--environment", environment], cwd);
+    if (result.status !== 0) return fail("canister:batch-action-fees", result.output || `failed to query ${method}`);
+    const actual = parseOptionalText(result.output);
+    if (!actual) return fail("canister:batch-action-fees", `${action} fee is not configured on canister`);
+    if (actual !== expected) return fail("canister:batch-action-fees", `${action}: expected ${expected}, got ${actual}`);
+  }
+  return ok("canister:batch-action-fees", `${canister}@${environment} action fees match`);
 }
 
 function canisterEnvStage(
@@ -722,6 +858,11 @@ function canisterEnvStage(
   const missing = REQUIRED_BATCH_ENV_NAMES.filter((name) => !names.includes(name));
   if (missing.length > 0) {
     return fail("canister:batch-env", `missing canister batch env names: ${missing.join(", ")}`);
+  }
+  const configuredSchedule = BATCH_CLAIM_SCHEDULE_ENV_NAMES.some((name) => (env[name] ?? "").trim() !== "");
+  if (configuredSchedule) {
+    const missingSchedule = BATCH_CLAIM_SCHEDULE_ENV_NAMES.filter((name) => !names.includes(name));
+    if (missingSchedule.length > 0) return fail("canister:batch-env", `missing canister claim fee schedule env names: ${missingSchedule.join(", ")}`);
   }
   return ok("canister:batch-env", `${canister}@${environment} batch env names present`);
 }
@@ -1218,6 +1359,9 @@ function nextCommands(
   if (stages.some((stage) => stage.name === "batch:settlement-fee" && stage.status === "fail")) {
     commands.push("set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer");
   }
+  if (stages.some((stage) => stage.name === "batch:action-fees" && stage.status === "fail")) {
+    commands.push("set all BATCH_DEPOSIT_FEE_AMOUNT, BATCH_CLAIM_FEE_AMOUNT, BATCH_SETTLE_FEE_AMOUNT, and BATCH_REFUND_FEE_AMOUNT, or use BATCH_SETTLEMENT_FEE_AMOUNT fallback");
+  }
   if (stages.some((stage) => stage.name === "batch:key-separation" && stage.status === "fail")) {
     commands.push("use different private keys for FACILITATOR_EVM_PRIVATE_KEY and BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY");
   }
@@ -1240,6 +1384,10 @@ function nextCommands(
     commands.push(readinessCommand(environment, canister, requireBatchReceipt));
   }
   if (stages.some((stage) => stage.name === "canister:batch-settlement-fee" && stage.status === "fail")) {
+    commands.push(canisterEnvCommand(environment, canister));
+    commands.push(readinessCommand(environment, canister, requireBatchReceipt));
+  }
+  if (stages.some((stage) => stage.name === "canister:batch-action-fees" && stage.status === "fail")) {
     commands.push(canisterEnvCommand(environment, canister));
     commands.push(readinessCommand(environment, canister, requireBatchReceipt));
   }
@@ -1312,6 +1460,14 @@ function preflightNextCommands(stageName: string): readonly string[] {
       return ["set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key"];
     case "batch:preflight:env:BATCH_SETTLEMENT_FEE_AMOUNT":
       return ["set BATCH_SETTLEMENT_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
+    case "batch:preflight:env:BATCH_DEPOSIT_FEE_AMOUNT":
+      return ["set BATCH_DEPOSIT_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
+    case "batch:preflight:env:BATCH_CLAIM_FEE_AMOUNT":
+      return ["set BATCH_CLAIM_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
+    case "batch:preflight:env:BATCH_SETTLE_FEE_AMOUNT":
+      return ["set BATCH_SETTLE_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
+    case "batch:preflight:env:BATCH_REFUND_FEE_AMOUNT":
+      return ["set BATCH_REFUND_FEE_AMOUNT to a positive JPYC atomic-unit integer"];
     default:
       return ["npm run preflight:batch"];
   }
@@ -1370,12 +1526,16 @@ export async function buildBatchProductionReadinessReport(
   let stages = [
     ...await preflightStages(options),
     batchSettlementFeeStage(options.env),
+    batchActionFeeStage(options.env),
+    batchClaimScheduleStage(options.env),
     batchKeySeparationStage(options.env),
     canisterEnvStage(options.env, commandRunner, cwd),
     canisterWriterScopeStage(options.env, commandRunner, cwd),
     canisterReceiverAuthorizerStage(options.env, commandRunner, cwd),
     canisterSettlementContractStage(options.env, commandRunner, cwd),
     canisterSettlementFeeStage(options.env, commandRunner, cwd),
+    canisterActionFeeStage(options.env, commandRunner, cwd),
+    canisterClaimFeeScheduleStage(options.env, commandRunner, cwd),
     canisterStorageApiStage(options.env, commandRunner, cwd),
     canisterWasmHashStage(options.env, commandRunner, cwd, artifact.wasmSha256),
     canisterOperationalSafetyStage(options.env, commandRunner, cwd),
