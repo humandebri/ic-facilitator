@@ -700,8 +700,7 @@ async fn send_raw_transaction(
 }
 
 fn raw_transaction_hash(raw: &str) -> Result<String, RawTransactionSendError> {
-    let bytes = crate::hexutil::parse_hex(raw, None)
-        .map_err(|message| RawTransactionSendError::Rejected(message))?;
+    let bytes = crate::hexutil::parse_hex(raw, None).map_err(RawTransactionSendError::Rejected)?;
     Ok(format!(
         "0x{}",
         hex::encode(crate::hexutil::keccak256(&bytes))
