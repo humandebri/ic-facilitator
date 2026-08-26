@@ -57,6 +57,16 @@ pub fn parse_u256_decimal(value: &str, label: &str) -> Result<[u8; 32], String> 
     Ok(out)
 }
 
+pub fn parse_u128_decimal_word(value: &str, label: &str) -> Result<[u8; 32], String> {
+    if value.is_empty() || !value.bytes().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("{label}: invalid decimal integer"));
+    }
+    value
+        .parse::<u128>()
+        .map(u256_word)
+        .map_err(|_| format!("{label}: integer too large"))
+}
+
 pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(bytes);
@@ -149,6 +159,20 @@ mod tests {
         let too_big =
             "115792089237316195423570985008687907853269984665640564039457584007913129639936";
         assert!(parse_u256_decimal(too_big, "too_big").is_err());
+    }
+
+    #[test]
+    fn parses_u128_decimal_word() {
+        let max = "340282366920938463463374607431768211455";
+        assert_eq!(
+            parse_u128_decimal_word(max, "max").unwrap(),
+            u256_word(u128::MAX)
+        );
+        let too_big = "340282366920938463463374607431768211456";
+        assert_eq!(
+            parse_u128_decimal_word(too_big, "too_big"),
+            Err("too_big: integer too large".to_string())
+        );
     }
 
     #[test]

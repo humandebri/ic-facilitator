@@ -8,7 +8,12 @@ import {
 import type { PaymentRequired, SettleResponse } from "@x402/core/types";
 import type { Hex } from "viem";
 
-import { hasExpectedPaidJpycReportBody, hasPaidJpycReportBody, payJpyc } from "../scripts/pay_jpyc";
+import {
+  hasExpectedPaidJpycReportBody,
+  hasPaidJpycReportBody,
+  payJpyc,
+  validatePaidRetrySettlements,
+} from "../scripts/pay_jpyc";
 
 const buyerPrivateKey: Hex = "0x59c6995e998f97a5a0044966f094538db1f78e001b7e6f2480d4ef9f4a3a9a8e";
 const targetUrl = "https://example.test/jpyc/report";
@@ -56,12 +61,13 @@ const paymentRequired: PaymentRequired = {
     }
   ]
 };
-const settlement: SettleResponse = {
+const settlement = {
   success: true,
   transaction: "0x0000000000000000000000000000000000000000000000000000000000000402",
   network: "eip155:137",
-  payer: buyerAddress
-};
+  payer: buyerAddress,
+  extra: { settlementKey: "0xsettlement-key" }
+} as SettleResponse;
 
 describe("payJpyc", () => {
   afterEach(() => {
@@ -153,8 +159,7 @@ describe("payJpyc", () => {
     let firstPaymentSignature = "";
     const retrySettlement: SettleResponse = {
       ...settlement,
-      amount: "1000000000000000000",
-      transaction: "0x0000000000000000000000000000000000000000000000000000000000000500"
+      amount: "1000000000000000000"
     };
     const fetchFn: typeof fetch = async (input, init) => {
       callCount += 1;
@@ -209,6 +214,20 @@ describe("payJpyc", () => {
     expect(result.paidStatus).toBe(200);
     expect(result.paidRetryStatus).toBe(200);
     expect(result.retrySettlement).toEqual(retrySettlement);
+  });
+
+  it("rejects paid retries with a different settlement key or transaction", () => {
+    expect(() => validatePaidRetrySettlements(
+      settlement,
+      {
+        ...settlement,
+        extra: { ...settlement.extra, settlementKey: "different" },
+      },
+    )).toThrow("settlement key mismatch");
+    expect(() => validatePaidRetrySettlements(
+      settlement,
+      { ...settlement, transaction: `0x${"ef".repeat(32)}` },
+    )).toThrow("transaction hash mismatch");
   });
 
   it("can enable paid retry from the environment", async () => {

@@ -8,13 +8,16 @@ import { polygon } from "viem/chains";
 
 import { positiveDecimalToAtomicUnits } from "../src/amount";
 import { loadDotenv } from "./env_file";
+import { normalizePolygonRpcUrl } from "./rpc_url";
 
 export type ReceiptReader = {
+  getBlockNumber(): Promise<bigint>;
   getTransactionReceipt(args: { hash: Hex }): Promise<TransactionReceipt>;
 };
 
 export type SettlementReceiptResult = {
   readonly blockNumber: string;
+  readonly confirmations: string;
   readonly from: Hex;
   readonly gasUsed: string;
   readonly hash: Hex;
@@ -36,9 +39,11 @@ export type ExpectedTransfer = {
 };
 
 export type SettlementReceiptOptions = {
+  readonly expectedFrom?: string;
   readonly expectedTo?: string;
   readonly expectedTransfer?: ExpectedTransfer;
   readonly hash: Hex;
+  readonly minConfirmations?: number;
   readonly reader?: ReceiptReader;
   readonly rpcUrl?: string;
 };
@@ -46,6 +51,7 @@ export type SettlementReceiptOptions = {
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const DEFAULT_JPYC_POLYGON_ADDRESS = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const DEFAULT_JPYC_PRICE = "1";
+const DEFAULT_MIN_CONFIRMATIONS = 3;
 const JPYC_DECIMALS = 18;
 const SAMPLE_SELLER_ADDRESS = "0x0000000000000000000000000000000000000402";
 
@@ -106,12 +112,44 @@ function amountFromData(data: Hex): string | null {
   return BigInt(data).toString();
 }
 
+function positiveInteger(value: string, name: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return parsed;
+}
+
+export function settlementMinConfirmationsFromEnv(env: NodeJS.ProcessEnv): number {
+  const value = env.SETTLE_MIN_CONFIRMATIONS;
+  return value === undefined || value.trim() === ""
+    ? DEFAULT_MIN_CONFIRMATIONS
+    : positiveInteger(value, "SETTLE_MIN_CONFIRMATIONS");
+}
+
+export function expectedSettlementSenderFromEnv(env: NodeJS.ProcessEnv): Hex {
+  const privateKey = env.FACILITATOR_EVM_PRIVATE_KEY;
+  if (!privateKey || privateKey.trim() === "") {
+    throw new Error("missing required env: FACILITATOR_EVM_PRIVATE_KEY");
+  }
+  if (!isPrivateKey(privateKey)) {
+    throw new Error("FACILITATOR_EVM_PRIVATE_KEY must be a 32-byte 0x-prefixed hex private key");
+  }
+  return privateKeyToAccount(privateKey).address;
+}
+
 function findExpectedTransfer(receipt: TransactionReceipt, expected: ExpectedTransfer): SettlementReceiptResult["transfer"] {
   const asset = normalizeAddress(expected.asset, "expected transfer asset");
   const to = normalizeAddress(expected.to, "expected transfer recipient");
   const from = expected.from ? normalizeAddress(expected.from, "expected transfer sender") : undefined;
 
   for (const log of receipt.logs) {
+    if (log.removed) {
+      continue;
+    }
     const topic0 = log.topics[0];
     const topic1 = log.topics[1];
     const topic2 = log.topics[2];
@@ -179,9 +217,12 @@ export async function verifySettlementReceipt(
 ): Promise<SettlementReceiptResult> {
   const reader = options.reader ?? createPublicClient({
     chain: polygon,
-    transport: http(options.rpcUrl ?? requireEnv("POLYGON_RPC_URL"))
+    transport: http(normalizePolygonRpcUrl(options.rpcUrl ?? requireEnv("POLYGON_RPC_URL")))
   });
-  const receipt = await reader.getTransactionReceipt({ hash: options.hash });
+  const [receipt, latestBlock] = await Promise.all([
+    reader.getTransactionReceipt({ hash: options.hash }),
+    reader.getBlockNumber()
+  ]);
 
   if (!equalsHex(receipt.transactionHash, options.hash)) {
     throw new Error(`receipt hash mismatch: ${receipt.transactionHash}`);
@@ -189,11 +230,22 @@ export async function verifySettlementReceipt(
   if (receipt.status !== "success") {
     throw new Error(`settlement tx failed: ${receipt.status}`);
   }
+  if (options.expectedFrom) {
+    const expectedFrom = normalizeAddress(options.expectedFrom, "expected settlement sender");
+    if (!equalsHex(receipt.from, expectedFrom)) {
+      throw new Error(`settlement tx sender mismatch: ${receipt.from}`);
+    }
+  }
   if (options.expectedTo) {
     const expectedTo = normalizeAddress(options.expectedTo, "expected settlement contract");
     if (!receipt.to || !equalsHex(receipt.to, expectedTo)) {
       throw new Error(`settlement tx recipient mismatch: ${receipt.to}`);
     }
+  }
+  const confirmations = latestBlock >= receipt.blockNumber ? latestBlock - receipt.blockNumber + 1n : 0n;
+  const minConfirmations = BigInt(options.minConfirmations ?? settlementMinConfirmationsFromEnv(process.env));
+  if (confirmations < minConfirmations) {
+    throw new Error(`settlement tx confirmations below minimum: ${confirmations.toString()} < ${minConfirmations.toString()}`);
   }
   const transfer = options.expectedTransfer
     ? findExpectedTransfer(receipt, options.expectedTransfer)
@@ -201,6 +253,7 @@ export async function verifySettlementReceipt(
 
   const result: SettlementReceiptResult = {
     blockNumber: receipt.blockNumber.toString(),
+    confirmations: confirmations.toString(),
     from: receipt.from,
     gasUsed: receipt.gasUsed.toString(),
     hash: options.hash,
@@ -217,9 +270,11 @@ async function main(): Promise<void> {
   const expectedTransfer = expectedTransferFromEnv(process.env);
   const result = await verifySettlementReceipt({
     hash: parseTxHash(tx),
-    ...(rpcUrl ? { rpcUrl } : {}),
+    ...(rpcUrl ? { rpcUrl: normalizePolygonRpcUrl(rpcUrl) } : {}),
+    expectedFrom: expectedSettlementSenderFromEnv(process.env),
     expectedTo: readEnv("JPYC_POLYGON_ADDRESS") ?? DEFAULT_JPYC_POLYGON_ADDRESS,
-    expectedTransfer
+    expectedTransfer,
+    minConfirmations: settlementMinConfirmationsFromEnv(process.env)
   });
 
   console.log(JSON.stringify(result, null, 2));

@@ -3,7 +3,6 @@ use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
 use crate::hexutil::{
     address_hex, address_word, keccak256, parse_address, parse_hex, parse_u256_decimal, u256_word,
-    JPYC_POLYGON_ADDRESS,
 };
 use crate::types::{Eip3009Authorization, PaymentPayload};
 
@@ -84,12 +83,15 @@ fn domain_separator(requirements: &crate::types::PaymentRequirements) -> Result<
         .get("version")
         .and_then(|value| value.as_str())
         .ok_or_else(|| "missing EIP-712 domain version".to_string())?;
-    let verifying_contract = parse_address(JPYC_POLYGON_ADDRESS, "JPYC verifying contract")?;
+    let verifying_contract = parse_address(
+        &crate::configured_token_address()?,
+        "JPYC verifying contract",
+    )?;
     let mut encoded = Vec::with_capacity(160);
     encoded.extend_from_slice(&keccak256(DOMAIN_TYPE.as_bytes()));
     encoded.extend_from_slice(&keccak256(name.as_bytes()));
     encoded.extend_from_slice(&keccak256(version.as_bytes()));
-    encoded.extend_from_slice(&u256_word(137));
+    encoded.extend_from_slice(&u256_word(crate::configured_chain_id() as u128));
     encoded.extend_from_slice(&address_word(&verifying_contract));
     Ok(keccak256(&encoded))
 }

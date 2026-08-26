@@ -1,14 +1,29 @@
+# Dependencies
 node_modules/
+
+# Build output and generated artifacts
+target/
 dist/
 !dist/
 dist/*
 !dist/facilitator.did
+
+# ICP local cache
 .icp/cache/
+
+# Local environment and secrets
 .env
 .env.*
 !.env.example
 .dev.vars
 .dev.vars.*
+.amoy/
+
+# Cloudflare local state/config
 .wrangler/
-wrangler.jsonc
+web/dist/
+/wrangler.jsonc
+
+# Logs and OS files
 *.log
+.DS_Store

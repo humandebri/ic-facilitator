@@ -1,3 +1,81 @@
+type BatchChannel = record {
+  channel_id : text;
+  signature : text;
+  channel_config : BatchChannelConfig;
+  balance : text;
+  charged_cumulative_amount : text;
+  pending_request : opt BatchPendingRequest;
+  refund_nonce : text;
+  signed_max_claimable : text;
+  revision : nat64;
+  last_request_timestamp : nat64;
+  onchain_synced_at : opt nat64;
+  total_claimed : text;
+  withdraw_requested_at : nat64;
+};
+type BatchChannelConfig = record {
+  token : text;
+  withdraw_delay : nat64;
+  salt : text;
+  receiver_authorizer : text;
+  payer_authorizer : text;
+  payer : text;
+  receiver : text;
+};
+type BatchChannelSnapshot = record {
+  channel_id : text;
+  balance : text;
+  refund_nonce : text;
+  total_claimed : text;
+  withdraw_requested_at : nat64;
+};
+type BatchChannelUpdate = record { channel : opt BatchChannel };
+type BatchChannelUpdateResult = record {
+  status : text;
+  current_revision : opt nat64;
+  message : opt text;
+  channel : opt BatchChannel;
+};
+type BatchClaimFeeSchedule = record {
+  refund_with_claim_1_fee_amount : text;
+  claim_100_fee_amount : text;
+  refund_with_claim_10_fee_amount : text;
+  claim_1_fee_amount : text;
+  refund_with_claim_50_fee_amount : text;
+  claim_10_fee_amount : text;
+  refund_with_claim_100_fee_amount : text;
+  claim_50_fee_amount : text;
+};
+type BatchDeletedChannel = record {
+  deleted_at : nat64;
+  deleted_by : text;
+  channel : BatchChannel;
+};
+type BatchFeeProfileUpdate = record {
+  refund_fee_amount : text;
+  claim_fee_amount : text;
+  deposit_fee_amount : text;
+  settle_fee_amount : text;
+};
+type BatchPendingRequest = record {
+  signed_max_claimable : text;
+  pending_id : text;
+  expires_at : nat64;
+};
+type BatchSeller = record {
+  status : text;
+  updated_at : nat64;
+  receiver_address : text;
+  created_at : nat64;
+};
+type BatchWriterReceiverScope = record {
+  updated_at : nat64;
+  updated_by : text;
+  writer_principal : principal;
+  receiver_address : text;
+  created_at : nat64;
+  enabled : bool;
+};
 type HttpRequest = record {
   url : text;
   method : text;
@@ -11,6 +89,61 @@ type HttpResponse = record {
   upgrade : opt bool;
   status_code : nat16;
 };
+type Result = variant { Ok : BatchSeller; Err : text };
+type Result_1 = variant { Ok : BatchWriterReceiverScope; Err : text };
+type Result_2 = variant { Ok : StaleSettlementRecovery; Err : text };
+type Result_3 = variant { Ok; Err : text };
+type RuntimeConfigurationUpdate = record {
+  token : text;
+  batch_contract : text;
+  terms_version : text;
+  refund_fee_amount : text;
+  privacy_version : text;
+  asset_boundary_version : text;
+  claim_fee_schedule : opt BatchClaimFeeSchedule;
+  claim_fee_amount : text;
+  seller_settlement_fee_amount : text;
+  deposit_fee_amount : text;
+  profile : text;
+  settle_fee_amount : text;
+};
+type RuntimeProfileUpdate = record {
+  token : text;
+  batch_contract : text;
+  batch_settlement_fee_amount : text;
+  terms_version : text;
+  privacy_version : text;
+  asset_boundary_version : text;
+  seller_settlement_fee_amount : text;
+  profile : text;
+};
+type SellerAcceptance = record {
+  status : text;
+  superseded : bool;
+  terms_version : text;
+  accepted_at : nat64;
+  privacy_version : text;
+  seller : text;
+  asset_boundary_version : text;
+};
+type SellerSettlementItem = record {
+  fee : text;
+  key : text;
+  confirmations : nat64;
+  status : text;
+  updated_at : nat64;
+  failure_reason : opt text;
+  kind : text;
+  transaction : text;
+  created_at : nat64;
+  seller : text;
+  payer : text;
+  amount : text;
+};
+type SellerSettlementPage = record {
+  next_cursor : opt text;
+  items : vec SellerSettlementItem;
+};
 type SettleResponse = record {
   transaction : text;
   error_reason : opt text;
@@ -20,22 +153,68 @@ type SettleResponse = record {
   success : bool;
   payer : opt text;
   amount : opt text;
+  extra_json : opt text;
 };
 type SettlementRecord = record {
   status : text;
   updated_at : nat64;
+  batch_pre_refund_snapshot : opt BatchChannelSnapshot;
+  charged_fee : opt text;
+  attempt_started_at : opt nat64;
   created_at : nat64;
+  target_total_claimed : opt text;
   response : SettleResponse;
   expires_at : nat64;
   pay_to : opt text;
+  settlement_kind : opt text;
+};
+type StaleSettlementRecovery = record {
+  key : text;
+  refunded_fee : text;
+  seller : text;
 };
 service : {
   active_settlement_count : () -> (nat64) query;
+  batch_channel : (text) -> (opt BatchChannel) query;
+  batch_channel_count : () -> (nat64) query;
+  batch_channels : (opt nat64) -> (vec BatchChannel) query;
+  batch_claim_fee_amount : () -> (opt text) query;
+  batch_claim_fee_schedule : () -> (opt BatchClaimFeeSchedule) query;
+  batch_deleted_channel : (text) -> (opt BatchDeletedChannel) query;
+  batch_deleted_channel_count : () -> (nat64) query;
+  batch_deleted_channels : (opt nat64) -> (vec BatchDeletedChannel) query;
+  batch_deposit_fee_amount : () -> (opt text) query;
+  batch_receiver_authorizer : () -> (opt text) query;
+  batch_refund_fee_amount : () -> (opt text) query;
+  batch_set_seller : (text, text) -> (Result);
+  batch_set_writer_receiver_scope : (principal, text, bool) -> (Result_1);
+  batch_settle_fee_amount : () -> (opt text) query;
+  batch_settlement_contract : () -> (opt text) query;
+  batch_settlement_fee_amount : () -> (opt text) query;
+  batch_update_channel : (text, opt nat64, BatchChannelUpdate) -> (
+      BatchChannelUpdateResult,
+    );
+  batch_writer_receiver_scope : (principal, text) -> (
+      opt BatchWriterReceiverScope,
+    ) query;
+  batch_writer_receiver_scope_count : () -> (nat64) query;
+  batch_writer_receiver_scopes : (opt nat64) -> (
+      vec BatchWriterReceiverScope,
+    ) query;
   env_names : () -> (vec text) query;
   http_request : (HttpRequest) -> (HttpResponse) query;
   http_request_update : (HttpRequest) -> (HttpResponse);
+  recover_stale_settlement : (text) -> (Result_2);
+  seller_acceptance : (text) -> (opt SellerAcceptance) query;
   seller_credit : (text) -> (nat) query;
+  seller_settlements : (text, opt text, opt nat64) -> (
+      SellerSettlementPage,
+    ) query;
+  set_batch_claim_fee_schedule : (BatchClaimFeeSchedule) -> (Result_3);
+  set_batch_fee_profile : (BatchFeeProfileUpdate) -> (Result_3);
   set_env : (text, text) -> ();
+  set_runtime_configuration : (RuntimeConfigurationUpdate) -> (Result_3);
+  set_runtime_profile : (RuntimeProfileUpdate) -> (Result_3);
   settlement : (text) -> (opt SettlementRecord) query;
   settlement_count : () -> (nat64) query;
 }

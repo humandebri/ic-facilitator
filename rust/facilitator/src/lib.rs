@@ -1,4 +1,5 @@
 // rust/facilitator/src/lib.rs: ICP HTTP gateway 上で JPYC x402 facilitator API を公開する。
+mod batch;
 mod eip712;
 mod facilitator;
 mod hexutil;
@@ -10,15 +11,32 @@ mod types;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use candid::{CandidType, Deserialize as CandidDeserialize};
+use candid::{CandidType, Deserialize as CandidDeserialize, Principal};
 use ic_cdk::{post_upgrade, pre_upgrade, query, update};
-use ic_stable_structures::{
-    memory_manager::{MemoryId, MemoryManager, VirtualMemory},
-    DefaultMemoryImpl, StableBTreeMap,
+#[cfg(not(test))]
+use ic_sqlite_vfs::db::migrate::Migration;
+use ic_sqlite_vfs::stable::raw_memory::Memory as SqliteRawMemory;
+#[cfg(not(test))]
+use ic_sqlite_vfs::{params, Db as SqliteDb, DbError as SqliteDbError};
+use ic_sqlite_vfs::{
+    DbMemory as SqliteDbMemory, DefaultMemoryImpl as SqliteDefaultMemoryImpl, MemoryId,
+    MemoryManager as SqliteMemoryManager,
 };
-use k256::ecdsa::SigningKey;
-use serde::Serialize;
+use ic_stable_structures::StableBTreeMap;
+use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::{RecoveryId, Signature, SigningKey};
+use serde::{Deserialize, Serialize};
 
+use crate::batch::{
+    batch_payload, compute_batch_channel_id, is_pending_only_provisional_channel,
+    requires_batch_eip712_version, validate_batch_channel, validate_batch_channel_transition,
+    validate_batch_claim_count, validate_batch_eip712_version, validate_batch_request,
+    validate_batch_settle_request, validate_channel_id, validate_optional_batch_eip712_version,
+    validate_withdraw_delay, voucher_channel_id, BatchChannel, BatchChannelUpdate,
+    BatchChannelUpdateResult, BatchFacilitatorRequest, BatchRequestPayload, BATCH_SCHEME,
+    CANONICAL_BATCH_SETTLEMENT_CONTRACT, DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS,
+    MAX_BATCH_CHANNELS_LIST, MAX_BATCH_CHANNELS_STORED, MAX_BATCH_CLAIMS,
+};
 use crate::eip712::recover_eip191_signer;
 use crate::facilitator::{
     failed_settlement, supported, validate_request, validate_request_before_signature,
@@ -29,13 +47,21 @@ use crate::hexutil::{
     JPYC_POLYGON_ADDRESS, NETWORK,
 };
 use crate::rpc::{
-    pending_nonce, refresh_settlement, send_settlement, ExpectedTransfer, RpcConfig,
-    SettlementOutcome, SettlementSendError,
+    batch_receiver_state, broadcast_contract_transaction, broadcast_settlement,
+    confirm_contract_broadcast, confirm_settlement_broadcast, pending_nonce,
+    refresh_contract_settlement, refresh_settlement, BatchChannelSnapshot, ContractExpectation,
+    ContractSettlementOutcome, ExpectedTransfer, RpcConfig, SettlementOutcome, SettlementSendError,
 };
 use crate::state::SettlementRecord;
+use crate::tx::{
+    encode_batch_claim_calldata, encode_batch_deposit_calldata, encode_batch_refund_calldata,
+    encode_batch_settle_calldata, recover_batch_claim_authorizer, recover_batch_refund_authorizer,
+};
 use crate::types::{
     json_response, text_response, FacilitatorRequest, HeaderField, HttpRequest, HttpResponse,
-    PaymentPayload, PaymentRequiredResponse, PaymentRequirements, ResourceInfo, SettleResponse,
+    PaymentPayload, PaymentRequiredResponse, PaymentRequirements, ResourceInfo,
+    SettleChannelStateExtra, SettleResponse, SettleResponseExtra, SettleVoucherStateExtra,
+    SupportedKind, VerifyResponse,
 };
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -46,14 +72,112 @@ const DEFAULT_MIN_CONFIRMATIONS: u64 = 3;
 const DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS: u64 = 86_400;
 const GAS_TOO_EXPENSIVE_MESSAGE: &str = "estimated POL settlement fee exceeds configured cap";
 const SELLER_AUTH_MESSAGE_PREFIX: &str = "IC_JPYC_X402_SELLER_AUTH_V1";
+const BATCH_LEGACY_FEE_ENV: &str = "BATCH_SETTLEMENT_FEE_AMOUNT";
+const BATCH_DEPOSIT_FEE_ENV: &str = "BATCH_DEPOSIT_FEE_AMOUNT";
+const BATCH_CLAIM_FEE_ENV: &str = "BATCH_CLAIM_FEE_AMOUNT";
+const BATCH_SETTLE_FEE_ENV: &str = "BATCH_SETTLE_FEE_AMOUNT";
+const BATCH_REFUND_FEE_ENV: &str = "BATCH_REFUND_FEE_AMOUNT";
+const BATCH_CLAIM_1_FEE_ENV: &str = "BATCH_CLAIM_1_FEE_AMOUNT";
+const BATCH_CLAIM_10_FEE_ENV: &str = "BATCH_CLAIM_10_FEE_AMOUNT";
+const BATCH_CLAIM_50_FEE_ENV: &str = "BATCH_CLAIM_50_FEE_AMOUNT";
+const BATCH_CLAIM_100_FEE_ENV: &str = "BATCH_CLAIM_100_FEE_AMOUNT";
+const BATCH_REFUND_WITH_CLAIM_1_FEE_ENV: &str = "BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT";
+const BATCH_REFUND_WITH_CLAIM_10_FEE_ENV: &str = "BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT";
+const BATCH_REFUND_WITH_CLAIM_50_FEE_ENV: &str = "BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT";
+const BATCH_REFUND_WITH_CLAIM_100_FEE_ENV: &str = "BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT";
 
-type Memory = VirtualMemory<DefaultMemoryImpl>;
+type Memory = StableMemoryAdapter;
 const ENV_MEM_ID: MemoryId = MemoryId::new(0);
 const SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(1);
 const SELLER_CREDITS_MEM_ID: MemoryId = MemoryId::new(2);
 const CREDITED_SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(3);
 const ACTIVE_SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(4);
 const NONCES_MEM_ID: MemoryId = MemoryId::new(5);
+const BATCH_CHANNELS_MEM_ID: MemoryId = MemoryId::new(6);
+const BATCH_DELETED_CHANNELS_MEM_ID: MemoryId = MemoryId::new(7);
+const SELLER_ACCEPTANCES_MEM_ID: MemoryId = MemoryId::new(8);
+const SELLER_ACCEPTANCE_CHALLENGES_MEM_ID: MemoryId = MemoryId::new(9);
+const SELLER_SETTLEMENT_INDEX_MEM_ID: MemoryId = MemoryId::new(10);
+#[cfg(not(test))]
+const SQLITE_MEMORY_ID: MemoryId = MemoryId::new(120);
+const BATCH_SQLITE_LIST_LIMIT: u64 = 1_000;
+#[cfg(test)]
+const MAX_SELLER_ACCEPTANCE_CHALLENGES: u64 = 3;
+
+#[cfg(not(test))]
+const BATCH_SQLITE_MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    sql: "
+        CREATE TABLE sellers (
+            receiver_address TEXT PRIMARY KEY NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE writer_receiver_scopes (
+            writer_principal TEXT NOT NULL,
+            receiver_address TEXT NOT NULL,
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            PRIMARY KEY(writer_principal, receiver_address)
+        );
+        CREATE INDEX writer_receiver_scopes_receiver_idx
+            ON writer_receiver_scopes(receiver_address);
+        CREATE TABLE payment_intents (
+            intent_id TEXT PRIMARY KEY NOT NULL,
+            receiver_address TEXT NOT NULL,
+            payer_address TEXT NOT NULL,
+            resource_url TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX payment_intents_receiver_idx
+            ON payment_intents(receiver_address);
+        CREATE TABLE batch_channel_bindings (
+            channel_id TEXT PRIMARY KEY NOT NULL,
+            receiver_address TEXT NOT NULL,
+            payer_address TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            intent_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX batch_channel_bindings_receiver_idx
+            ON batch_channel_bindings(receiver_address);
+    ",
+}];
+#[cfg(not(test))]
+const BATCH_SQLITE_MIGRATIONS_V2: &[Migration] = &[Migration {
+    version: 2,
+    sql: "
+        ALTER TABLE payment_intents ADD COLUMN pending_id TEXT;
+        CREATE UNIQUE INDEX payment_intents_pending_id_idx
+            ON payment_intents(pending_id)
+            WHERE pending_id IS NOT NULL;
+    ",
+}];
+#[cfg(not(test))]
+const BATCH_SQLITE_MIGRATIONS_V3: &[Migration] = &[Migration {
+    version: 3,
+    sql: "
+        DROP TABLE IF EXISTS payment_intent_removal_guard;
+        CREATE TABLE payment_intent_removal_guard (
+            row_count INTEGER NOT NULL CHECK(row_count = 0)
+        );
+        INSERT INTO payment_intent_removal_guard(row_count)
+            SELECT
+                (SELECT COUNT(*) FROM payment_intents) +
+                (SELECT COUNT(*) FROM batch_channel_bindings);
+        DROP TABLE payment_intent_removal_guard;
+        DROP TABLE IF EXISTS batch_channel_bindings;
+        DROP TABLE IF EXISTS payment_intents;
+    ",
+}];
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct StableState {
@@ -63,29 +187,208 @@ struct StableState {
     credited_settlements: BTreeMap<String, String>,
     active_settlements: Option<BTreeMap<String, ActiveSettlement>>,
     nonces: Option<BTreeMap<String, NonceState>>,
+    batch_channels: Option<BTreeMap<String, BatchChannel>>,
+    batch_deleted_channels: Option<BTreeMap<String, BatchDeletedChannel>>,
+}
+
+const STABLE_VALUE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct VersionedStableValue {
+    version: u32,
+    payload: Vec<u8>,
 }
 
 thread_local! {
-    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
-        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+    static MEMORY_MANAGER: RefCell<SqliteMemoryManager<SqliteDefaultMemoryImpl>> =
+        RefCell::new(SqliteMemoryManager::init(SqliteDefaultMemoryImpl::default()));
     static ENV: RefCell<StableBTreeMap<String, String, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(ENV_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(ENV_MEM_ID)));
     static SETTLEMENTS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(SETTLEMENTS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(SETTLEMENTS_MEM_ID)));
     static SELLER_CREDITS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(SELLER_CREDITS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_CREDITS_MEM_ID)));
     static CREDITED_SETTLEMENTS: RefCell<StableBTreeMap<String, String, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(CREDITED_SETTLEMENTS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(CREDITED_SETTLEMENTS_MEM_ID)));
     static ACTIVE_SETTLEMENTS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(ACTIVE_SETTLEMENTS_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(ACTIVE_SETTLEMENTS_MEM_ID)));
     static NONCES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
-        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(NONCES_MEM_ID))));
+        RefCell::new(StableBTreeMap::init(stable_memory(NONCES_MEM_ID)));
+    static BATCH_CHANNELS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(BATCH_CHANNELS_MEM_ID)));
+    static BATCH_DELETED_CHANNELS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(BATCH_DELETED_CHANNELS_MEM_ID)));
+    static SELLER_ACCEPTANCES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_ACCEPTANCES_MEM_ID)));
+    static SELLER_ACCEPTANCE_CHALLENGES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_ACCEPTANCE_CHALLENGES_MEM_ID)));
+    static SELLER_SETTLEMENT_INDEX: RefCell<StableBTreeMap<String, String, Memory>> =
+        RefCell::new(StableBTreeMap::init(stable_memory(SELLER_SETTLEMENT_INDEX_MEM_ID)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENFORCE_SELLER_ACCEPTANCE: RefCell<bool> = const { RefCell::new(false) };
+    static TEST_ACCEPTANCE_NONCE_SEQUENCE: RefCell<u64> = const { RefCell::new(0) };
+}
+
+#[derive(Clone)]
+struct StableMemoryAdapter(SqliteDbMemory);
+
+fn stable_memory(id: MemoryId) -> StableMemoryAdapter {
+    StableMemoryAdapter(MEMORY_MANAGER.with(|manager| manager.borrow().get(id)))
+}
+
+impl ic_stable_structures::Memory for StableMemoryAdapter {
+    fn size(&self) -> u64 {
+        SqliteRawMemory::size(&self.0)
+    }
+
+    fn grow(&self, pages: u64) -> i64 {
+        SqliteRawMemory::grow(&self.0, pages)
+    }
+
+    fn read(&self, offset: u64, dst: &mut [u8]) {
+        SqliteRawMemory::read(&self.0, offset, dst);
+    }
+
+    unsafe fn read_unsafe(&self, offset: u64, dst: *mut u8, count: usize) {
+        SqliteRawMemory::read_unsafe(&self.0, offset, dst, count);
+    }
+
+    fn write(&self, offset: u64, src: &[u8]) {
+        SqliteRawMemory::write(&self.0, offset, src);
+    }
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, PartialEq, Eq)]
+struct BatchSeller {
+    receiver_address: String,
+    status: String,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, PartialEq, Eq)]
+struct BatchWriterReceiverScope {
+    writer_principal: Principal,
+    receiver_address: String,
+    enabled: bool,
+    created_at: u64,
+    updated_at: u64,
+    updated_by: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct RuntimeProfileUpdate {
+    profile: String,
+    token: String,
+    batch_contract: String,
+    seller_settlement_fee_amount: String,
+    batch_settlement_fee_amount: String,
+    terms_version: String,
+    privacy_version: String,
+    asset_boundary_version: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct BatchFeeProfileUpdate {
+    deposit_fee_amount: String,
+    claim_fee_amount: String,
+    settle_fee_amount: String,
+    refund_fee_amount: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct RuntimeConfigurationUpdate {
+    profile: String,
+    token: String,
+    batch_contract: String,
+    seller_settlement_fee_amount: String,
+    deposit_fee_amount: String,
+    claim_fee_amount: String,
+    settle_fee_amount: String,
+    refund_fee_amount: String,
+    claim_fee_schedule: Option<BatchClaimFeeSchedule>,
+    terms_version: String,
+    privacy_version: String,
+    asset_boundary_version: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchClaimFeeSchedule {
+    claim_1_fee_amount: String,
+    claim_10_fee_amount: String,
+    claim_50_fee_amount: String,
+    claim_100_fee_amount: String,
+    refund_with_claim_1_fee_amount: String,
+    refund_with_claim_10_fee_amount: String,
+    refund_with_claim_50_fee_amount: String,
+    refund_with_claim_100_fee_amount: String,
 }
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct SellerCredit {
     credit_atoms: u128,
     updated_at: u64,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase"))]
+struct SellerAcceptance {
+    seller: String,
+    status: String,
+    terms_version: String,
+    privacy_version: String,
+    asset_boundary_version: String,
+    accepted_at: u64,
+    superseded: bool,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerAcceptanceChallenge {
+    seller: String,
+    nonce: String,
+    expires_at: u64,
+    message: String,
+    facilitator_signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerAcceptanceSubmission {
+    seller: String,
+    nonce: String,
+    expires_at: u64,
+    message: String,
+    facilitator_signature: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerSettlementItem {
+    key: String,
+    kind: String,
+    status: String,
+    payer: String,
+    seller: String,
+    amount: String,
+    fee: String,
+    transaction: String,
+    confirmations: u64,
+    failure_reason: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(CandidType, CandidDeserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SellerSettlementPage {
+    items: Vec<SellerSettlementItem>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, CandidType, CandidDeserialize)]
@@ -95,9 +398,23 @@ struct ActiveSettlement {
     tx: Option<String>,
 }
 
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct StaleSettlementRecovery {
+    key: String,
+    seller: String,
+    refunded_fee: String,
+}
+
 #[derive(Clone, Debug, Default, CandidType, CandidDeserialize)]
 struct NonceState {
     next_nonce: Option<u128>,
+}
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
+struct BatchDeletedChannel {
+    channel: BatchChannel,
+    deleted_at: u64,
+    deleted_by: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -134,26 +451,395 @@ fn http_request(request: HttpRequest) -> HttpResponse {
 async fn http_request_update(request: HttpRequest) -> HttpResponse {
     match (request.method.as_str(), path(&request.url).as_str()) {
         ("GET", "/seller-credit") => seller_credit_http(request).await,
+        ("POST", "/seller-acceptance/challenge") => seller_acceptance_challenge_http(&request),
+        ("POST", "/seller-acceptance") => seller_acceptance_submit_http(&request),
         ("POST", "/settle") => settle_http(request).await,
+        ("POST", "/verify") => verify_http(request).await,
         _ => route(request, true),
     }
 }
 
 #[update]
 fn set_env(name: String, value: String) {
-    let caller = ic_cdk::api::msg_caller();
-    if !ic_cdk::api::is_controller(&caller) {
-        ic_cdk::trap("caller is not a controller");
+    require_controller_or_trap();
+    if matches!(
+        name.as_str(),
+        "NETWORK_PROFILE"
+            | "AMOY_JPYC_ADDRESS"
+            | "AMOY_BATCH_SETTLEMENT_CONTRACT"
+            | "BATCH_SETTLEMENT_CONTRACT"
+            | "SELLER_SETTLEMENT_FEE_AMOUNT"
+            | "BATCH_SETTLEMENT_FEE_AMOUNT"
+            | "BATCH_DEPOSIT_FEE_AMOUNT"
+            | "BATCH_CLAIM_FEE_AMOUNT"
+            | "BATCH_SETTLE_FEE_AMOUNT"
+            | "BATCH_REFUND_FEE_AMOUNT"
+            | "BATCH_CLAIM_1_FEE_AMOUNT"
+            | "BATCH_CLAIM_10_FEE_AMOUNT"
+            | "BATCH_CLAIM_50_FEE_AMOUNT"
+            | "BATCH_CLAIM_100_FEE_AMOUNT"
+            | "BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT"
+            | "BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT"
+            | "BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT"
+            | "BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT"
+            | "SELLER_TERMS_VERSION"
+            | "PRIVACY_VERSION"
+            | "ASSET_BOUNDARY_VERSION"
+    ) {
+        ic_cdk::trap("network profile fields must be changed with set_runtime_profile");
+    }
+    if let Err(message) = validate_env_update(&name, &value) {
+        ic_cdk::trap(&message);
     }
     set_env_value(&name, &value);
 }
 
-#[query]
-fn env_names() -> Vec<String> {
-    let caller = ic_cdk::api::msg_caller();
-    if !ic_cdk::api::is_controller(&caller) {
+fn validate_env_update(name: &str, value: &str) -> Result<(), String> {
+    if configured_network_profile().as_deref() != Ok("polygon") {
+        return Ok(());
+    }
+    if matches!(
+        name,
+        "SELLER_TERMS_VERSION" | "PRIVACY_VERSION" | "ASSET_BOUNDARY_VERSION"
+    ) && (value.trim().is_empty() || value.ends_with("-draft"))
+    {
+        return Err(format!(
+            "{name} must be an approved, non-draft version for Polygon production"
+        ));
+    }
+    let minimum = match name {
+        "SELLER_SETTLEMENT_FEE_AMOUNT" => Some(JPYC_ATOMIC_UNITS / 2),
+        "BATCH_SETTLEMENT_FEE_AMOUNT" => Some(JPYC_ATOMIC_UNITS / 2),
+        "BATCH_DEPOSIT_FEE_AMOUNT"
+        | "BATCH_CLAIM_FEE_AMOUNT"
+        | "BATCH_SETTLE_FEE_AMOUNT"
+        | "BATCH_REFUND_FEE_AMOUNT"
+        | "BATCH_CLAIM_1_FEE_AMOUNT"
+        | "BATCH_CLAIM_10_FEE_AMOUNT"
+        | "BATCH_CLAIM_50_FEE_AMOUNT"
+        | "BATCH_CLAIM_100_FEE_AMOUNT"
+        | "BATCH_REFUND_WITH_CLAIM_1_FEE_AMOUNT"
+        | "BATCH_REFUND_WITH_CLAIM_10_FEE_AMOUNT"
+        | "BATCH_REFUND_WITH_CLAIM_50_FEE_AMOUNT"
+        | "BATCH_REFUND_WITH_CLAIM_100_FEE_AMOUNT" => Some(JPYC_ATOMIC_UNITS / 2),
+        _ => None,
+    };
+    if let Some(minimum) = minimum {
+        let amount = value
+            .parse::<u128>()
+            .map_err(|_| format!("{name} must be a positive uint128 integer"))?;
+        if amount < minimum {
+            return Err(format!("{name} is below the Polygon production minimum"));
+        }
+    }
+    Ok(())
+}
+
+#[update]
+fn set_runtime_profile(update: RuntimeProfileUpdate) -> Result<(), String> {
+    require_controller_or_trap();
+    validate_network_profile_values(&update.profile, &update.token, &update.batch_contract)?;
+    if update.profile == "polygon" {
+        validate_polygon_production_values(
+            &update.seller_settlement_fee_amount,
+            &update.batch_settlement_fee_amount,
+            &update.terms_version,
+            &update.privacy_version,
+            &update.asset_boundary_version,
+        )?;
+    } else {
+        required_positive_u128_value(
+            "SELLER_SETTLEMENT_FEE_AMOUNT",
+            &update.seller_settlement_fee_amount,
+        )?;
+        required_positive_u128_value(
+            "BATCH_SETTLEMENT_FEE_AMOUNT",
+            &update.batch_settlement_fee_amount,
+        )?;
+    }
+    if batch_fee_profile_has_any_value() {
+        for name in [
+            BATCH_DEPOSIT_FEE_ENV,
+            BATCH_CLAIM_FEE_ENV,
+            BATCH_SETTLE_FEE_ENV,
+            BATCH_REFUND_FEE_ENV,
+        ] {
+            validate_fee_for_profile(&update.profile, name, &env(name)?)?;
+        }
+    }
+    if let Some(schedule) = configured_batch_claim_fee_schedule()? {
+        for (name, value) in batch_claim_fee_schedule_values(&schedule) {
+            validate_fee_for_profile(&update.profile, name, value)?;
+        }
+    }
+    apply_network_profile(&update.profile, &update.token, &update.batch_contract)?;
+    set_env_value(
+        "SELLER_SETTLEMENT_FEE_AMOUNT",
+        &update.seller_settlement_fee_amount,
+    );
+    set_env_value(
+        "BATCH_SETTLEMENT_FEE_AMOUNT",
+        &update.batch_settlement_fee_amount,
+    );
+    set_env_value("SELLER_TERMS_VERSION", &update.terms_version);
+    set_env_value("PRIVACY_VERSION", &update.privacy_version);
+    set_env_value("ASSET_BOUNDARY_VERSION", &update.asset_boundary_version);
+    Ok(())
+}
+
+#[update]
+fn set_runtime_configuration(update: RuntimeConfigurationUpdate) -> Result<(), String> {
+    require_controller_or_trap();
+    validate_network_profile_values(&update.profile, &update.token, &update.batch_contract)?;
+    validate_document_versions_for_profile(
+        &update.profile,
+        &update.terms_version,
+        &update.privacy_version,
+        &update.asset_boundary_version,
+    )?;
+    validate_fee_for_profile(
+        &update.profile,
+        "SELLER_SETTLEMENT_FEE_AMOUNT",
+        &update.seller_settlement_fee_amount,
+    )?;
+    for (name, value) in [
+        (BATCH_DEPOSIT_FEE_ENV, &update.deposit_fee_amount),
+        (BATCH_CLAIM_FEE_ENV, &update.claim_fee_amount),
+        (BATCH_SETTLE_FEE_ENV, &update.settle_fee_amount),
+        (BATCH_REFUND_FEE_ENV, &update.refund_fee_amount),
+    ] {
+        validate_fee_for_profile(&update.profile, name, value)?;
+    }
+    if let Some(schedule) = &update.claim_fee_schedule {
+        validate_monotonic_fee_schedule(
+            "claim fee schedule",
+            [
+                &schedule.claim_1_fee_amount,
+                &schedule.claim_10_fee_amount,
+                &schedule.claim_50_fee_amount,
+                &schedule.claim_100_fee_amount,
+            ],
+        )?;
+        validate_monotonic_fee_schedule(
+            "refund-with-claim fee schedule",
+            [
+                &schedule.refund_with_claim_1_fee_amount,
+                &schedule.refund_with_claim_10_fee_amount,
+                &schedule.refund_with_claim_50_fee_amount,
+                &schedule.refund_with_claim_100_fee_amount,
+            ],
+        )?;
+        for (name, value) in batch_claim_fee_schedule_values(schedule) {
+            validate_fee_for_profile(&update.profile, name, value)?;
+        }
+    }
+
+    apply_network_profile(&update.profile, &update.token, &update.batch_contract)?;
+    set_env_value(
+        "SELLER_SETTLEMENT_FEE_AMOUNT",
+        &update.seller_settlement_fee_amount,
+    );
+    set_env_value(BATCH_DEPOSIT_FEE_ENV, &update.deposit_fee_amount);
+    set_env_value(BATCH_CLAIM_FEE_ENV, &update.claim_fee_amount);
+    set_env_value(BATCH_SETTLE_FEE_ENV, &update.settle_fee_amount);
+    set_env_value(BATCH_REFUND_FEE_ENV, &update.refund_fee_amount);
+    let legacy = update
+        .claim_fee_schedule
+        .as_ref()
+        .map(|schedule| schedule.claim_100_fee_amount.as_str())
+        .unwrap_or(update.claim_fee_amount.as_str());
+    set_env_value(BATCH_LEGACY_FEE_ENV, legacy);
+    clear_batch_claim_fee_schedule_values();
+    if let Some(schedule) = &update.claim_fee_schedule {
+        for (name, value) in batch_claim_fee_schedule_values(schedule) {
+            set_env_value(name, value);
+        }
+    }
+    set_env_value("SELLER_TERMS_VERSION", &update.terms_version);
+    set_env_value("PRIVACY_VERSION", &update.privacy_version);
+    set_env_value("ASSET_BOUNDARY_VERSION", &update.asset_boundary_version);
+    Ok(())
+}
+
+#[update]
+fn set_batch_fee_profile(update: BatchFeeProfileUpdate) -> Result<(), String> {
+    require_controller_or_trap();
+    let schedule = configured_batch_claim_fee_schedule()?;
+    for (name, value) in [
+        (BATCH_DEPOSIT_FEE_ENV, &update.deposit_fee_amount),
+        (BATCH_CLAIM_FEE_ENV, &update.claim_fee_amount),
+        (BATCH_SETTLE_FEE_ENV, &update.settle_fee_amount),
+        (BATCH_REFUND_FEE_ENV, &update.refund_fee_amount),
+    ] {
+        required_positive_u128_value(name, value)?;
+        validate_env_update(name, value)?;
+    }
+    let legacy = schedule
+        .map(|schedule| schedule.claim_100_fee_amount)
+        .unwrap_or_else(|| update.claim_fee_amount.clone());
+    set_env_value(BATCH_DEPOSIT_FEE_ENV, &update.deposit_fee_amount);
+    set_env_value(BATCH_CLAIM_FEE_ENV, &update.claim_fee_amount);
+    set_env_value(BATCH_SETTLE_FEE_ENV, &update.settle_fee_amount);
+    set_env_value(BATCH_REFUND_FEE_ENV, &update.refund_fee_amount);
+    // Keep the legacy value equal to the effective 100-claim price for old readers.
+    set_env_value(BATCH_LEGACY_FEE_ENV, &legacy);
+    Ok(())
+}
+
+#[update]
+fn set_batch_claim_fee_schedule(update: BatchClaimFeeSchedule) -> Result<(), String> {
+    require_controller_or_trap();
+    validate_batch_claim_fee_schedule(&update)?;
+    for (name, value) in batch_claim_fee_schedule_values(&update) {
+        set_env_value(name, value);
+    }
+    set_env_value(BATCH_LEGACY_FEE_ENV, &update.claim_100_fee_amount);
+    Ok(())
+}
+
+fn validate_polygon_production_values(
+    seller_fee: &str,
+    batch_fee: &str,
+    terms: &str,
+    privacy: &str,
+    asset_boundary: &str,
+) -> Result<(), String> {
+    for (name, value) in [
+        ("SELLER_TERMS_VERSION", terms),
+        ("PRIVACY_VERSION", privacy),
+        ("ASSET_BOUNDARY_VERSION", asset_boundary),
+    ] {
+        if value.trim().is_empty() || value.ends_with("-draft") {
+            return Err(format!(
+                "{name} must be an approved, non-draft version for Polygon production"
+            ));
+        }
+    }
+    let seller_fee = required_positive_u128_value("SELLER_SETTLEMENT_FEE_AMOUNT", seller_fee)?;
+    if seller_fee < JPYC_ATOMIC_UNITS / 2 {
+        return Err(
+            "SELLER_SETTLEMENT_FEE_AMOUNT is below the Polygon production minimum".to_string(),
+        );
+    }
+    let batch_fee = required_positive_u128_value("BATCH_SETTLEMENT_FEE_AMOUNT", batch_fee)?;
+    if batch_fee < JPYC_ATOMIC_UNITS / 2 {
+        return Err(
+            "BATCH_SETTLEMENT_FEE_AMOUNT is below the Polygon production minimum".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_document_versions_for_profile(
+    profile: &str,
+    terms: &str,
+    privacy: &str,
+    asset_boundary: &str,
+) -> Result<(), String> {
+    if profile != "polygon" {
+        return Ok(());
+    }
+    for (name, value) in [
+        ("SELLER_TERMS_VERSION", terms),
+        ("PRIVACY_VERSION", privacy),
+        ("ASSET_BOUNDARY_VERSION", asset_boundary),
+    ] {
+        if value.trim().is_empty() || value.ends_with("-draft") {
+            return Err(format!(
+                "{name} must be an approved, non-draft version for Polygon production"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fee_for_profile(profile: &str, name: &str, value: &str) -> Result<u128, String> {
+    let amount = required_positive_u128_value(name, value)?;
+    if profile == "polygon" && amount < JPYC_ATOMIC_UNITS / 2 {
+        return Err(format!("{name} is below the Polygon production minimum"));
+    }
+    Ok(amount)
+}
+
+fn validate_network_profile_values(
+    profile: &str,
+    token: &str,
+    batch_contract: &str,
+) -> Result<(), String> {
+    match profile {
+        "polygon" => {
+            if !same_address(token, JPYC_POLYGON_ADDRESS)
+                || !same_address(batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
+            {
+                return Err(
+                    "polygon profile requires the pinned JPYC and official batch contract"
+                        .to_string(),
+                );
+            }
+        }
+        "amoy" => {
+            let token = normalize_evm_address("token", token)?;
+            let batch_contract = normalize_evm_address("batch_contract", batch_contract)?;
+            if same_address(&token, JPYC_POLYGON_ADDRESS)
+                || !same_address(&batch_contract, CANONICAL_BATCH_SETTLEMENT_CONTRACT)
+            {
+                return Err(
+                    "amoy profile requires a test token and the official canonical batch contract"
+                        .to_string(),
+                );
+            }
+        }
+        _ => return Err("NETWORK_PROFILE must be polygon or amoy".to_string()),
+    }
+    Ok(())
+}
+
+fn required_positive_u128_value(name: &str, value: &str) -> Result<u128, String> {
+    let value = value
+        .parse::<u128>()
+        .map_err(|_| format!("{name} must be a positive uint128 integer"))?;
+    if value == 0 {
+        return Err(format!("{name} must be a positive uint128 integer"));
+    }
+    Ok(value)
+}
+
+fn apply_network_profile(profile: &str, token: &str, batch_contract: &str) -> Result<(), String> {
+    validate_network_profile_values(profile, token, batch_contract)?;
+    // An Amoy code check is deployment-specific and must be re-established after every
+    // profile application before batch support can be advertised or used.
+    set_env_value("AMOY_BATCH_CONTRACT_CODE_VERIFIED", "");
+    match profile {
+        "polygon" => {
+            set_env_value("AMOY_JPYC_ADDRESS", "");
+            set_env_value("AMOY_BATCH_SETTLEMENT_CONTRACT", "");
+            set_env_value(
+                "BATCH_SETTLEMENT_CONTRACT",
+                CANONICAL_BATCH_SETTLEMENT_CONTRACT,
+            );
+        }
+        "amoy" => {
+            let token = normalize_evm_address("token", token)?;
+            let batch_contract = normalize_evm_address("batch_contract", batch_contract)?;
+            set_env_value("AMOY_JPYC_ADDRESS", &token);
+            set_env_value("AMOY_BATCH_SETTLEMENT_CONTRACT", &batch_contract);
+            set_env_value("BATCH_SETTLEMENT_CONTRACT", &batch_contract);
+        }
+        _ => return Err("NETWORK_PROFILE must be polygon or amoy".to_string()),
+    }
+    set_env_value("NETWORK_PROFILE", profile);
+    Ok(())
+}
+
+fn require_controller_or_trap() {
+    if !batch_caller_is_controller() {
         ic_cdk::trap("caller is not a controller");
     }
+}
+
+#[query]
+fn env_names() -> Vec<String> {
+    require_controller_or_trap();
     ENV.with(|env| {
         env.borrow()
             .iter()
@@ -167,23 +853,323 @@ fn pre_upgrade() {}
 
 #[post_upgrade]
 fn post_upgrade() {
-    if let Ok((state,)) = ic_cdk::storage::stable_restore::<(StableState,)>() {
-        migrate_legacy_state(state);
+    init_sqlite_db_or_trap();
+    if stable_structures_empty() {
+        if let Ok((state,)) = ic_cdk::storage::stable_restore::<(StableState,)>() {
+            migrate_legacy_state(state);
+        }
+    }
+    finalize_post_upgrade_state();
+}
+
+fn finalize_post_upgrade_state() {
+    clear_seller_acceptance_challenges();
+    rebuild_seller_settlement_index();
+}
+
+fn init_sqlite_db_or_trap() {
+    if let Err(message) = init_sqlite_db() {
+        ic_cdk::trap(&message);
     }
 }
 
+#[cfg(not(test))]
+fn init_sqlite_db() -> Result<(), String> {
+    MEMORY_MANAGER.with(|manager| {
+        match SqliteDb::init(manager.borrow().get(SQLITE_MEMORY_ID)) {
+            Ok(()) | Err(SqliteDbError::StableMemoryAlreadyInitialized) => Ok(()),
+            Err(error) => Err(format!("sqlite init failed: {error}")),
+        }
+    })?;
+    SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS)
+        .map_err(|error| format!("sqlite migration failed: {error}"))?;
+    SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS_V2)
+        .map_err(|error| format!("sqlite migration failed: {error}"))?;
+    SqliteDb::migrate(BATCH_SQLITE_MIGRATIONS_V3)
+        .map_err(|error| format!("sqlite migration failed: {error}"))
+}
+
+#[cfg(test)]
+fn init_sqlite_db() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn batch_update_caller() -> Principal {
+    ic_cdk::api::msg_caller()
+}
+
+#[cfg(test)]
+fn batch_update_caller() -> Principal {
+    TEST_BATCH_CALLER.with(|caller| *caller.borrow())
+}
+
+#[cfg(not(test))]
+fn batch_caller_is_controller() -> bool {
+    ic_cdk::api::is_controller(&batch_update_caller())
+}
+
+#[cfg(test)]
+fn batch_caller_is_controller() -> bool {
+    TEST_BATCH_CALLER_IS_CONTROLLER.with(|is_controller| *is_controller.borrow())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BATCH_CALLER: RefCell<Principal> = RefCell::new(Principal::anonymous());
+    static TEST_BATCH_CALLER_IS_CONTROLLER: RefCell<bool> = const { RefCell::new(true) };
+    static TEST_BATCH_SELLERS: RefCell<BTreeMap<String, BatchSeller>> = const { RefCell::new(BTreeMap::new()) };
+    static TEST_BATCH_WRITER_RECEIVER_SCOPES: RefCell<BTreeMap<String, BatchWriterReceiverScope>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+fn set_test_batch_caller(caller: Principal, is_controller: bool) {
+    TEST_BATCH_CALLER.with(|value| *value.borrow_mut() = caller);
+    TEST_BATCH_CALLER_IS_CONTROLLER.with(|value| *value.borrow_mut() = is_controller);
+}
+
+#[cfg(test)]
+fn reset_test_batch_caller() {
+    set_test_batch_caller(Principal::anonymous(), true);
+}
+
+#[cfg(not(test))]
+fn sqlite_error(error: SqliteDbError) -> String {
+    format!("sqlite error: {error}")
+}
+
+#[cfg(not(test))]
+fn sqlite_u64(label: &str, value: i64) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("{label} is out of range"))
+}
+
+fn sqlite_now_seconds() -> i64 {
+    i64::try_from(now_seconds()).unwrap_or(i64::MAX)
+}
+
+fn validate_non_system_principal(label: &str, principal: Principal) -> Result<(), String> {
+    let text = principal.to_text();
+    if text == "2vxsx-fae" || text == "aaaaa-aa" {
+        return Err(format!("{label} must be a non-system IC principal"));
+    }
+    Ok(())
+}
+
+fn require_sqlite_text(label: &str, value: &str, max_bytes: usize) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required"));
+    }
+    if trimmed.len() > max_bytes {
+        return Err(format!("{label} exceeds {max_bytes} bytes"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn require_seller_status(status: &str) -> Result<String, String> {
+    let status = require_sqlite_text("status", status, 64)?;
+    match status.as_str() {
+        "active" | "disabled" => Ok(status),
+        _ => Err("seller status must be active or disabled".to_string()),
+    }
+}
+
+#[cfg(not(test))]
+fn batch_sqlite_scope_count() -> Result<u64, String> {
+    init_sqlite_db()?;
+    let count = SqliteDb::query(|connection| {
+        connection.query_scalar::<i64>(
+            "SELECT COUNT(*)
+             FROM writer_receiver_scopes scopes
+             JOIN sellers ON sellers.receiver_address = scopes.receiver_address
+             WHERE scopes.enabled = 1 AND sellers.status = 'active'",
+            params![],
+        )
+    })
+    .map_err(sqlite_error)?;
+    sqlite_u64("batch writer receiver scope count", count)
+}
+
+#[cfg(test)]
+fn batch_sqlite_scope_count() -> Result<u64, String> {
+    let count = TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+        TEST_BATCH_SELLERS.with(|sellers| {
+            let sellers = sellers.borrow();
+            scopes
+                .borrow()
+                .values()
+                .filter(|scope| {
+                    scope.enabled
+                        && sellers
+                            .get(&scope.receiver_address)
+                            .is_some_and(|seller| seller.status == "active")
+                })
+                .count()
+        })
+    });
+    u64::try_from(count)
+        .map_err(|_| "batch writer receiver scope count is out of range".to_string())
+}
+
+fn require_batch_writer_receiver_scope_configured() -> Result<(), String> {
+    if batch_sqlite_scope_count()? == 0 {
+        return Err("missing enabled batch writer receiver scope".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn batch_writer_scope_enabled(writer: Principal, receiver: &str) -> Result<bool, String> {
+    validate_non_system_principal("writer", writer)?;
+    let receiver = normalize_evm_address("receiver", receiver)?;
+    let writer = writer.to_text();
+    init_sqlite_db()?;
+    SqliteDb::query(|connection| {
+        connection.exists(
+            "SELECT 1
+             FROM writer_receiver_scopes scopes
+             JOIN sellers ON sellers.receiver_address = scopes.receiver_address
+             WHERE scopes.writer_principal = ?1
+               AND scopes.receiver_address = ?2
+               AND scopes.enabled = 1
+               AND sellers.status = 'active'",
+            params![writer, receiver],
+        )
+    })
+    .map_err(sqlite_error)
+}
+
+#[cfg(test)]
+fn batch_writer_scope_enabled(writer: Principal, receiver: &str) -> Result<bool, String> {
+    validate_non_system_principal("writer", writer)?;
+    let receiver = normalize_evm_address("receiver", receiver)?;
+    let key = test_scope_key(&writer.to_text(), &receiver);
+    Ok(TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+        TEST_BATCH_SELLERS.with(|sellers| {
+            scopes.borrow().get(&key).is_some_and(|scope| {
+                scope.enabled
+                    && sellers
+                        .borrow()
+                        .get(&receiver)
+                        .is_some_and(|seller| seller.status == "active")
+            })
+        })
+    }))
+}
+
+#[cfg(test)]
+fn test_scope_key(writer: &str, receiver: &str) -> String {
+    format!("{writer}\n{receiver}")
+}
+
+#[cfg(not(test))]
+fn batch_scope_from_row(
+    row: &ic_sqlite_vfs::db::Row<'_>,
+) -> Result<BatchWriterReceiverScope, SqliteDbError> {
+    let writer_text = row.get::<String>(0)?;
+    let writer_principal = Principal::from_text(&writer_text)
+        .map_err(|_| SqliteDbError::Constraint("invalid writer principal".to_string()))?;
+    Ok(BatchWriterReceiverScope {
+        writer_principal,
+        receiver_address: row.get::<String>(1)?,
+        enabled: row.get::<i64>(2)? != 0,
+        created_at: u64::try_from(row.get::<i64>(3)?)
+            .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
+        updated_at: u64::try_from(row.get::<i64>(4)?)
+            .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
+        updated_by: row.get::<String>(5)?,
+    })
+}
+
+#[cfg(not(test))]
+fn batch_seller_from_row(row: &ic_sqlite_vfs::db::Row<'_>) -> Result<BatchSeller, SqliteDbError> {
+    Ok(BatchSeller {
+        receiver_address: row.get::<String>(0)?,
+        status: row.get::<String>(1)?,
+        created_at: u64::try_from(row.get::<i64>(2)?)
+            .map_err(|_| SqliteDbError::Constraint("created_at out of range".to_string()))?,
+        updated_at: u64::try_from(row.get::<i64>(3)?)
+            .map_err(|_| SqliteDbError::Constraint("updated_at out of range".to_string()))?,
+    })
+}
+
 fn encode_stable<T: CandidType>(value: &T) -> Vec<u8> {
-    candid::encode_one(value).expect("stable value must encode")
+    let payload = candid::encode_one(value).expect("stable value must encode");
+    candid::encode_one(VersionedStableValue {
+        version: STABLE_VALUE_VERSION,
+        payload,
+    })
+    .expect("stable wrapper must encode")
 }
 
 fn decode_stable<T: CandidType + for<'de> CandidDeserialize<'de>>(bytes: Vec<u8>) -> T {
-    candid::decode_one(&bytes).expect("stable value must decode")
+    decode_stable_result(bytes).expect("stable value must decode")
+}
+
+fn decode_stable_result<T: CandidType + for<'de> CandidDeserialize<'de>>(
+    bytes: Vec<u8>,
+) -> Result<T, String> {
+    match candid::decode_one::<VersionedStableValue>(&bytes) {
+        Ok(wrapper) => {
+            if wrapper.version != STABLE_VALUE_VERSION {
+                return Err(format!(
+                    "unsupported stable value version {}",
+                    wrapper.version
+                ));
+            }
+            candid::decode_one(&wrapper.payload)
+                .map_err(|error| format!("stable value payload decode failed: {error}"))
+        }
+        Err(wrapper_error) => candid::decode_one(&bytes).map_err(|legacy_error| {
+            format!("stable value decode failed: wrapper={wrapper_error}; legacy={legacy_error}")
+        }),
+    }
+}
+
+fn stable_structures_empty() -> bool {
+    ENV.with(|items| items.borrow().is_empty())
+        && SETTLEMENTS.with(|items| items.borrow().is_empty())
+        && SELLER_CREDITS.with(|items| items.borrow().is_empty())
+        && CREDITED_SETTLEMENTS.with(|items| items.borrow().is_empty())
+        && ACTIVE_SETTLEMENTS.with(|items| items.borrow().is_empty())
+        && NONCES.with(|items| items.borrow().is_empty())
+        && BATCH_CHANNELS.with(|items| items.borrow().is_empty())
+        && BATCH_DELETED_CHANNELS.with(|items| items.borrow().is_empty())
 }
 
 fn set_env_value(name: &str, value: &str) {
     ENV.with(|env| {
-        env.borrow_mut().insert(name.to_string(), value.to_string());
+        if value.trim().is_empty() {
+            env.borrow_mut().remove(&name.to_string());
+        } else {
+            env.borrow_mut().insert(name.to_string(), value.to_string());
+        }
     });
+}
+
+fn optional_env_value(name: &str) -> Option<String> {
+    if let Some(value) = ENV.with(|env| env.borrow().get(&name.to_string())) {
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        if !ic_cdk::api::env_var_name_exists(name) {
+            None
+        } else {
+            let value = ic_cdk::api::env_var_value(name);
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        }
+    }
 }
 
 fn clear_env_values_runtime() {
@@ -210,6 +1196,8 @@ fn remove_env_value(name: &str) {
 #[cfg(test)]
 fn clear_env_values() {
     clear_env_values_runtime();
+    clear_batch_sqlite();
+    reset_test_batch_caller();
 }
 
 fn get_settlement(key: &str) -> Option<SettlementRecord> {
@@ -253,6 +1241,134 @@ fn get_active_settlement(from: &str) -> Option<ActiveSettlement> {
             .get(&from.to_string())
             .map(decode_stable::<ActiveSettlement>)
     })
+}
+
+fn put_batch_channel(channel_id: &str, channel: BatchChannel) -> Result<(), String> {
+    BATCH_CHANNELS.with(|items| {
+        let mut items = items.borrow_mut();
+        let key = channel_id.to_ascii_lowercase();
+        if !items.contains_key(&key) && items.len() >= MAX_BATCH_CHANNELS_STORED {
+            return Err("batch channel storage limit reached".to_string());
+        }
+        items.insert(key, encode_stable(&channel));
+        Ok(())
+    })
+}
+
+fn can_put_batch_channel(channel_id: &str) -> bool {
+    BATCH_CHANNELS.with(|items| {
+        let items = items.borrow();
+        items.contains_key(&channel_id.to_ascii_lowercase())
+            || items.len() < MAX_BATCH_CHANNELS_STORED
+    })
+}
+
+fn get_batch_channel(channel_id: &str) -> Option<BatchChannel> {
+    BATCH_CHANNELS.with(|items| {
+        items
+            .borrow()
+            .get(&channel_id.to_ascii_lowercase())
+            .map(decode_stable::<BatchChannel>)
+    })
+}
+
+fn put_batch_deleted_channel(channel_id: &str, deleted: BatchDeletedChannel) {
+    BATCH_DELETED_CHANNELS.with(|items| {
+        let mut items = items.borrow_mut();
+        let key = channel_id.to_ascii_lowercase();
+        if !items.contains_key(&key) && items.len() >= MAX_BATCH_CHANNELS_STORED {
+            if let Some(oldest_key) = items
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.key().clone(),
+                        decode_stable::<BatchDeletedChannel>(entry.value()).deleted_at,
+                    )
+                })
+                .min_by_key(|(_, deleted_at)| *deleted_at)
+                .map(|(key, _)| key)
+            {
+                items.remove(&oldest_key);
+            }
+        }
+        items.insert(key, encode_stable(&deleted));
+    });
+}
+
+fn get_batch_deleted_channel(channel_id: &str) -> Option<BatchDeletedChannel> {
+    BATCH_DELETED_CHANNELS.with(|items| {
+        items
+            .borrow()
+            .get(&channel_id.to_ascii_lowercase())
+            .map(decode_stable::<BatchDeletedChannel>)
+    })
+}
+
+#[cfg(test)]
+fn batch_channel_update_caller_text() -> String {
+    batch_update_caller().to_text()
+}
+
+#[cfg(not(test))]
+fn batch_channel_update_caller_text() -> String {
+    batch_update_caller().to_text()
+}
+
+fn authorize_batch_channel_update(
+    current: Option<&BatchChannel>,
+    next: Option<&BatchChannel>,
+) -> Result<(), String> {
+    if batch_caller_is_controller() {
+        return Ok(());
+    }
+    let caller = batch_update_caller();
+    validate_non_system_principal("caller", caller)?;
+    let mut receivers = Vec::new();
+    if let Some(channel) = current {
+        receivers.push(normalize_evm_address(
+            "current.channelConfig.receiver",
+            &channel.channel_config.receiver,
+        )?);
+    }
+    if let Some(channel) = next {
+        receivers.push(normalize_evm_address(
+            "next.channelConfig.receiver",
+            &channel.channel_config.receiver,
+        )?);
+    }
+    receivers.sort();
+    receivers.dedup();
+    for receiver in receivers {
+        if !batch_writer_scope_enabled(caller, &receiver)? {
+            return Err(format!("caller is not authorized for receiver {receiver}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_channel_runtime_config(channel: &BatchChannel) -> Result<(), String> {
+    if !configured_token_address()
+        .is_ok_and(|token| same_address(&channel.channel_config.token, &token))
+    {
+        return Err("batch channel token must be JPYC on Polygon".to_string());
+    }
+    let receiver_authorizer = batch_receiver_authorizer_address()?;
+    if !same_address(
+        &channel.channel_config.receiver_authorizer,
+        &receiver_authorizer,
+    ) {
+        return Err(
+            "batch channel receiverAuthorizer must match BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
+                .to_string(),
+        );
+    }
+    let withdraw_delay = batch_withdraw_delay_seconds()?;
+    if channel.channel_config.withdraw_delay != withdraw_delay {
+        return Err(
+            "batch channel withdrawDelay must match BATCH_WITHDRAW_DELAY_SECONDS".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn put_nonce_state(from: &str, state: NonceState) {
@@ -301,6 +1417,25 @@ fn clear_seller_credits() {
     });
 }
 
+fn clear_seller_acceptance_challenges() {
+    SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+#[cfg(test)]
+fn encode_seller_acceptance_challenge(value: &SellerAcceptanceChallenge) -> Vec<u8> {
+    serde_json::to_vec(value).expect("seller acceptance challenge must encode")
+}
+
 fn clear_credited_settlements() {
     CREDITED_SETTLEMENTS.with(|items| {
         let keys = items
@@ -343,6 +1478,38 @@ fn clear_nonces() {
     });
 }
 
+#[cfg(test)]
+fn clear_batch_channels() {
+    BATCH_CHANNELS.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+    BATCH_DELETED_CHANNELS.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+#[cfg(test)]
+fn clear_batch_sqlite() {
+    TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| scopes.borrow_mut().clear());
+    TEST_BATCH_SELLERS.with(|sellers| sellers.borrow_mut().clear());
+}
+
 fn migrate_legacy_state(state: StableState) {
     clear_env_values_runtime();
     clear_settlements();
@@ -370,30 +1537,54 @@ fn migrate_legacy_state(state: StableState) {
     for (key, nonce) in state.nonces.unwrap_or_default() {
         put_nonce_state(&key, nonce);
     }
+    for (key, channel) in state.batch_channels.unwrap_or_default() {
+        put_batch_channel(&key, channel).expect("legacy batch channel storage exceeds limit");
+    }
+    for (key, deleted) in state.batch_deleted_channels.unwrap_or_default() {
+        put_batch_deleted_channel(&key, deleted);
+    }
 }
 
 fn route(request: HttpRequest, updated: bool) -> HttpResponse {
     match (request.method.as_str(), path(&request.url).as_str()) {
-        ("GET", "/health") => json_response(200, &health()),
-        ("GET", "/supported") => match env("JPYC_EIP712_VERSION") {
-            Ok(version) => json_response(200, &supported(facilitator_address(), &version)),
-            Err(message) => json_response(
-                500,
-                &serde_json::json!({ "error": "invalid_config", "message": message }),
-            ),
+        ("OPTIONS", _) => HttpResponse {
+            status_code: 204,
+            headers: vec![
+                HeaderField("access-control-allow-origin".to_string(), "*".to_string()),
+                HeaderField(
+                    "access-control-allow-methods".to_string(),
+                    "GET,POST,OPTIONS".to_string(),
+                ),
+                HeaderField(
+                    "access-control-allow-headers".to_string(),
+                    "content-type,payment-signature".to_string(),
+                ),
+            ],
+            body: Vec::new(),
+            upgrade: None,
         },
-        ("GET", "/seller-credit") if payment_signature_header(&request).is_some() && !updated => {
-            HttpResponse {
-                status_code: 202,
-                headers: vec![HeaderField(
-                    "content-type".to_string(),
-                    "text/plain".to_string(),
-                )],
-                body: b"upgrade required".to_vec(),
-                upgrade: Some(true),
-            }
-        }
+        ("GET", "/health") => json_response(200, &health()),
+        ("GET", "/supported") => supported_response(),
+        ("GET", "/seller-credit-balance") => seller_credit_balance_http(&request),
+        ("GET", "/seller-acceptance") => seller_acceptance_status_http(&request),
+        ("GET", "/seller-settlements") => seller_settlements_http(&request),
+        ("POST", "/seller-acceptance/challenge") if !updated => upgrade_response(),
+        ("POST", "/seller-acceptance") if !updated => upgrade_response(),
         ("GET", "/seller-credit") => {
+            if let Err(message) = seller_credit_request_parameters(&request) {
+                return json_response(400, &retryable_error("invalid_request", &message, false));
+            }
+            if payment_signature_header(&request).is_some() && !updated {
+                return HttpResponse {
+                    status_code: 202,
+                    headers: vec![HeaderField(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )],
+                    body: b"upgrade required".to_vec(),
+                    upgrade: Some(true),
+                };
+            }
             seller_credit_required_response(&request).unwrap_or_else(|message| {
                 json_response(400, &retryable_error("invalid_request", &message, false))
             })
@@ -407,13 +1598,281 @@ fn route(request: HttpRequest, updated: bool) -> HttpResponse {
             body: b"upgrade required".to_vec(),
             upgrade: Some(true),
         },
+        ("POST", "/verify") if !updated => HttpResponse {
+            status_code: 202,
+            headers: vec![HeaderField(
+                "content-type".to_string(),
+                "text/plain".to_string(),
+            )],
+            body: b"upgrade required".to_vec(),
+            upgrade: Some(true),
+        },
         _ => text_response(404, "not found"),
+    }
+}
+
+fn upgrade_response() -> HttpResponse {
+    HttpResponse {
+        status_code: 202,
+        headers: vec![HeaderField(
+            "content-type".to_string(),
+            "text/plain".to_string(),
+        )],
+        body: b"upgrade required".to_vec(),
+        upgrade: Some(true),
+    }
+}
+
+fn supported_response() -> HttpResponse {
+    let version = match env("JPYC_EIP712_VERSION") {
+        Ok(version) => version,
+        Err(message) => {
+            return json_response(
+                500,
+                &serde_json::json!({ "error": "invalid_config", "message": message }),
+            )
+        }
+    };
+    let mut response = supported(facilitator_address(), &version);
+    if let Some((receiver_authorizer, withdraw_delay)) = supported_batch_config() {
+        response.kinds.push(SupportedKind {
+            x402_version: 2,
+            scheme: BATCH_SCHEME.to_string(),
+            network: configured_network(),
+            extra: serde_json::json!({
+                "receiverAuthorizer": receiver_authorizer,
+                "withdrawDelay": withdraw_delay,
+                "assetTransferMethod": "eip3009",
+                "name": JPYC_EIP712_NAME,
+                "version": version
+            }),
+        });
+        response
+            .signers
+            .entry("eip155:*".to_string())
+            .or_default()
+            .push(facilitator_address());
+    }
+    json_response(200, &response)
+}
+
+fn supported_batch_config() -> Option<(String, u64)> {
+    optional_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY")?;
+    let receiver_authorizer = batch_receiver_authorizer_address().ok()?;
+    let withdraw_delay = batch_withdraw_delay_seconds().ok()?;
+    configured_batch_settlement_contract().ok()?;
+    require_amoy_batch_contract_code_verified().ok()?;
+    require_batch_fee_configuration().ok()?;
+    require_batch_writer_receiver_scope_configured().ok()?;
+    validate_batch_key_separation(&receiver_authorizer).ok()?;
+    Some((receiver_authorizer, withdraw_delay))
+}
+
+fn require_amoy_batch_contract_code_verified() -> Result<(), String> {
+    if configured_network_profile().as_deref() == Ok("amoy")
+        && optional_env_value("AMOY_BATCH_CONTRACT_CODE_VERIFIED").as_deref() != Some("1")
+    {
+        return Err(
+            "Amoy batch contract bytecode has not been verified; batch support is disabled"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn batch_withdraw_delay_seconds() -> Result<u64, String> {
+    let value = optional_positive_u64(
+        "BATCH_WITHDRAW_DELAY_SECONDS",
+        DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS,
+    )?;
+    validate_withdraw_delay(value)?;
+    Ok(value)
+}
+
+fn require_batch_settlement_enabled() -> Result<String, String> {
+    let receiver_authorizer = batch_receiver_authorizer_address()?;
+    batch_withdraw_delay_seconds()?;
+    let contract = configured_batch_settlement_contract()?;
+    require_amoy_batch_contract_code_verified()?;
+    require_batch_fee_configuration()?;
+    require_batch_writer_receiver_scope_configured()?;
+    validate_batch_key_separation(&receiver_authorizer)?;
+    Ok(contract)
+}
+
+fn require_batch_settlement_enabled_except_fee() -> Result<String, String> {
+    let receiver_authorizer = batch_receiver_authorizer_address()?;
+    batch_withdraw_delay_seconds()?;
+    let contract = configured_batch_settlement_contract()?;
+    require_amoy_batch_contract_code_verified()?;
+    require_batch_writer_receiver_scope_configured()?;
+    validate_batch_key_separation(&receiver_authorizer)?;
+    Ok(contract)
+}
+
+async fn verify_http(request: HttpRequest) -> HttpResponse {
+    let value = match parse_json_value(&request) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &verify_error("invalid_request", &message, None))
+        }
+    };
+    let Some(scheme) = value
+        .get("paymentRequirements")
+        .and_then(|item| item.get("scheme"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return json_response(
+            400,
+            &verify_error(
+                "invalid_request",
+                "missing paymentRequirements.scheme",
+                None,
+            ),
+        );
+    };
+    if scheme != BATCH_SCHEME {
+        return json_response(
+            400,
+            &verify_error(
+                "unsupported_verify_scheme",
+                "only batch-settlement supports /verify",
+                None,
+            ),
+        );
+    }
+    let body = match serde_json::from_value::<BatchFacilitatorRequest>(value) {
+        Ok(body) => body,
+        Err(err) => {
+            return json_response(
+                400,
+                &verify_error(
+                    "invalid_request",
+                    &format!("invalid batch JSON body: {err}"),
+                    None,
+                ),
+            )
+        }
+    };
+    let expected_version = match env("JPYC_EIP712_VERSION") {
+        Ok(value) => value,
+        Err(message) => return json_response(500, &verify_error("invalid_config", &message, None)),
+    };
+    let payload = match batch_payload(&body.payment_payload.payload) {
+        Ok(payload) => payload,
+        Err(message) => {
+            return json_response(400, &verify_error("invalid_request", &message, None));
+        }
+    };
+    if let Err(message) = validate_batch_claim_count(&payload) {
+        return json_response(400, &verify_error("invalid_request", &message, None));
+    }
+    let version_check = if requires_batch_eip712_version(&payload) {
+        validate_batch_eip712_version(&body, &expected_version)
+    } else {
+        validate_optional_batch_eip712_version(&body, &expected_version)
+    };
+    if let Err(message) = version_check {
+        return json_response(
+            402,
+            &verify_error("invalid_batch_settlement", &message, None),
+        );
+    }
+    let channel_id = match voucher_channel_id(&payload) {
+        Ok(channel_id) => channel_id,
+        Err(message) => {
+            return json_response(400, &verify_error("invalid_request", &message, None));
+        }
+    };
+    let channel_id = channel_id.to_string();
+    let contract = match require_batch_settlement_enabled() {
+        Ok(contract) => contract,
+        Err(message) => {
+            return json_response(500, &verify_error("invalid_config", &message, None));
+        }
+    };
+    let current = get_batch_channel(&channel_id);
+    let verified = match validate_batch_request(&body, current.as_ref(), &contract) {
+        Ok(verified) => verified,
+        Err(message) => {
+            if let Some(extra) = batch_corrective_verify_extra(current.as_ref(), &message) {
+                return json_response(
+                    402,
+                    &VerifyResponse {
+                        is_valid: false,
+                        invalid_reason: Some("invalid_batch_settlement".to_string()),
+                        invalid_message: Some(message),
+                        payer: current.as_ref().and_then(batch_channel_payer),
+                        extra: Some(extra),
+                    },
+                );
+            }
+            return json_response(
+                402,
+                &verify_error("invalid_batch_settlement", &message, None),
+            );
+        }
+    };
+    let Some(current) = current.as_ref() else {
+        return json_response(
+            402,
+            &verify_error(
+                "invalid_batch_settlement",
+                "invalid_batch_settlement_evm_channel_not_found",
+                Some(verified.payer),
+            ),
+        );
+    };
+    if let Err(message) = validate_batch_verify_pending(&payload, current) {
+        return json_response(
+            402,
+            &verify_error("invalid_batch_settlement", &message, Some(verified.payer)),
+        );
+    }
+    let snapshot = batch_channel_storage_snapshot(current);
+    if let Err(message) = validate_batch_verify_snapshot(&payload, &snapshot) {
+        return json_response(
+            402,
+            &verify_error("invalid_batch_settlement", &message, Some(verified.payer)),
+        );
+    }
+    json_response(
+        200,
+        &VerifyResponse {
+            is_valid: true,
+            invalid_reason: None,
+            invalid_message: None,
+            payer: Some(verified.payer),
+            extra: Some(batch_verify_success_extra(&snapshot)),
+        },
+    )
+}
+
+fn batch_verify_success_extra(snapshot: &BatchChannelSnapshot) -> serde_json::Value {
+    let channel_state = snapshot.to_json();
+    serde_json::json!({
+        "channelId": snapshot.channel_id,
+        "balance": snapshot.balance,
+        "totalClaimed": snapshot.total_claimed,
+        "withdrawRequestedAt": snapshot.withdraw_requested_at,
+        "refundNonce": snapshot.refund_nonce,
+        "channelState": channel_state
+    })
+}
+
+fn batch_channel_storage_snapshot(channel: &BatchChannel) -> BatchChannelSnapshot {
+    BatchChannelSnapshot {
+        channel_id: channel.channel_id.clone(),
+        balance: channel.balance.clone(),
+        total_claimed: channel.total_claimed.clone(),
+        withdraw_requested_at: channel.withdraw_requested_at,
+        refund_nonce: channel.refund_nonce.clone(),
     }
 }
 
 async fn settle_http(request: HttpRequest) -> HttpResponse {
     let mut trace = CostTrace::for_request(&request);
-    let body = match parse_request(&request) {
+    let value = match parse_json_value(&request) {
         Ok(body) => body,
         Err(message) => {
             trace.step("settle.parse", 0);
@@ -424,11 +1883,31 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             );
         }
     };
+    if batch::is_batch_request(&value) {
+        trace.step("settle.parse", 0);
+        return batch_settle_http(value, &mut trace).await;
+    }
+    let body = match serde_json::from_value::<FacilitatorRequest>(value) {
+        Ok(body) => body,
+        Err(err) => {
+            trace.step("settle.parse", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error(
+                    "invalid_request",
+                    &format!("invalid JSON body: {err}"),
+                    None,
+                ),
+                &trace,
+            );
+        }
+    };
     trace.step("settle.parse", 0);
     let untrusted_payer = body.payment_payload.payload.authorization.from.clone();
     if let Err(err) = validate_request_before_signature(&body) {
         trace.step("settle.cheap_validation", 0);
-        let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+        let response =
+            failed_settlement(&configured_network(), &err.reason, &err.message, err.payer);
         return json_response_with_cost(402, &response, &trace);
     }
     trace.step("settle.cheap_validation", 0);
@@ -448,7 +1927,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         trace.step("settle.version_validation", 0);
         return json_response_with_cost(
             402,
-            &failed_settlement(NETWORK, &err.reason, &err.message, err.payer),
+            &failed_settlement(&configured_network(), &err.reason, &err.message, err.payer),
             &trace,
         );
     }
@@ -466,11 +1945,25 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         );
     }
     trace.step("settle.seller_authorization", 0);
+    if let Err(message) = require_current_seller_acceptance(&body.payment_requirements.pay_to) {
+        trace.step("settle.seller_acceptance", 0);
+        return json_response_with_cost(
+            403,
+            &settle_error(
+                "seller_acceptance_required",
+                &message,
+                Some(untrusted_payer),
+            ),
+            &trace,
+        );
+    }
+    trace.step("settle.seller_acceptance", 0);
     let payer = match validate_request_signature(&body) {
         Ok(payer) => payer,
         Err(err) => {
             trace.step("settle.signature_validation", 0);
-            let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+            let response =
+                failed_settlement(&configured_network(), &err.reason, &err.message, err.payer);
             return json_response_with_cost(402, &response, &trace);
         }
     };
@@ -583,7 +2076,8 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             body.payment_requirements.amount.clone(),
             now_seconds(),
             ttl,
-        ),
+        )
+        .with_metadata("exact", Some(settlement_fee.to_string()), None),
     );
     let config = match rpc_config() {
         Ok(config) => config,
@@ -616,8 +2110,67 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     };
     trace.step("settle.pending_nonce", 1);
     let nonce = reserve_nonce(&from, rpc_nonce);
-    match send_settlement(&config, &private_key, &body, nonce).await {
-        Ok(SettlementOutcome::Settled(tx)) => {
+    let broadcast = match broadcast_settlement(&config, &private_key, &body, nonce).await {
+        Ok(broadcast) => {
+            update_active_broadcast(&active_scope, &key, broadcast.nonce, &broadcast.tx);
+            insert_settlement(
+                &key,
+                SettlementRecord::broadcast(
+                    broadcast.tx.clone(),
+                    payer.clone(),
+                    body.payment_requirements.pay_to.clone(),
+                    body.payment_requirements.amount.clone(),
+                    now_seconds(),
+                    ttl,
+                ),
+            );
+            broadcast
+        }
+        Err(SettlementSendError::GasTooExpensive) => {
+            trace.step("settle.send_settlement", 2);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
+            release_active_settlement(&active_scope, &key);
+            return json_response_with_cost(
+                503,
+                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
+                &trace,
+            );
+        }
+        Err(SettlementSendError::Ambiguous {
+            nonce,
+            tx,
+            message: _,
+        }) => {
+            trace.step("settle.send_settlement", 5);
+            update_active_broadcast(&active_scope, &key, nonce, &tx);
+            let record = SettlementRecord::broadcast(
+                tx,
+                payer,
+                body.payment_requirements.pay_to,
+                body.payment_requirements.amount,
+                now_seconds(),
+                ttl,
+            );
+            let record = insert_settlement(&key, record);
+            return json_response_with_cost(202, &record.response, &trace);
+        }
+        Err(SettlementSendError::Other(message)) => {
+            trace.step("settle.send_settlement", 5);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
+            release_active_settlement(&active_scope, &key);
+            return json_response_with_cost(
+                502,
+                &settle_error("settlement_failed", &message, Some(payer)),
+                &trace,
+            );
+        }
+    };
+    match confirm_settlement_broadcast(&config, &body, &broadcast).await {
+        SettlementOutcome::Settled(tx) => {
             trace.step("settle.send_settlement", 5);
             let record = SettlementRecord::settled(
                 tx,
@@ -631,7 +2184,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(200, &record.response, &trace)
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        SettlementOutcome::Pending { nonce, tx } => {
             trace.step("settle.send_settlement", 5);
             update_active_broadcast(&active_scope, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -645,7 +2198,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             let record = insert_settlement(&key, record);
             json_response_with_cost(202, &record.response, &trace)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        SettlementOutcome::Failed { tx, message } => {
             trace.step("settle.send_settlement", 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -659,31 +2212,746 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             release_active_settlement(&active_scope, &key);
             json_response_with_cost(502, &record.response, &trace)
         }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step("settle.send_settlement", 2);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&active_scope, &key);
-            json_response_with_cost(
-                503,
-                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
-                &trace,
+    }
+}
+
+async fn batch_settle_http(value: serde_json::Value, trace: &mut CostTrace) -> HttpResponse {
+    let body = match serde_json::from_value::<BatchFacilitatorRequest>(value) {
+        Ok(body) => body,
+        Err(err) => {
+            return json_response_with_cost(
+                400,
+                &settle_error(
+                    "invalid_request",
+                    &format!("invalid batch JSON body: {err}"),
+                    None,
+                ),
+                trace,
             )
         }
-        Err(SettlementSendError::Other(message)) => {
-            trace.step("settle.send_settlement", 5);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&active_scope, &key);
-            json_response_with_cost(
-                502,
-                &settle_error("settlement_failed", &message, Some(payer)),
-                &trace,
+    };
+    let payload = match batch_payload(&body.payment_payload.payload) {
+        Ok(payload) => payload,
+        Err(message) => {
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_request", &message, None),
+                trace,
             )
+        }
+    };
+    if let Err(message) = validate_batch_claim_count(&payload) {
+        return json_response_with_cost(
+            400,
+            &settle_error("invalid_request", &message, None),
+            trace,
+        );
+    }
+    if requires_batch_eip712_version(&payload) {
+        let expected_version = match env("JPYC_EIP712_VERSION") {
+            Ok(value) => value,
+            Err(message) => {
+                trace.step("batch_settle.validation", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, None),
+                    trace,
+                );
+            }
+        };
+        if let Err(message) = validate_batch_eip712_version(&body, &expected_version) {
+            trace.step("batch_settle.validation", 0);
+            return json_response_with_cost(
+                402,
+                &settle_error("invalid_batch_settlement", &message, None),
+                trace,
+            );
+        }
+    } else {
+        match env("JPYC_EIP712_VERSION") {
+            Ok(expected_version) => {
+                if let Err(message) =
+                    validate_optional_batch_eip712_version(&body, &expected_version)
+                {
+                    trace.step("batch_settle.validation", 0);
+                    return json_response_with_cost(
+                        402,
+                        &settle_error("invalid_batch_settlement", &message, None),
+                        trace,
+                    );
+                }
+            }
+            Err(message)
+                if body.payment_requirements.extra.get("version").is_some()
+                    || body.payment_payload.accepted.extra.get("version").is_some() =>
+            {
+                trace.step("batch_settle.validation", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, None),
+                    trace,
+                );
+            }
+            Err(_) => {}
         }
     }
+    let contract = match configured_batch_settlement_contract() {
+        Ok(contract) => contract,
+        Err(message) => {
+            trace.step("batch_settle.config", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_config", &message, None),
+                trace,
+            );
+        }
+    };
+    let current = batch_settle_current_channel(&payload);
+    let verified = match validate_batch_settle_request(&body, current.as_ref(), &contract) {
+        Ok(value) => value,
+        Err(message) => {
+            trace.step("batch_settle.validation", 0);
+            return json_response_with_cost(
+                402,
+                &settle_error("invalid_batch_settlement", &message, None),
+                trace,
+            );
+        }
+    };
+    if let Err(message) = require_current_seller_acceptance(&verified.receiver) {
+        trace.step("batch_settle.seller_acceptance", 0);
+        return json_response_with_cost(
+            403,
+            &settle_error(
+                "seller_acceptance_required",
+                &message,
+                verified.payer.clone(),
+            ),
+            trace,
+        );
+    }
+    trace.step("batch_settle.seller_acceptance", 0);
+    trace.step("batch_settle.validation", 0);
+    let payer = verified.payer.clone();
+    let mut settle_target_total_claimed = None;
+    let mut key = match batch_settlement_key(&body, None) {
+        Ok(key) => key,
+        Err(message) => {
+            trace.step("batch_settle.key", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_request", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.key", 0);
+    let expectation = match batch_contract_expectation(&payload, &contract) {
+        Ok(expectation) => expectation,
+        Err(message) => {
+            trace.step("batch_settle.expectation", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_request", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.expectation", 0);
+    purge_expired_settlements(now_seconds());
+    if payload.kind == "settle" {
+        if let Some(active_key) = active_batch_settle_key(
+            payload.receiver.as_deref().unwrap_or_default(),
+            payload.token.as_deref().unwrap_or_default(),
+        ) {
+            if let Some(existing) = get_settlement(&active_key) {
+                return cached_batch_settlement_response(
+                    &active_key,
+                    existing,
+                    &payload,
+                    &body.payment_requirements,
+                    &contract,
+                    &expectation,
+                    trace,
+                )
+                .await;
+            }
+        }
+    }
+    if let Some(existing) = get_settlement(&key) {
+        return cached_batch_settlement_response(
+            &key,
+            existing,
+            &payload,
+            &body.payment_requirements,
+            &contract,
+            &expectation,
+            trace,
+        )
+        .await;
+    }
+    if let Err(message) = require_batch_settlement_enabled_except_fee().map(|_| ()) {
+        trace.step("batch_settle.config", 0);
+        return json_response_with_cost(
+            400,
+            &settle_error("invalid_config", &message, payer),
+            trace,
+        );
+    }
+    if let Err(error) = validate_batch_receiver_authorizer_config(&payload, &contract) {
+        trace.step("batch_settle.authorizer_config", 0);
+        let (status, reason, message) = match error {
+            BatchAuthorizerValidationError::InvalidConfig(message) => {
+                (400, "invalid_config", message)
+            }
+            BatchAuthorizerValidationError::InvalidSettlement(message) => {
+                (402, "invalid_batch_settlement", message)
+            }
+        };
+        return json_response_with_cost(status, &settle_error(reason, &message, payer), trace);
+    }
+    trace.step("batch_settle.authorizer_config", 0);
+    let private_key = match env("FACILITATOR_EVM_PRIVATE_KEY") {
+        Ok(value) => value,
+        Err(message) => {
+            trace.step("batch_settle.config", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_config", &message, payer),
+                trace,
+            );
+        }
+    };
+    let from = match private_key_address(&private_key) {
+        Ok(value) => value,
+        Err(message) => {
+            trace.step("batch_settle.config", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_config", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.config", 0);
+    let active_scope = match active_settlement_scope(&from, &verified.receiver) {
+        Ok(value) => value,
+        Err(message) => {
+            trace.step("batch_settle.active_scope", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_request", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.active_scope", 0);
+    if !acquire_active_settlement(&active_scope, &key) {
+        trace.step("batch_settle.active_lock", 0);
+        return json_response_with_cost(
+            429,
+            &settle_error(
+                "settlement_queue_busy",
+                "another settlement is active for this seller",
+                payer,
+            ),
+            trace,
+        );
+    }
+    trace.step("batch_settle.active_lock", 0);
+    let fee = match batch_fee_for_payload(&payload) {
+        Ok(value) => value,
+        Err(message) => {
+            release_active_settlement(&active_scope, &key);
+            trace.step("batch_settle.fee_config", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_config", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.fee_config", 0);
+    let mut prechecked_ttl = None;
+    let mut prechecked_config = None;
+    let mut prechecked_to = None;
+    if let ContractExpectation::Settle { receiver, token } = &expectation {
+        let noop_ttl = match settlement_cache_ttl_seconds() {
+            Ok(ttl) => ttl,
+            Err(message) => {
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.ttl", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, payer),
+                    trace,
+                );
+            }
+        };
+        trace.step("batch_settle.ttl", 0);
+        let noop_config = match rpc_config() {
+            Ok(config) => config,
+            Err(message) => {
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.rpc_config", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, payer),
+                    trace,
+                );
+            }
+        };
+        trace.step("batch_settle.rpc_config", 0);
+        let noop_to = match parse_address(&contract, "BATCH_SETTLEMENT_CONTRACT") {
+            Ok(to) => to,
+            Err(message) => {
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.contract", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, payer),
+                    trace,
+                );
+            }
+        };
+        match batch_receiver_state(&noop_config, &noop_to, receiver, token).await {
+            Ok(state) => {
+                trace.step("batch_settle.noop_check", 1);
+                let target_key = match batch_settlement_key(&body, Some(&state.total_claimed)) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        release_active_settlement(&active_scope, &key);
+                        return json_response_with_cost(
+                            400,
+                            &settle_error("invalid_request", &message, payer),
+                            trace,
+                        );
+                    }
+                };
+                if target_key != key {
+                    if let Some(existing) = get_settlement(&target_key) {
+                        release_active_settlement(&active_scope, &key);
+                        return cached_batch_settlement_response(
+                            &target_key,
+                            existing,
+                            &payload,
+                            &body.payment_requirements,
+                            &contract,
+                            &expectation,
+                            trace,
+                        )
+                        .await;
+                    }
+                    rename_active_settlement_key(&active_scope, &key, &target_key);
+                    key = target_key;
+                }
+                settle_target_total_claimed = Some(state.total_claimed.clone());
+                let total_claimed = state.total_claimed.parse::<u128>().unwrap_or(u128::MAX);
+                let total_settled = state.total_settled.parse::<u128>().unwrap_or(0);
+                if total_claimed > total_settled {
+                    prechecked_ttl = Some(noop_ttl);
+                    prechecked_config = Some(noop_config);
+                    prechecked_to = Some(noop_to);
+                } else {
+                    let record = batch_settled_record(BatchSettleRecordInput {
+                        tx: String::new(),
+                        settled_amount: None,
+                        payload: &payload,
+                        requirements: &body.payment_requirements,
+                        payer: payer.clone(),
+                        receiver: verified.receiver,
+                        now: now_seconds(),
+                        ttl: noop_ttl,
+                    })
+                    .await;
+                    let record = annotate_batch_settle_target(
+                        record,
+                        &payload,
+                        settle_target_total_claimed.clone(),
+                        Some("0".to_string()),
+                    );
+                    let record = insert_batch_settlement(&key, record, Some(0));
+                    release_active_settlement(&active_scope, &key);
+                    return json_response_with_cost(record.status_code(), &record.response, trace);
+                }
+            }
+            Err(message) => {
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.noop_check", 1);
+                return json_response_with_cost(
+                    502,
+                    &settle_error("rpc_error", &message, payer),
+                    trace,
+                );
+            }
+        }
+    }
+    if let Err(message) = reserve_seller_credit(&verified.receiver, fee) {
+        release_active_settlement(&active_scope, &key);
+        trace.step("batch_settle.reserve_seller_credit", 0);
+        return json_response_with_cost(
+            402,
+            &settle_error("seller_insufficient_credit", &message, payer),
+            trace,
+        );
+    }
+    trace.step("batch_settle.reserve_seller_credit", 0);
+    let ttl = match prechecked_ttl.take() {
+        Some(ttl) => ttl,
+        None => match settlement_cache_ttl_seconds() {
+            Ok(ttl) => ttl,
+            Err(message) => {
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.ttl", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, payer),
+                    trace,
+                );
+            }
+        },
+    };
+    trace.step("batch_settle.ttl", 0);
+    let config = match prechecked_config.take() {
+        Some(config) => config,
+        None => match rpc_config() {
+            Ok(config) => config,
+            Err(message) => {
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.rpc_config", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, payer),
+                    trace,
+                );
+            }
+        },
+    };
+    trace.step("batch_settle.rpc_config", 0);
+    let to = match prechecked_to.take() {
+        Some(to) => to,
+        None => match parse_address(&contract, "BATCH_SETTLEMENT_CONTRACT") {
+            Ok(to) => to,
+            Err(message) => {
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                trace.step("batch_settle.contract", 0);
+                return json_response_with_cost(
+                    400,
+                    &settle_error("invalid_config", &message, payer),
+                    trace,
+                );
+            }
+        },
+    };
+    trace.step("batch_settle.contract", 0);
+    let calldata = match batch_calldata(&payload, &contract) {
+        Ok(calldata) => calldata,
+        Err(message) => {
+            refund_seller_credit(&verified.receiver, fee);
+            release_active_settlement(&active_scope, &key);
+            trace.step("batch_settle.calldata", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_request", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.calldata", 0);
+    insert_batch_settlement(
+        &key,
+        annotate_batch_settle_target(
+            SettlementRecord::checking(
+                payer.clone().unwrap_or_else(|| verified.receiver.clone()),
+                verified.receiver.clone(),
+                body.payment_requirements.amount.clone(),
+                now_seconds(),
+                ttl,
+            ),
+            &payload,
+            settle_target_total_claimed.clone(),
+            Some(fee.to_string()),
+        ),
+        Some(fee),
+    );
+    let rpc_nonce = match pending_nonce(&config, &from).await {
+        Ok(nonce) => nonce,
+        Err(message) => {
+            remove_settlement(&key);
+            refund_seller_credit(&verified.receiver, fee);
+            release_active_settlement(&active_scope, &key);
+            trace.step("batch_settle.pending_nonce", 1);
+            return json_response_with_cost(
+                502,
+                &settle_error("rpc_error", &message, payer),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.pending_nonce", 1);
+    let nonce = reserve_nonce(&from, rpc_nonce);
+    let broadcast =
+        match broadcast_contract_transaction(&config, &private_key, to, calldata, nonce).await {
+            Ok(broadcast) => {
+                update_active_broadcast(&active_scope, &key, broadcast.nonce, &broadcast.tx);
+                let record = SettlementRecord::broadcast(
+                    broadcast.tx.clone(),
+                    payer.clone().unwrap_or_else(|| verified.receiver.clone()),
+                    verified.receiver.clone(),
+                    body.payment_requirements.amount.clone(),
+                    now_seconds(),
+                    ttl,
+                );
+                insert_batch_settlement(&key, record, Some(fee));
+                broadcast
+            }
+            Err(SettlementSendError::GasTooExpensive) => {
+                trace.step("batch_settle.send", 2);
+                remove_settlement(&key);
+                rollback_reserved_nonce(&from, nonce);
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                return json_response_with_cost(
+                    503,
+                    &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, payer),
+                    trace,
+                );
+            }
+            Err(SettlementSendError::Ambiguous {
+                nonce,
+                tx,
+                message: _,
+            }) => {
+                trace.step("batch_settle.send", 5);
+                update_active_broadcast(&active_scope, &key, nonce, &tx);
+                let record = SettlementRecord::broadcast(
+                    tx,
+                    payer.unwrap_or_else(|| verified.receiver.clone()),
+                    verified.receiver,
+                    body.payment_requirements.amount,
+                    now_seconds(),
+                    ttl,
+                );
+                let record = insert_batch_settlement(&key, record, Some(fee));
+                return json_response_with_cost(202, &record.response, trace);
+            }
+            Err(SettlementSendError::Other(message)) => {
+                trace.step("batch_settle.send", 5);
+                remove_settlement(&key);
+                rollback_reserved_nonce(&from, nonce);
+                refund_seller_credit(&verified.receiver, fee);
+                release_active_settlement(&active_scope, &key);
+                return json_response_with_cost(
+                    502,
+                    &settle_error("settlement_failed", &message, payer),
+                    trace,
+                );
+            }
+        };
+    match confirm_contract_broadcast(&config, &broadcast, &to, Some(&from), &expectation).await {
+        ContractSettlementOutcome::Settled { tx, settled_amount } => {
+            trace.step("batch_settle.send", 5);
+            let record = batch_settled_record(BatchSettleRecordInput {
+                tx,
+                settled_amount,
+                payload: &payload,
+                requirements: &body.payment_requirements,
+                payer: payer.clone(),
+                receiver: verified.receiver,
+                now: now_seconds(),
+                ttl,
+            })
+            .await;
+            let record = insert_batch_settlement(&key, record, Some(fee));
+            release_active_settlement(&active_scope, &key);
+            json_response_with_cost(record.status_code(), &record.response, trace)
+        }
+        ContractSettlementOutcome::Pending { nonce, tx } => {
+            trace.step("batch_settle.send", 5);
+            update_active_broadcast(&active_scope, &key, nonce, &tx);
+            let record = SettlementRecord::broadcast(
+                tx,
+                payer.unwrap_or_else(|| verified.receiver.clone()),
+                verified.receiver,
+                body.payment_requirements.amount,
+                now_seconds(),
+                ttl,
+            );
+            let record = insert_batch_settlement(&key, record, Some(fee));
+            json_response_with_cost(202, &record.response, trace)
+        }
+        ContractSettlementOutcome::Failed { tx, message } => {
+            trace.step("batch_settle.send", 5);
+            let record = SettlementRecord::failed(
+                tx,
+                message,
+                payer.unwrap_or_else(|| verified.receiver.clone()),
+                verified.receiver,
+                now_seconds(),
+                ttl,
+            );
+            let record = insert_batch_settlement(&key, record, Some(fee));
+            release_active_settlement(&active_scope, &key);
+            json_response_with_cost(502, &record.response, trace)
+        }
+    }
+}
+
+fn batch_settle_current_channel(
+    payload: &crate::batch::BatchRequestPayload,
+) -> Option<BatchChannel> {
+    match payload.kind.as_str() {
+        "deposit" | "voucher" | "refund" => {
+            voucher_channel_id(payload).ok().and_then(get_batch_channel)
+        }
+        _ => None,
+    }
+}
+
+enum BatchAuthorizerValidationError {
+    InvalidConfig(String),
+    InvalidSettlement(String),
+}
+
+fn validate_batch_receiver_authorizer_config(
+    payload: &crate::batch::BatchRequestPayload,
+    contract: &str,
+) -> Result<(), BatchAuthorizerValidationError> {
+    match payload.kind.as_str() {
+        "claim" => {
+            let claims = payload.claims.as_deref().unwrap_or_default();
+            if claims.is_empty() {
+                return Ok(());
+            }
+            let expected = &claims[0].voucher.channel.receiver_authorizer;
+            validate_batch_claim_authorizer(
+                claims,
+                payload.claim_authorizer_signature.as_deref(),
+                expected,
+                contract,
+            )
+        }
+        "refund" => {
+            let Some(config) = payload.channel_config.as_ref() else {
+                return Ok(());
+            };
+            let Some(amount) = payload.amount.as_deref() else {
+                return Ok(());
+            };
+            let Some(nonce) = payload.refund_nonce.as_deref() else {
+                return Ok(());
+            };
+            validate_batch_refund_authorizer(
+                config,
+                amount,
+                nonce,
+                payload.refund_authorizer_signature.as_deref(),
+                contract,
+            )?;
+            let claims = payload.claims.as_deref().unwrap_or_default();
+            if claims.is_empty() {
+                return Ok(());
+            }
+            validate_batch_claim_authorizer(
+                claims,
+                payload.claim_authorizer_signature.as_deref(),
+                &config.receiver_authorizer,
+                contract,
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_batch_claim_authorizer(
+    claims: &[crate::batch::BatchVoucherClaim],
+    signature: Option<&str>,
+    expected_authorizer: &str,
+    contract: &str,
+) -> Result<(), BatchAuthorizerValidationError> {
+    if let Some(signature) = signature {
+        let recovered = recover_batch_claim_authorizer(claims, signature, contract)
+            .map_err(BatchAuthorizerValidationError::InvalidSettlement)?;
+        if !same_address(&recovered, expected_authorizer) {
+            return Err(BatchAuthorizerValidationError::InvalidSettlement(
+                "batch claim authorizer signature mismatch".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    validate_local_batch_receiver_authorizer(expected_authorizer)
+}
+
+fn validate_batch_refund_authorizer(
+    config: &crate::batch::BatchChannelConfig,
+    amount: &str,
+    nonce: &str,
+    signature: Option<&str>,
+    contract: &str,
+) -> Result<(), BatchAuthorizerValidationError> {
+    if let Some(signature) = signature {
+        let channel_id = compute_batch_channel_id(config, contract)
+            .map_err(BatchAuthorizerValidationError::InvalidSettlement)?;
+        let recovered =
+            recover_batch_refund_authorizer(&channel_id, amount, nonce, signature, contract)
+                .map_err(BatchAuthorizerValidationError::InvalidSettlement)?;
+        if !same_address(&recovered, &config.receiver_authorizer) {
+            return Err(BatchAuthorizerValidationError::InvalidSettlement(
+                "batch refund authorizer signature mismatch".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    validate_local_batch_receiver_authorizer(&config.receiver_authorizer)
+}
+
+fn validate_local_batch_receiver_authorizer(
+    expected_authorizer: &str,
+) -> Result<(), BatchAuthorizerValidationError> {
+    let local = batch_receiver_authorizer_address()
+        .map_err(BatchAuthorizerValidationError::InvalidConfig)?;
+    if !same_address(&local, expected_authorizer) {
+        return Err(BatchAuthorizerValidationError::InvalidConfig(
+            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY does not match receiverAuthorizer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn batch_corrective_verify_extra(
+    current: Option<&BatchChannel>,
+    message: &str,
+) -> Option<serde_json::Value> {
+    if message != "invalid_batch_settlement_evm_cumulative_amount_mismatch" {
+        return None;
+    }
+    let channel = current?;
+    serde_json::to_value(SettleResponseExtra {
+        settlement_key: None,
+        charged_amount: None,
+        channel_state: Some(SettleChannelStateExtra {
+            channel_id: channel.channel_id.clone(),
+            balance: channel.balance.clone(),
+            total_claimed: channel.total_claimed.clone(),
+            withdraw_requested_at: channel.withdraw_requested_at,
+            refund_nonce: channel.refund_nonce.clone(),
+            charged_cumulative_amount: Some(channel.charged_cumulative_amount.clone()),
+        }),
+        voucher_state: Some(SettleVoucherStateExtra {
+            signed_max_claimable: Some(channel.signed_max_claimable.clone()),
+            signature: Some(channel.signature.clone()),
+        }),
+    })
+    .ok()
+}
+
+fn batch_channel_payer(channel: &BatchChannel) -> Option<String> {
+    parse_address(&channel.channel_config.payer, "payer")
+        .ok()
+        .map(|address| address_hex(&address))
 }
 
 async fn cached_settlement_response(
@@ -773,12 +3041,120 @@ async fn cached_settlement_response(
     }
 }
 
+async fn cached_batch_settlement_response(
+    key: &str,
+    existing: SettlementRecord,
+    payload: &crate::batch::BatchRequestPayload,
+    requirements: &PaymentRequirements,
+    contract: &str,
+    expectation: &ContractExpectation,
+    trace: &mut CostTrace,
+) -> HttpResponse {
+    let Some(details) = existing.broadcast_settlement() else {
+        trace.step("batch_settle.cache_hit", 0);
+        return json_response_with_cost(existing.status_code(), &existing.response, trace);
+    };
+    let config = match rpc_config() {
+        Ok(config) => config,
+        Err(_) => {
+            trace.step("batch_settle.cache_config", 0);
+            return json_response_with_cost(existing.status_code(), &existing.response, trace);
+        }
+    };
+    trace.step("batch_settle.cache_config", 0);
+    let to = match parse_address(contract, "BATCH_SETTLEMENT_CONTRACT") {
+        Ok(to) => to,
+        Err(_) => {
+            trace.step("batch_settle.cache_contract", 0);
+            return json_response_with_cost(existing.status_code(), &existing.response, trace);
+        }
+    };
+    trace.step("batch_settle.cache_contract", 0);
+    let expected_from = env("FACILITATOR_EVM_PRIVATE_KEY")
+        .ok()
+        .and_then(|key| private_key_address(&key).ok());
+    let refreshed = match refresh_contract_settlement(
+        &config,
+        &details.tx,
+        &to,
+        expected_from.as_deref(),
+        expectation,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            trace.step("batch_settle.refresh", 2);
+            return json_response_with_cost(
+                502,
+                &settle_error("rpc_error", &message, Some(details.payer)),
+                trace,
+            );
+        }
+    };
+    trace.step("batch_settle.refresh", 2);
+    let ttl = match settlement_cache_ttl_seconds() {
+        Ok(ttl) => ttl,
+        Err(_) => {
+            trace.step("batch_settle.cache_ttl", 0);
+            return json_response_with_cost(existing.status_code(), &existing.response, trace);
+        }
+    };
+    trace.step("batch_settle.cache_ttl", 0);
+    match refreshed {
+        ContractSettlementOutcome::Settled { tx, settled_amount } => {
+            let record = batch_settled_record(BatchSettleRecordInput {
+                tx,
+                settled_amount,
+                payload,
+                requirements,
+                payer: Some(details.payer.clone()),
+                receiver: details.pay_to.clone(),
+                now: now_seconds(),
+                ttl,
+            })
+            .await;
+            let record = insert_batch_settlement(key, record, None);
+            release_active_settlement_by_key(key);
+            json_response_with_cost(record.status_code(), &record.response, trace)
+        }
+        ContractSettlementOutcome::Pending { .. } => {
+            let record = maybe_replace_pending_batch_settlement_record(
+                key,
+                existing,
+                payload,
+                requirements,
+                details,
+                contract,
+                expectation,
+                ttl,
+                trace,
+            )
+            .await;
+            json_response_with_cost(record.status_code(), &record.response, trace)
+        }
+        ContractSettlementOutcome::Failed { tx, message } => {
+            let record = SettlementRecord::failed(
+                tx,
+                message,
+                details.payer.clone(),
+                details.pay_to.clone(),
+                now_seconds(),
+                ttl,
+            );
+            let record = insert_batch_settlement(key, record, None);
+            release_active_settlement_by_key(key);
+            json_response_with_cost(502, &record.response, trace)
+        }
+    }
+}
+
 async fn seller_credit_http(request: HttpRequest) -> HttpResponse {
     let mut trace = CostTrace::for_request(&request);
-    let seller = match seller_from_request(&request) {
+    let (seller, topup_amount) = match seller_credit_request_parameters(&request) {
         Ok(value) => value,
         Err(message) => {
-            trace.step("seller_credit.parse_seller", 0);
+            trace.step("seller_credit.parse_parameters", 0);
             return json_response_with_cost(
                 400,
                 &retryable_error("invalid_request", &message, false),
@@ -786,7 +3162,7 @@ async fn seller_credit_http(request: HttpRequest) -> HttpResponse {
             );
         }
     };
-    trace.step("seller_credit.parse_seller", 0);
+    trace.step("seller_credit.parse_parameters", 0);
     let signature = match payment_signature_header(&request) {
         Some(value) => value,
         None => {
@@ -847,7 +3223,7 @@ async fn seller_credit_http(request: HttpRequest) -> HttpResponse {
         );
     }
     trace.step("seller_credit.resource_validation", 0);
-    let requirements = match seller_credit_requirements(&resource) {
+    let requirements = match seller_credit_requirements(&resource, topup_amount) {
         Ok(value) => value,
         Err(message) => {
             trace.step("seller_credit.requirements", 0);
@@ -876,7 +3252,8 @@ async fn settle_seller_credit_payment(
         Ok(payer) => payer,
         Err(err) => {
             trace.step("seller_credit.local_validation", 0);
-            let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+            let response =
+                failed_settlement(&configured_network(), &err.reason, &err.message, err.payer);
             return json_response_with_cost(402, &response, trace);
         }
     };
@@ -954,7 +3331,8 @@ async fn settle_seller_credit_payment(
             body.payment_requirements.amount.clone(),
             now_seconds(),
             ttl,
-        ),
+        )
+        .with_metadata("seller-credit", Some("0".to_string()), None),
     );
     let config = match rpc_config() {
         Ok(config) => config,
@@ -985,8 +3363,65 @@ async fn settle_seller_credit_payment(
     };
     trace.step("seller_credit.pending_nonce", 1);
     let nonce = reserve_nonce(&from, rpc_nonce);
-    match send_settlement(&config, &private_key, &body, nonce).await {
-        Ok(SettlementOutcome::Settled(tx)) => {
+    let broadcast = match broadcast_settlement(&config, &private_key, &body, nonce).await {
+        Ok(broadcast) => {
+            update_active_broadcast(&from, &key, broadcast.nonce, &broadcast.tx);
+            insert_settlement(
+                &key,
+                SettlementRecord::broadcast(
+                    broadcast.tx.clone(),
+                    payer.clone(),
+                    body.payment_requirements.pay_to.clone(),
+                    body.payment_requirements.amount.clone(),
+                    now_seconds(),
+                    ttl,
+                ),
+            );
+            broadcast
+        }
+        Err(SettlementSendError::GasTooExpensive) => {
+            trace.step("seller_credit.send_settlement", 2);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            release_active_settlement(&from, &key);
+            return json_response_with_cost(
+                503,
+                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
+                trace,
+            );
+        }
+        Err(SettlementSendError::Ambiguous {
+            nonce,
+            tx,
+            message: _,
+        }) => {
+            trace.step("seller_credit.send_settlement", 5);
+            update_active_broadcast(&from, &key, nonce, &tx);
+            let record = SettlementRecord::broadcast(
+                tx,
+                payer,
+                body.payment_requirements.pay_to,
+                body.payment_requirements.amount,
+                now_seconds(),
+                ttl,
+            );
+            let record = insert_settlement(&key, record);
+            return seller_credit_paid_response(202, &seller, &record, trace);
+        }
+        Err(SettlementSendError::Other(message)) => {
+            trace.step("seller_credit.send_settlement", 5);
+            rollback_reserved_nonce(&from, nonce);
+            remove_settlement(&key);
+            release_active_settlement(&from, &key);
+            return json_response_with_cost(
+                502,
+                &settle_error("settlement_failed", &message, Some(payer)),
+                trace,
+            );
+        }
+    };
+    match confirm_settlement_broadcast(&config, &body, &broadcast).await {
+        SettlementOutcome::Settled(tx) => {
             trace.step("seller_credit.send_settlement", 5);
             let record = SettlementRecord::settled(
                 tx,
@@ -1007,7 +3442,7 @@ async fn settle_seller_credit_payment(
             }
             seller_credit_paid_response(200, &seller, &record, trace)
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        SettlementOutcome::Pending { nonce, tx } => {
             trace.step("seller_credit.send_settlement", 5);
             update_active_broadcast(&from, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -1021,7 +3456,7 @@ async fn settle_seller_credit_payment(
             let record = insert_settlement(&key, record);
             seller_credit_paid_response(202, &seller, &record, trace)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        SettlementOutcome::Failed { tx, message } => {
             trace.step("seller_credit.send_settlement", 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -1034,28 +3469,6 @@ async fn settle_seller_credit_payment(
             let record = insert_settlement(&key, record);
             release_active_settlement(&from, &key);
             seller_credit_paid_response(502, &seller, &record, trace)
-        }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step("seller_credit.send_settlement", 2);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            release_active_settlement(&from, &key);
-            json_response_with_cost(
-                503,
-                &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
-                trace,
-            )
-        }
-        Err(SettlementSendError::Other(message)) => {
-            trace.step("seller_credit.send_settlement", 5);
-            rollback_reserved_nonce(&from, nonce);
-            remove_settlement(&key);
-            release_active_settlement(&from, &key);
-            json_response_with_cost(
-                502,
-                &settle_error("settlement_failed", &message, Some(payer)),
-                trace,
-            )
         }
     }
 }
@@ -1172,11 +3585,431 @@ async fn cached_seller_credit_response(
     }
 }
 
+#[cfg(test)]
 fn parse_request(request: &HttpRequest) -> Result<FacilitatorRequest, String> {
+    serde_json::from_value(parse_json_value(request)?)
+        .map_err(|err| format!("invalid JSON body: {err}"))
+}
+
+fn parse_json_value(request: &HttpRequest) -> Result<serde_json::Value, String> {
     if request.body.len() > MAX_REQUEST_BODY_BYTES {
         return Err("request body exceeds 64KiB".to_string());
     }
     serde_json::from_slice(&request.body).map_err(|err| format!("invalid JSON body: {err}"))
+}
+
+fn batch_settlement_key(
+    body: &BatchFacilitatorRequest,
+    target_total_claimed: Option<&str>,
+) -> Result<String, String> {
+    let identity = if let Some(target_total_claimed) = target_total_claimed {
+        let payload: BatchRequestPayload =
+            serde_json::from_value(body.payment_payload.payload.clone())
+                .map_err(|err| format!("invalid batch settle payload: {err}"))?;
+        if payload.kind != "settle" {
+            return Err("target totalClaimed is only valid for batch settle".to_string());
+        }
+        serde_json::json!({
+            "receiver": payload.receiver
+                .ok_or_else(|| "batch settle receiver is required".to_string())?
+                .to_ascii_lowercase(),
+            "token": payload.token
+                .ok_or_else(|| "batch settle token is required".to_string())?
+                .to_ascii_lowercase(),
+            "targetTotalClaimed": target_total_claimed
+        })
+    } else {
+        serde_json::json!({
+            "network": body.payment_requirements.network,
+            "asset": body.payment_requirements.asset.to_ascii_lowercase(),
+            "payTo": body.payment_requirements.pay_to.to_ascii_lowercase(),
+            "payload": body.payment_payload.payload
+        })
+    };
+    let bytes = serde_json::to_vec(&identity).map_err(|err| format!("invalid batch key: {err}"))?;
+    Ok(format!(
+        "0x{}",
+        hex::encode(keccak256(
+            format!("batch|{}", hex::encode(bytes)).as_bytes()
+        ))
+    ))
+}
+
+fn annotate_batch_settle_target(
+    mut record: SettlementRecord,
+    payload: &BatchRequestPayload,
+    target_total_claimed: Option<String>,
+    charged_fee: Option<String>,
+) -> SettlementRecord {
+    if payload.kind != "settle" {
+        return record.with_metadata("batch", charged_fee, None);
+    }
+    if let Some(token) = payload.token.as_deref() {
+        record
+            .response
+            .extra
+            .get_or_insert_with(BTreeMap::new)
+            .insert("batchSettleToken".to_string(), token.to_ascii_lowercase());
+    }
+    record.with_metadata("batch", charged_fee, target_total_claimed)
+}
+
+fn active_batch_settle_key(receiver: &str, token: &str) -> Option<String> {
+    ACTIVE_SETTLEMENTS.with(|active| {
+        active.borrow().iter().find_map(|entry| {
+            let active = decode_stable::<ActiveSettlement>(entry.value());
+            let record = get_settlement(&active.key)?;
+            let record_token = record
+                .response
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("batchSettleToken"))?;
+            (record.target_total_claimed.is_some()
+                && record
+                    .pay_to
+                    .as_deref()
+                    .is_some_and(|seller| same_address(seller, receiver))
+                && same_address(record_token, token))
+            .then_some(active.key)
+        })
+    })
+}
+
+fn batch_calldata(
+    payload: &crate::batch::BatchRequestPayload,
+    contract: &str,
+) -> Result<Vec<u8>, String> {
+    match payload.kind.as_str() {
+        "deposit" => encode_batch_deposit_calldata(payload),
+        "claim" => encode_batch_claim_calldata(
+            payload,
+            &batch_authorizer_private_key_for_claim(payload)?,
+            contract,
+        ),
+        "settle" => encode_batch_settle_calldata(
+            payload
+                .receiver
+                .as_deref()
+                .ok_or_else(|| "batch settle receiver is required".to_string())?,
+            payload
+                .token
+                .as_deref()
+                .ok_or_else(|| "batch settle token is required".to_string())?,
+        ),
+        "refund" => encode_batch_refund_calldata(
+            payload,
+            &batch_authorizer_private_key_for_refund(payload)?,
+            contract,
+        ),
+        other => Err(format!("unsupported batch payload type: {other}")),
+    }
+}
+
+fn batch_authorizer_private_key_for_claim(
+    payload: &crate::batch::BatchRequestPayload,
+) -> Result<String, String> {
+    if payload.claim_authorizer_signature.is_some() {
+        return Ok(String::new());
+    }
+    env("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY")
+}
+
+fn batch_authorizer_private_key_for_refund(
+    payload: &crate::batch::BatchRequestPayload,
+) -> Result<String, String> {
+    let needs_refund_signature = payload.refund_authorizer_signature.is_none();
+    let needs_claim_signature = payload
+        .claims
+        .as_deref()
+        .is_some_and(|claims| !claims.is_empty())
+        && payload.claim_authorizer_signature.is_none();
+    if !needs_refund_signature && !needs_claim_signature {
+        return Ok(String::new());
+    }
+    env("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY")
+}
+
+struct BatchSettleRecordInput<'a> {
+    tx: String,
+    settled_amount: Option<String>,
+    payload: &'a crate::batch::BatchRequestPayload,
+    requirements: &'a PaymentRequirements,
+    payer: Option<String>,
+    receiver: String,
+    now: u64,
+    ttl: u64,
+}
+
+async fn batch_settled_record(input: BatchSettleRecordInput<'_>) -> SettlementRecord {
+    let tx = input.tx;
+    let error_payer = input
+        .payer
+        .clone()
+        .unwrap_or_else(|| input.receiver.clone());
+    match batch_success_response(
+        tx.clone(),
+        input.payload,
+        input.requirements,
+        input.payer,
+        input.settled_amount,
+    )
+    .await
+    {
+        Ok(response) => {
+            SettlementRecord::settled_response(response, input.receiver, input.now, input.ttl)
+        }
+        Err(message) => SettlementRecord::failed(
+            tx,
+            message,
+            error_payer,
+            input.receiver,
+            input.now,
+            input.ttl,
+        ),
+    }
+}
+
+async fn batch_success_response(
+    tx: String,
+    payload: &crate::batch::BatchRequestPayload,
+    requirements: &PaymentRequirements,
+    payer: Option<String>,
+    settled_amount: Option<String>,
+) -> Result<SettleResponse, String> {
+    let mut response = SettleResponse {
+        success: true,
+        transaction: tx.clone(),
+        network: configured_network(),
+        payer,
+        amount: Some(requirements.amount.clone()),
+        error_reason: None,
+        error_message: None,
+        extra: None,
+        extra_json: None,
+    };
+    match payload.kind.as_str() {
+        "deposit" => {
+            response.amount = payload
+                .deposit
+                .as_ref()
+                .map(|deposit| deposit.amount.clone());
+            response.extra_json = None;
+        }
+        "claim" => {
+            response.payer = None;
+            response.amount = Some("0".to_string());
+            response.extra_json = None;
+        }
+        "settle" => {
+            response.payer = None;
+            response.amount = if tx.trim().is_empty() {
+                Some("0".to_string())
+            } else {
+                Some(
+                    settled_amount
+                        .ok_or_else(|| "batch settle event amount unavailable".to_string())?,
+                )
+            };
+        }
+        "refund" => {
+            response.payer = payload
+                .channel_config
+                .as_ref()
+                .map(|config| config.payer.clone())
+                .or(response.payer);
+            response.amount = payload.amount.clone();
+            response.extra_json = None;
+        }
+        _ => {}
+    }
+    Ok(response)
+}
+
+fn validate_batch_verify_snapshot(
+    payload: &crate::batch::BatchRequestPayload,
+    snapshot: &BatchChannelSnapshot,
+) -> Result<(), String> {
+    let max_claimable = payload
+        .voucher
+        .as_ref()
+        .map(|voucher| parse_batch_decimal("maxClaimableAmount", &voucher.max_claimable_amount))
+        .transpose()?
+        .ok_or_else(|| "batch voucher is required".to_string())?;
+    let balance = parse_batch_decimal("balance", &snapshot.balance)?;
+    let total_claimed = parse_batch_decimal("totalClaimed", &snapshot.total_claimed)?;
+
+    match payload.kind.as_str() {
+        "deposit" => {
+            let deposit_amount = payload
+                .deposit
+                .as_ref()
+                .map(|deposit| parse_batch_decimal("deposit.amount", &deposit.amount))
+                .transpose()?
+                .ok_or_else(|| "batch deposit payload is required".to_string())?;
+            let effective_balance = balance
+                .checked_add(deposit_amount)
+                .ok_or_else(|| "batch deposit effective balance overflow".to_string())?;
+            if max_claimable > effective_balance {
+                return Err("invalid_batch_settlement_evm_cumulative_exceeds_balance".to_string());
+            }
+            if max_claimable <= total_claimed {
+                return Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string());
+            }
+        }
+        "voucher" => {
+            if balance == 0 {
+                return Err("invalid_batch_settlement_evm_channel_not_found".to_string());
+            }
+            if max_claimable > balance {
+                return Err("invalid_batch_settlement_evm_cumulative_exceeds_balance".to_string());
+            }
+            if max_claimable <= total_claimed {
+                return Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string());
+            }
+        }
+        "refund" => {
+            if balance == 0 {
+                return Err("invalid_batch_settlement_evm_channel_not_found".to_string());
+            }
+            if max_claimable < total_claimed {
+                return Err("invalid_batch_settlement_evm_cumulative_below_claimed".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_batch_verify_pending(
+    payload: &crate::batch::BatchRequestPayload,
+    channel: &BatchChannel,
+) -> Result<(), String> {
+    let pending = channel
+        .pending_request
+        .as_ref()
+        .ok_or_else(|| "invalid_batch_settlement_evm_channel_not_reserved".to_string())?;
+    let expires_at = pending.expires_at;
+    if expires_at <= now_seconds().saturating_mul(1_000) {
+        return Err("invalid_batch_settlement_evm_channel_not_reserved".to_string());
+    }
+    let pending_signed =
+        parse_batch_decimal("pending.signedMaxClaimable", &pending.signed_max_claimable)?;
+    let max_claimable = payload
+        .voucher
+        .as_ref()
+        .map(|voucher| parse_batch_decimal("maxClaimableAmount", &voucher.max_claimable_amount))
+        .transpose()?
+        .ok_or_else(|| "batch voucher is required".to_string())?;
+    if pending_signed != max_claimable {
+        return Err("invalid_batch_settlement_evm_pending_voucher_mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn parse_batch_decimal(label: &str, value: &str) -> Result<u128, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{label}: invalid decimal integer"));
+    }
+    value
+        .parse::<u128>()
+        .map_err(|_| format!("{label}: integer too large"))
+}
+
+fn batch_contract_expectation(
+    payload: &crate::batch::BatchRequestPayload,
+    contract: &str,
+) -> Result<ContractExpectation, String> {
+    match payload.kind.as_str() {
+        "deposit" => {
+            let config = payload
+                .channel_config
+                .as_ref()
+                .ok_or_else(|| "batch deposit channelConfig is required".to_string())?;
+            let channel_id = match &payload.voucher {
+                Some(voucher) => voucher.channel_id.clone(),
+                None => compute_batch_channel_id(config, contract)?,
+            };
+            validate_channel_id(&channel_id)?;
+            payload
+                .deposit
+                .as_ref()
+                .ok_or_else(|| "batch deposit payload is required".to_string())?;
+            payload
+                .voucher
+                .as_ref()
+                .ok_or_else(|| "batch voucher is required".to_string())?;
+            Ok(ContractExpectation::Deposit)
+        }
+        "claim" => Ok(ContractExpectation::Claim),
+        "settle" => Ok(ContractExpectation::Settle {
+            receiver: payload
+                .receiver
+                .clone()
+                .ok_or_else(|| "batch settle receiver is required".to_string())?,
+            token: payload
+                .token
+                .clone()
+                .ok_or_else(|| "batch settle token is required".to_string())?,
+        }),
+        "refund" => {
+            let config = payload
+                .channel_config
+                .as_ref()
+                .ok_or_else(|| "batch refund channelConfig is required".to_string())?;
+            compute_batch_channel_id(config, contract)?;
+            payload
+                .refund_nonce
+                .as_deref()
+                .ok_or_else(|| "batch refund nonce is required".to_string())?;
+            Ok(ContractExpectation::Refund)
+        }
+        other => Err(format!("unsupported batch payload type: {other}")),
+    }
+}
+
+fn verify_error(reason: &str, message: &str, payer: Option<String>) -> VerifyResponse {
+    VerifyResponse {
+        is_valid: false,
+        invalid_reason: Some(reason.to_string()),
+        invalid_message: Some(message.to_string()),
+        payer,
+        extra: None,
+    }
+}
+
+fn configured_batch_settlement_contract() -> Result<String, String> {
+    let value = env("BATCH_SETTLEMENT_CONTRACT")?;
+    let normalized = normalize_evm_address("BATCH_SETTLEMENT_CONTRACT", &value)?;
+    let expected = if configured_network_profile()? == "amoy" {
+        normalize_evm_address(
+            "AMOY_BATCH_SETTLEMENT_CONTRACT",
+            &env("AMOY_BATCH_SETTLEMENT_CONTRACT")?,
+        )?
+    } else {
+        CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string()
+    };
+    if !same_address(&normalized, &expected) {
+        return Err(
+            "BATCH_SETTLEMENT_CONTRACT does not match the selected NETWORK_PROFILE".to_string(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn batch_receiver_authorizer_address() -> Result<String, String> {
+    env("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY").and_then(|key| private_key_address(&key))
+}
+
+fn validate_batch_key_separation(receiver_authorizer: &str) -> Result<(), String> {
+    let facilitator =
+        env("FACILITATOR_EVM_PRIVATE_KEY").and_then(|key| private_key_address(&key))?;
+    if same_address(receiver_authorizer, &facilitator) {
+        return Err(
+            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY must not derive the FACILITATOR_EVM_PRIVATE_KEY address"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn rpc_config() -> Result<RpcConfig, String> {
@@ -1188,7 +4021,7 @@ fn rpc_config() -> Result<RpcConfig, String> {
     let min_confirmations =
         optional_positive_u64("SETTLE_MIN_CONFIRMATIONS", DEFAULT_MIN_CONFIRMATIONS)?;
     Ok(RpcConfig {
-        services: env("POLYGON_RPC_SERVICES")?,
+        url: env("POLYGON_RPC_URL")?,
         max_gas,
         max_settlement_fee_wei,
         min_confirmations,
@@ -1196,10 +4029,31 @@ fn rpc_config() -> Result<RpcConfig, String> {
 }
 
 fn health() -> impl Serialize {
+    let profile = configured_network_profile();
+    let token = configured_token_address();
+    let batch_contract = configured_batch_settlement_contract();
+    let (terms, privacy, asset_boundary) = acceptance_versions();
     serde_json::json!({
-        "ok": true,
-        "network": NETWORK,
-        "facilitatorAddress": facilitator_address()
+        "ok": profile.is_ok() && token.is_ok(),
+        "network": configured_network(),
+        "networkProfile": profile.clone().ok(),
+        "chainId": configured_chain_id(),
+        "token": token.clone().ok(),
+        "facilitatorAddress": facilitator_address(),
+        "polygonRpcConfigured": env("POLYGON_RPC_URL").is_ok(),
+        "sellerSettlementFeeAmount": seller_settlement_fee_amount().ok().map(|value| value.to_string()),
+        "batchSettlementFeeAmount": batch_settlement_fee_amount(),
+        "batchFees": {
+            "deposit": batch_deposit_fee_amount(),
+            "claim": batch_claim_fee_amount(),
+            "settle": batch_settle_fee_amount(),
+            "refund": batch_refund_fee_amount()
+        },
+        "batchClaimFeeSchedule": batch_claim_fee_schedule(),
+        "receiverAuthorizer": batch_receiver_authorizer_address().ok(),
+        "batchSettlementContract": batch_contract.ok(),
+        "readiness": profile.is_ok() && token.is_ok() && env("POLYGON_RPC_URL").is_ok(),
+        "documentVersions": { "terms": terms, "privacy": privacy, "assetBoundary": asset_boundary }
     })
 }
 
@@ -1292,12 +4146,13 @@ fn instruction_counter_now() -> u64 {
 }
 
 fn settle_error(reason: &str, message: &str, payer: Option<String>) -> SettleResponse {
-    failed_settlement(NETWORK, reason, message, payer)
+    failed_settlement(&configured_network(), reason, message, payer)
 }
 
 fn seller_credit_required_response(request: &HttpRequest) -> Result<HttpResponse, String> {
+    let (_, amount) = seller_credit_request_parameters(request)?;
     let resource = seller_credit_resource(request)?;
-    let requirements = seller_credit_requirements(&resource)?;
+    let requirements = seller_credit_requirements(&resource, amount)?;
     let payment = PaymentRequiredResponse {
         x402_version: 2,
         error: "Payment required".to_string(),
@@ -1310,6 +4165,13 @@ fn seller_credit_required_response(request: &HttpRequest) -> Result<HttpResponse
         .headers
         .push(HeaderField("payment-required".to_string(), header));
     Ok(response)
+}
+
+fn seller_credit_request_parameters(request: &HttpRequest) -> Result<(String, u128), String> {
+    Ok((
+        seller_from_request(request)?,
+        seller_credit_topup_amount(request)?,
+    ))
 }
 
 fn seller_credit_paid_response(
@@ -1335,15 +4197,18 @@ fn seller_credit_paid_response(
     response
 }
 
-fn seller_credit_requirements(resource: &ResourceInfo) -> Result<PaymentRequirements, String> {
+fn seller_credit_requirements(
+    resource: &ResourceInfo,
+    amount: u128,
+) -> Result<PaymentRequirements, String> {
     if resource.url.trim().is_empty() {
         return Err("seller credit resource URL is empty".to_string());
     }
     Ok(PaymentRequirements {
         scheme: "exact".to_string(),
-        network: NETWORK.to_string(),
-        asset: JPYC_POLYGON_ADDRESS.to_string(),
-        amount: seller_credit_topup_amount()?.to_string(),
+        network: configured_network(),
+        asset: configured_token_address()?,
+        amount: amount.to_string(),
         pay_to: normalize_evm_address("SELLER_CREDIT_PAY_TO", &env("SELLER_CREDIT_PAY_TO")?)?,
         max_timeout_seconds: optional_positive_u64("SELLER_CREDIT_MAX_TIMEOUT_SECONDS", 60)?,
         extra: serde_json::json!({
@@ -1363,8 +4228,7 @@ fn seller_credit_resource(request: &HttpRequest) -> Result<ResourceInfo, String>
 }
 
 fn seller_from_request(request: &HttpRequest) -> Result<String, String> {
-    let value = query_param(&request.url, "seller")
-        .ok_or_else(|| "missing seller query parameter".to_string())?;
+    let value = unique_query_param(&request.url, "seller")?;
     normalize_evm_address("seller", &value)
 }
 
@@ -1564,8 +4428,52 @@ fn normalize_evm_address(label: &str, value: &str) -> Result<String, String> {
     parse_address(value, label).map(|address| address_hex(&address))
 }
 
-fn seller_credit_topup_amount() -> Result<u128, String> {
-    required_positive_u128("SELLER_CREDIT_TOPUP_AMOUNT")
+const JPYC_ATOMIC_UNITS: u128 = 1_000_000_000_000_000_000;
+const SELLER_CREDIT_MAX_TOPUP_ATOMS: u128 = 10_000 * JPYC_ATOMIC_UNITS;
+
+fn seller_credit_topup_amount(request: &HttpRequest) -> Result<u128, String> {
+    let value = unique_query_param(&request.url, "amount")?;
+    parse_jpyc_decimal(&value)
+}
+
+fn parse_jpyc_decimal(value: &str) -> Result<u128, String> {
+    let invalid = || {
+        "amount must be a decimal JPYC value from 1 to 10000 with at most 18 fractional digits"
+            .to_string()
+    };
+    if value.is_empty() || value.starts_with(['+', '-']) || value.contains(['e', 'E']) {
+        return Err(invalid());
+    }
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.chars().all(|ch| ch.is_ascii_digit())
+        || fraction.is_some_and(|part| {
+            part.is_empty() || part.len() > 18 || !part.chars().all(|ch| ch.is_ascii_digit())
+        })
+    {
+        return Err(invalid());
+    }
+    let whole = integer.parse::<u128>().map_err(|_| invalid())?;
+    let fractional = match fraction {
+        Some(part) => {
+            let digits = part.parse::<u128>().map_err(|_| invalid())?;
+            digits
+                .checked_mul(10u128.pow((18 - part.len()) as u32))
+                .ok_or_else(invalid)?
+        }
+        None => 0,
+    };
+    let atoms = whole
+        .checked_mul(JPYC_ATOMIC_UNITS)
+        .and_then(|value| value.checked_add(fractional))
+        .ok_or_else(invalid)?;
+    if !(JPYC_ATOMIC_UNITS..=SELLER_CREDIT_MAX_TOPUP_ATOMS).contains(&atoms) {
+        return Err(invalid());
+    }
+    Ok(atoms)
 }
 
 fn seller_settlement_fee_amount() -> Result<u128, String> {
@@ -1574,6 +4482,221 @@ fn seller_settlement_fee_amount() -> Result<u128, String> {
 
 fn required_positive_u128(name: &str) -> Result<u128, String> {
     parse_positive_u128(name, &env(name)?)
+}
+
+fn batch_fee_profile_has_any_value() -> bool {
+    [
+        BATCH_DEPOSIT_FEE_ENV,
+        BATCH_CLAIM_FEE_ENV,
+        BATCH_SETTLE_FEE_ENV,
+        BATCH_REFUND_FEE_ENV,
+    ]
+    .into_iter()
+    .any(|name| optional_env_value(name).is_some())
+}
+
+fn batch_claim_fee_schedule_has_any_value() -> bool {
+    [
+        BATCH_CLAIM_1_FEE_ENV,
+        BATCH_CLAIM_10_FEE_ENV,
+        BATCH_CLAIM_50_FEE_ENV,
+        BATCH_CLAIM_100_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_1_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_10_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_50_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_100_FEE_ENV,
+    ]
+    .into_iter()
+    .any(|name| optional_env_value(name).is_some())
+}
+
+fn batch_claim_fee_schedule_values(
+    schedule: &BatchClaimFeeSchedule,
+) -> [(&'static str, &String); 8] {
+    [
+        (BATCH_CLAIM_1_FEE_ENV, &schedule.claim_1_fee_amount),
+        (BATCH_CLAIM_10_FEE_ENV, &schedule.claim_10_fee_amount),
+        (BATCH_CLAIM_50_FEE_ENV, &schedule.claim_50_fee_amount),
+        (BATCH_CLAIM_100_FEE_ENV, &schedule.claim_100_fee_amount),
+        (
+            BATCH_REFUND_WITH_CLAIM_1_FEE_ENV,
+            &schedule.refund_with_claim_1_fee_amount,
+        ),
+        (
+            BATCH_REFUND_WITH_CLAIM_10_FEE_ENV,
+            &schedule.refund_with_claim_10_fee_amount,
+        ),
+        (
+            BATCH_REFUND_WITH_CLAIM_50_FEE_ENV,
+            &schedule.refund_with_claim_50_fee_amount,
+        ),
+        (
+            BATCH_REFUND_WITH_CLAIM_100_FEE_ENV,
+            &schedule.refund_with_claim_100_fee_amount,
+        ),
+    ]
+}
+
+fn clear_batch_claim_fee_schedule_values() {
+    for name in [
+        BATCH_CLAIM_1_FEE_ENV,
+        BATCH_CLAIM_10_FEE_ENV,
+        BATCH_CLAIM_50_FEE_ENV,
+        BATCH_CLAIM_100_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_1_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_10_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_50_FEE_ENV,
+        BATCH_REFUND_WITH_CLAIM_100_FEE_ENV,
+    ] {
+        set_env_value(name, "");
+    }
+}
+
+fn validate_monotonic_fee_schedule(label: &str, values: [&str; 4]) -> Result<(), String> {
+    let mut previous = 0u128;
+    for value in values {
+        let amount = value
+            .parse::<u128>()
+            .map_err(|_| format!("{label} must contain positive uint128 integers"))?;
+        if amount < previous {
+            return Err(format!("{label} must be non-decreasing by claim count"));
+        }
+        previous = amount;
+    }
+    Ok(())
+}
+
+fn validate_batch_claim_fee_schedule(schedule: &BatchClaimFeeSchedule) -> Result<(), String> {
+    for (name, value) in batch_claim_fee_schedule_values(schedule) {
+        required_positive_u128_value(name, value)?;
+        validate_env_update(name, value)?;
+    }
+    validate_monotonic_fee_schedule(
+        "claim fee schedule",
+        [
+            &schedule.claim_1_fee_amount,
+            &schedule.claim_10_fee_amount,
+            &schedule.claim_50_fee_amount,
+            &schedule.claim_100_fee_amount,
+        ],
+    )?;
+    validate_monotonic_fee_schedule(
+        "refund-with-claim fee schedule",
+        [
+            &schedule.refund_with_claim_1_fee_amount,
+            &schedule.refund_with_claim_10_fee_amount,
+            &schedule.refund_with_claim_50_fee_amount,
+            &schedule.refund_with_claim_100_fee_amount,
+        ],
+    )
+}
+
+fn configured_batch_claim_fee_schedule() -> Result<Option<BatchClaimFeeSchedule>, String> {
+    if !batch_claim_fee_schedule_has_any_value() {
+        return Ok(None);
+    }
+    let schedule = BatchClaimFeeSchedule {
+        claim_1_fee_amount: required_positive_u128(BATCH_CLAIM_1_FEE_ENV)?.to_string(),
+        claim_10_fee_amount: required_positive_u128(BATCH_CLAIM_10_FEE_ENV)?.to_string(),
+        claim_50_fee_amount: required_positive_u128(BATCH_CLAIM_50_FEE_ENV)?.to_string(),
+        claim_100_fee_amount: required_positive_u128(BATCH_CLAIM_100_FEE_ENV)?.to_string(),
+        refund_with_claim_1_fee_amount: required_positive_u128(BATCH_REFUND_WITH_CLAIM_1_FEE_ENV)?
+            .to_string(),
+        refund_with_claim_10_fee_amount: required_positive_u128(
+            BATCH_REFUND_WITH_CLAIM_10_FEE_ENV,
+        )?
+        .to_string(),
+        refund_with_claim_50_fee_amount: required_positive_u128(
+            BATCH_REFUND_WITH_CLAIM_50_FEE_ENV,
+        )?
+        .to_string(),
+        refund_with_claim_100_fee_amount: required_positive_u128(
+            BATCH_REFUND_WITH_CLAIM_100_FEE_ENV,
+        )?
+        .to_string(),
+    };
+    validate_batch_claim_fee_schedule(&schedule)?;
+    Ok(Some(schedule))
+}
+
+fn require_batch_fee_configuration() -> Result<(), String> {
+    if !batch_fee_profile_has_any_value() {
+        return required_positive_u128(BATCH_LEGACY_FEE_ENV).map(|_| ());
+    }
+    for name in [
+        BATCH_DEPOSIT_FEE_ENV,
+        BATCH_CLAIM_FEE_ENV,
+        BATCH_SETTLE_FEE_ENV,
+        BATCH_REFUND_FEE_ENV,
+    ] {
+        required_positive_u128(name)?;
+    }
+    Ok(())
+}
+
+fn batch_fee_for_kind(kind: &str, has_claims: bool) -> Result<u128, String> {
+    if !batch_fee_profile_has_any_value() {
+        return required_positive_u128(BATCH_LEGACY_FEE_ENV);
+    }
+    let name = match (kind, has_claims) {
+        ("deposit", _) => BATCH_DEPOSIT_FEE_ENV,
+        ("claim", _) => BATCH_CLAIM_FEE_ENV,
+        ("settle", _) => BATCH_SETTLE_FEE_ENV,
+        ("refund", true) => BATCH_CLAIM_FEE_ENV,
+        ("refund", false) => BATCH_REFUND_FEE_ENV,
+        (other, _) => return Err(format!("unsupported batch fee action: {other}")),
+    };
+    required_positive_u128(name)
+}
+
+fn scheduled_claim_fee(count: usize, refund_with_claim: bool) -> Result<u128, String> {
+    if count == 0 || count > MAX_BATCH_CLAIMS {
+        return Err(format!(
+            "claim count must be between 1 and {MAX_BATCH_CLAIMS}"
+        ));
+    }
+    let Some(schedule) = configured_batch_claim_fee_schedule().ok().flatten() else {
+        return batch_fee_for_kind(
+            if refund_with_claim { "refund" } else { "claim" },
+            refund_with_claim,
+        );
+    };
+    let values = if refund_with_claim {
+        [
+            &schedule.refund_with_claim_1_fee_amount,
+            &schedule.refund_with_claim_10_fee_amount,
+            &schedule.refund_with_claim_50_fee_amount,
+            &schedule.refund_with_claim_100_fee_amount,
+        ]
+    } else {
+        [
+            &schedule.claim_1_fee_amount,
+            &schedule.claim_10_fee_amount,
+            &schedule.claim_50_fee_amount,
+            &schedule.claim_100_fee_amount,
+        ]
+    };
+    let value = if count <= 1 {
+        values[0]
+    } else if count <= 10 {
+        values[1]
+    } else if count <= 50 {
+        values[2]
+    } else {
+        values[3]
+    };
+    value
+        .parse::<u128>()
+        .map_err(|_| "configured claim fee schedule contains an invalid amount".to_string())
+}
+
+fn batch_fee_for_payload(payload: &BatchRequestPayload) -> Result<u128, String> {
+    let claim_count = payload.claims.as_deref().map_or(0, |claims| claims.len());
+    match payload.kind.as_str() {
+        "claim" => scheduled_claim_fee(claim_count, false),
+        "refund" if claim_count > 0 => scheduled_claim_fee(claim_count, true),
+        kind => batch_fee_for_kind(kind, false),
+    }
 }
 
 fn parse_positive_u128(label: &str, value: &str) -> Result<u128, String> {
@@ -1672,6 +4795,337 @@ fn seller_credit(seller: String) -> u128 {
 }
 
 #[query]
+fn seller_acceptance(seller: String) -> Option<SellerAcceptance> {
+    let seller = normalize_evm_address("seller", &seller).ok()?;
+    current_seller_acceptance(&seller)
+}
+
+fn current_seller_acceptance(seller: &str) -> Option<SellerAcceptance> {
+    SELLER_ACCEPTANCES
+        .with(|items| items.borrow().get(&seller.to_string()))
+        .map(decode_stable::<SellerAcceptance>)
+        .map(|mut value| {
+            value.superseded = !acceptance_versions_current(&value);
+            value
+        })
+}
+
+fn acceptance_versions() -> (String, String, String) {
+    (
+        env("SELLER_TERMS_VERSION").unwrap_or_else(|_| "2026-07-13-draft".to_string()),
+        env("PRIVACY_VERSION").unwrap_or_else(|_| "2026-07-13-draft".to_string()),
+        env("ASSET_BOUNDARY_VERSION").unwrap_or_else(|_| "2026-07-13-draft".to_string()),
+    )
+}
+
+fn acceptance_versions_current(value: &SellerAcceptance) -> bool {
+    let (terms, privacy, asset) = acceptance_versions();
+    if configured_network_profile().as_deref() == Ok("polygon")
+        && validate_polygon_production_values(
+            &env("SELLER_SETTLEMENT_FEE_AMOUNT").unwrap_or_default(),
+            &env("BATCH_SETTLEMENT_FEE_AMOUNT").unwrap_or_default(),
+            &terms,
+            &privacy,
+            &asset,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    value.status == "active"
+        && value.terms_version == terms
+        && value.privacy_version == privacy
+        && value.asset_boundary_version == asset
+}
+
+fn require_current_seller_acceptance(seller: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if !TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow()) {
+        return Ok(());
+    }
+    current_seller_acceptance(seller)
+        .filter(acceptance_versions_current)
+        .map(|_| ())
+        .ok_or_else(|| "seller must accept the current legal document versions".to_string())
+}
+
+fn seller_credit_balance_http(request: &HttpRequest) -> HttpResponse {
+    match seller_from_request(request) {
+        Ok(seller) => json_response(
+            200,
+            &serde_json::json!({
+                "seller": seller,
+                "creditAtoms": seller_credit_balance_for(&seller).to_string()
+            }),
+        ),
+        Err(message) => json_response(400, &retryable_error("invalid_request", &message, false)),
+    }
+}
+
+fn seller_acceptance_status_http(request: &HttpRequest) -> HttpResponse {
+    match seller_from_request(request) {
+        Ok(seller) => json_response(200, &current_seller_acceptance(&seller)),
+        Err(message) => json_response(400, &retryable_error("invalid_request", &message, false)),
+    }
+}
+
+fn seller_acceptance_challenge_http(request: &HttpRequest) -> HttpResponse {
+    let seller = match seller_from_request(request) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &retryable_error("invalid_request", &message, false))
+        }
+    };
+    let now = now_seconds();
+    let expires_at = now.saturating_add(300);
+    let seed = format!("{}|{}|{}", seller, now_nanos(), facilitator_canister_id());
+    let nonce = format!("0x{}", hex::encode(keccak256(seed.as_bytes())));
+    let message = seller_acceptance_message(&seller, &nonce, expires_at);
+    let facilitator_signature = match sign_eip191_message(&message) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(
+                503,
+                &retryable_error("facilitator_signer_unavailable", &message, true),
+            )
+        }
+    };
+    let challenge = SellerAcceptanceChallenge {
+        seller,
+        nonce,
+        expires_at,
+        message,
+        facilitator_signature,
+    };
+    json_response(200, &challenge)
+}
+
+fn sign_eip191_message(message: &str) -> Result<String, String> {
+    let private_key = env("FACILITATOR_EVM_PRIVATE_KEY")?;
+    let bytes = parse_hex(&private_key, Some(32))?;
+    let key = SigningKey::from_slice(&bytes).map_err(|_| "invalid facilitator private key")?;
+    let digest = crate::eip712::eip191_digest(message);
+    let (signature, recovery): (Signature, RecoveryId) = key
+        .sign_prehash(&digest)
+        .map_err(|_| "failed to sign seller acceptance challenge")?;
+    let mut encoded = Vec::with_capacity(65);
+    encoded.extend_from_slice(&signature.to_bytes());
+    encoded.push(u8::from(recovery) + 27);
+    Ok(format!("0x{}", hex::encode(encoded)))
+}
+
+fn seller_acceptance_message(seller: &str, nonce: &str, expires_at: u64) -> String {
+    let (terms, privacy, asset) = acceptance_versions();
+    format!(
+        "IC_JPYC_FACILITATOR_SELLER_ACCEPTANCE_V1\nseller={seller}\ncanisterId={}\npublicOrigin={}\nchainId={}\ntermsVersion={terms}\nprivacyVersion={privacy}\nassetBoundaryVersion={asset}\nnonce={nonce}\nexpiresAt={expires_at}",
+        facilitator_canister_id(),
+        env("FACILITATOR_PUBLIC_ORIGIN").unwrap_or_default(),
+        configured_chain_id()
+    )
+}
+
+fn seller_acceptance_submit_http(request: &HttpRequest) -> HttpResponse {
+    let submission = match serde_json::from_slice::<SellerAcceptanceSubmission>(&request.body) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                400,
+                &retryable_error(
+                    "invalid_request",
+                    &format!("invalid JSON body: {error}"),
+                    false,
+                ),
+            )
+        }
+    };
+    let seller = match normalize_evm_address("seller", &submission.seller) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &retryable_error("invalid_request", &message, false))
+        }
+    };
+    if submission.expires_at < now_seconds()
+        || submission.message
+            != seller_acceptance_message(&seller, &submission.nonce, submission.expires_at)
+    {
+        return json_response(
+            410,
+            &retryable_error(
+                "expired_challenge",
+                "acceptance challenge expired or document versions changed",
+                true,
+            ),
+        );
+    }
+    let facilitator =
+        match recover_eip191_signer(&submission.message, &submission.facilitator_signature) {
+            Ok(value) => value,
+            Err(message) => {
+                return json_response(
+                    402,
+                    &retryable_error("invalid_challenge_proof", &message, false),
+                )
+            }
+        };
+    let expected_facilitator =
+        env("FACILITATOR_EVM_PRIVATE_KEY").and_then(|key| private_key_address(&key));
+    if expected_facilitator
+        .as_deref()
+        .map(|expected| !same_address(&facilitator, expected))
+        .unwrap_or(true)
+    {
+        return json_response(
+            402,
+            &retryable_error(
+                "invalid_challenge_proof",
+                "challenge proof does not match facilitator",
+                false,
+            ),
+        );
+    }
+    let recovered = match recover_eip191_signer(&submission.message, &submission.signature) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(402, &retryable_error("invalid_signature", &message, false))
+        }
+    };
+    if !same_address(&recovered, &seller) {
+        return json_response(
+            402,
+            &retryable_error(
+                "invalid_signature",
+                "signature does not match seller",
+                false,
+            ),
+        );
+    }
+    if let Some(existing) = current_seller_acceptance(&seller).filter(acceptance_versions_current) {
+        return json_response(200, &existing);
+    }
+    if let Err(message) = ensure_batch_seller_exists(&seller) {
+        return json_response(
+            500,
+            &retryable_error("seller_activation_failed", &message, true),
+        );
+    }
+    let (terms_version, privacy_version, asset_boundary_version) = acceptance_versions();
+    let acceptance = SellerAcceptance {
+        seller: seller.clone(),
+        status: "active".to_string(),
+        terms_version,
+        privacy_version,
+        asset_boundary_version,
+        accepted_at: now_seconds(),
+        superseded: false,
+    };
+    SELLER_ACCEPTANCES.with(|items| {
+        items
+            .borrow_mut()
+            .insert(seller, encode_stable(&acceptance))
+    });
+    json_response(200, &acceptance)
+}
+
+fn ensure_batch_seller_exists(receiver: &str) -> Result<(), String> {
+    let now = sqlite_now_seconds();
+    #[cfg(test)]
+    {
+        TEST_BATCH_SELLERS.with(|sellers| {
+            let mut sellers = sellers.borrow_mut();
+            let created_at = sellers
+                .get(receiver)
+                .map(|seller| seller.created_at)
+                .unwrap_or_else(|| u64::try_from(now).unwrap_or(u64::MAX));
+            sellers.entry(receiver.to_string()).or_insert(BatchSeller {
+                receiver_address: receiver.to_string(),
+                status: "active".to_string(),
+                created_at,
+                updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+            });
+        });
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| connection.execute(
+            "INSERT INTO sellers(receiver_address, status, created_at, updated_at) VALUES (?1, 'active', ?2, ?2) ON CONFLICT(receiver_address) DO NOTHING",
+            params![receiver, now],
+        ).map(|_| ())).map_err(sqlite_error)
+    }
+}
+
+fn now_nanos() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ic_cdk::api::time()
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+    {
+        1_700_000_000_000_000_000
+    }
+    #[cfg(test)]
+    {
+        TEST_ACCEPTANCE_NONCE_SEQUENCE.with(|sequence| {
+            let next = sequence.borrow().saturating_add(1);
+            *sequence.borrow_mut() = next;
+            1_700_000_000_000_000_000u64.saturating_add(next)
+        })
+    }
+}
+
+fn facilitator_canister_id() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ic_cdk::api::canister_self().to_text()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "aaaaa-aa".to_string()
+    }
+}
+
+pub(crate) fn configured_chain_id() -> u64 {
+    configured_network_profile()
+        .ok()
+        .filter(|value| value == "amoy")
+        .map(|_| 80_002)
+        .unwrap_or(137)
+}
+
+pub(crate) fn configured_network_profile() -> Result<String, String> {
+    let profile = env("NETWORK_PROFILE").unwrap_or_else(|_| "polygon".to_string());
+    match profile.as_str() {
+        "polygon" => Ok(profile),
+        "amoy" => {
+            normalize_evm_address("AMOY_JPYC_ADDRESS", &env("AMOY_JPYC_ADDRESS")?)?;
+            normalize_evm_address(
+                "AMOY_BATCH_SETTLEMENT_CONTRACT",
+                &env("AMOY_BATCH_SETTLEMENT_CONTRACT")?,
+            )?;
+            Ok(profile)
+        }
+        _ => Err("NETWORK_PROFILE must be polygon or amoy".to_string()),
+    }
+}
+
+pub(crate) fn configured_network() -> String {
+    if configured_network_profile().as_deref() == Ok("amoy") {
+        "eip155:80002".to_string()
+    } else {
+        NETWORK.to_string()
+    }
+}
+
+pub(crate) fn configured_token_address() -> Result<String, String> {
+    if configured_network_profile()? == "amoy" {
+        normalize_evm_address("AMOY_JPYC_ADDRESS", &env("AMOY_JPYC_ADDRESS")?)
+    } else {
+        Ok(JPYC_POLYGON_ADDRESS.to_string())
+    }
+}
+
+#[query]
 fn settlement(key: String) -> Option<SettlementRecord> {
     get_settlement(&key)
 }
@@ -1684,6 +5138,501 @@ fn settlement_count() -> u64 {
 #[query]
 fn active_settlement_count() -> u64 {
     ACTIVE_SETTLEMENTS.with(|items| items.borrow().len())
+}
+
+#[update]
+fn recover_stale_settlement(key: String) -> Result<StaleSettlementRecovery, String> {
+    require_controller_or_trap();
+    let record = get_settlement(&key).ok_or_else(|| "settlement not found".to_string())?;
+    if record.status != "checking" || !record.response.transaction.trim().is_empty() {
+        return Err("only an unbroadcast checking settlement can be recovered".to_string());
+    }
+    let started_at = record.attempt_started_at.unwrap_or(record.updated_at);
+    if now_seconds().saturating_sub(started_at) < 600 {
+        return Err("checking settlement must be at least 600 seconds old".to_string());
+    }
+    if get_active_settlement_by_key(&key).is_some_and(|active| active.tx.is_some()) {
+        return Err("settlement already has a broadcast transaction".to_string());
+    }
+    let seller = record
+        .pay_to
+        .clone()
+        .ok_or_else(|| "checking settlement has no seller".to_string())?;
+    let kind = record
+        .settlement_kind
+        .clone()
+        .or_else(|| {
+            record
+                .response
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("settlementKind"))
+                .cloned()
+        })
+        .unwrap_or_else(|| "exact".to_string());
+    let refunded_fee = if kind == "seller-credit" {
+        0
+    } else {
+        record
+            .charged_fee
+            .as_deref()
+            .or_else(|| {
+                record
+                    .response
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.get("settlementFee"))
+                    .map(String::as_str)
+            })
+            .ok_or_else(|| "checking settlement has no recorded charged fee".to_string())?
+            .parse::<u128>()
+            .map_err(|_| "checking settlement charged fee is invalid".to_string())?
+    };
+    if refunded_fee > 0 {
+        refund_seller_credit(&seller, refunded_fee);
+    }
+    remove_settlement(&key);
+    release_active_settlement_by_key(&key);
+    Ok(StaleSettlementRecovery {
+        key,
+        seller,
+        refunded_fee: refunded_fee.to_string(),
+    })
+}
+
+#[query]
+fn batch_channel(channel_id: String) -> Option<BatchChannel> {
+    validate_channel_id(&channel_id)
+        .map(|_| channel_id.to_ascii_lowercase())
+        .ok()
+        .and_then(|key| get_batch_channel(&key))
+}
+
+#[query]
+fn batch_channel_count() -> u64 {
+    BATCH_CHANNELS.with(|items| items.borrow().len())
+}
+
+#[query]
+fn batch_deleted_channel(channel_id: String) -> Option<BatchDeletedChannel> {
+    validate_channel_id(&channel_id)
+        .map(|_| channel_id.to_ascii_lowercase())
+        .ok()
+        .and_then(|key| get_batch_deleted_channel(&key))
+}
+
+#[query]
+fn batch_deleted_channel_count() -> u64 {
+    BATCH_DELETED_CHANNELS.with(|items| items.borrow().len())
+}
+
+#[update]
+fn batch_set_seller(receiver: String, status: String) -> Result<BatchSeller, String> {
+    require_controller_or_trap();
+    let receiver = normalize_evm_address("receiver", &receiver)?;
+    let status = require_seller_status(&status)?;
+    let now = sqlite_now_seconds();
+    #[cfg(test)]
+    {
+        let seller = TEST_BATCH_SELLERS.with(|sellers| {
+            let mut sellers = sellers.borrow_mut();
+            let created_at = sellers
+                .get(&receiver)
+                .map(|seller| seller.created_at)
+                .unwrap_or_else(|| u64::try_from(now).unwrap_or(u64::MAX));
+            let seller = BatchSeller {
+                receiver_address: receiver.clone(),
+                status: status.clone(),
+                created_at,
+                updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+            };
+            sellers.insert(receiver.clone(), seller.clone());
+            seller
+        });
+        return Ok(seller);
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| {
+            connection.execute(
+                "INSERT INTO sellers(receiver_address, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(receiver_address) DO UPDATE SET
+                 status = excluded.status,
+                 updated_at = excluded.updated_at",
+                params![receiver, status, now],
+            )?;
+            connection.query_one(
+                "SELECT receiver_address, status, created_at, updated_at
+             FROM sellers WHERE receiver_address = ?1",
+                params![receiver],
+                batch_seller_from_row,
+            )
+        })
+        .map_err(sqlite_error)
+    }
+}
+
+#[update]
+fn batch_set_writer_receiver_scope(
+    writer: Principal,
+    receiver: String,
+    enabled: bool,
+) -> Result<BatchWriterReceiverScope, String> {
+    require_controller_or_trap();
+    validate_non_system_principal("writer", writer)?;
+    let receiver = normalize_evm_address("receiver", &receiver)?;
+    let writer_text = writer.to_text();
+    let now = sqlite_now_seconds();
+    let updated_by = batch_update_caller().to_text();
+    #[cfg(test)]
+    {
+        let scope = TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let key = test_scope_key(&writer_text, &receiver);
+            let created_at = scopes
+                .get(&key)
+                .map(|scope| scope.created_at)
+                .unwrap_or_else(|| u64::try_from(now).unwrap_or(u64::MAX));
+            let scope = BatchWriterReceiverScope {
+                writer_principal: writer,
+                receiver_address: receiver.clone(),
+                enabled,
+                created_at,
+                updated_at: u64::try_from(now).unwrap_or(u64::MAX),
+                updated_by: updated_by.clone(),
+            };
+            scopes.insert(key, scope.clone());
+            scope
+        });
+        return Ok(scope);
+    }
+    #[cfg(not(test))]
+    {
+        let enabled_value = if enabled { 1_i64 } else { 0_i64 };
+        init_sqlite_db()?;
+        SqliteDb::update(|connection| {
+            connection.execute(
+                "INSERT INTO writer_receiver_scopes(
+                 writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             )
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+             ON CONFLICT(writer_principal, receiver_address) DO UPDATE SET
+                 enabled = excluded.enabled,
+                 updated_at = excluded.updated_at,
+                 updated_by = excluded.updated_by",
+                params![writer_text, receiver, enabled_value, now, updated_by],
+            )?;
+            connection.query_one(
+            "SELECT writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             FROM writer_receiver_scopes
+             WHERE writer_principal = ?1 AND receiver_address = ?2",
+            params![writer_text, receiver],
+            batch_scope_from_row,
+        )
+        })
+        .map_err(sqlite_error)
+    }
+}
+
+#[query]
+fn batch_writer_receiver_scope(
+    writer: Principal,
+    receiver: String,
+) -> Option<BatchWriterReceiverScope> {
+    validate_non_system_principal("writer", writer).ok()?;
+    let receiver = normalize_evm_address("receiver", &receiver).ok()?;
+    let writer = writer.to_text();
+    #[cfg(test)]
+    {
+        return TEST_BATCH_WRITER_RECEIVER_SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .get(&test_scope_key(&writer, &receiver))
+                .cloned()
+        });
+    }
+    #[cfg(not(test))]
+    {
+        init_sqlite_db().ok()?;
+        SqliteDb::query(|connection| {
+            connection.query_optional(
+            "SELECT writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             FROM writer_receiver_scopes
+             WHERE writer_principal = ?1 AND receiver_address = ?2",
+            params![writer, receiver],
+            batch_scope_from_row,
+        )
+        })
+        .ok()
+        .flatten()
+    }
+}
+
+#[query]
+fn batch_writer_receiver_scope_count() -> u64 {
+    batch_sqlite_scope_count().unwrap_or(0)
+}
+
+#[query]
+fn batch_writer_receiver_scopes(limit: Option<u64>) -> Vec<BatchWriterReceiverScope> {
+    let limit = limit
+        .unwrap_or(BATCH_SQLITE_LIST_LIMIT)
+        .min(BATCH_SQLITE_LIST_LIMIT);
+    #[cfg(test)]
+    {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        return TEST_BATCH_WRITER_RECEIVER_SCOPES
+            .with(|scopes| scopes.borrow().values().take(limit).cloned().collect());
+    }
+    #[cfg(not(test))]
+    {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        if init_sqlite_db().is_err() {
+            return Vec::new();
+        }
+        SqliteDb::query(|connection| {
+            connection.query_map(
+            "SELECT writer_principal, receiver_address, enabled, created_at, updated_at, updated_by
+             FROM writer_receiver_scopes
+             ORDER BY receiver_address, writer_principal
+             LIMIT ?1",
+            params![limit_i64],
+            batch_scope_from_row,
+        )
+        })
+        .unwrap_or_default()
+    }
+}
+
+#[query]
+fn batch_receiver_authorizer() -> Option<String> {
+    batch_receiver_authorizer_address().ok()
+}
+
+#[query]
+fn batch_settlement_contract() -> Option<String> {
+    configured_batch_settlement_contract()
+        .ok()
+        .and_then(|value| normalize_evm_address("BATCH_SETTLEMENT_CONTRACT", &value).ok())
+}
+
+#[query]
+fn batch_settlement_fee_amount() -> Option<String> {
+    scheduled_claim_fee(MAX_BATCH_CLAIMS, false)
+        .ok()
+        .map(|value| value.to_string())
+}
+
+#[query]
+fn batch_deposit_fee_amount() -> Option<String> {
+    batch_fee_for_kind("deposit", false)
+        .ok()
+        .map(|value| value.to_string())
+}
+
+#[query]
+fn batch_claim_fee_amount() -> Option<String> {
+    scheduled_claim_fee(MAX_BATCH_CLAIMS, false)
+        .ok()
+        .map(|value| value.to_string())
+}
+
+#[query]
+fn batch_settle_fee_amount() -> Option<String> {
+    batch_fee_for_kind("settle", false)
+        .ok()
+        .map(|value| value.to_string())
+}
+
+#[query]
+fn batch_refund_fee_amount() -> Option<String> {
+    batch_fee_for_kind("refund", false)
+        .ok()
+        .map(|value| value.to_string())
+}
+
+#[query]
+fn batch_claim_fee_schedule() -> Option<BatchClaimFeeSchedule> {
+    configured_batch_claim_fee_schedule().ok().flatten()
+}
+
+#[query]
+fn batch_channels(limit: Option<u64>) -> Vec<BatchChannel> {
+    let limit = limit
+        .map(|value| value.min(MAX_BATCH_CHANNELS_LIST as u64) as usize)
+        .unwrap_or(MAX_BATCH_CHANNELS_LIST);
+    BATCH_CHANNELS.with(|items| {
+        items
+            .borrow()
+            .iter()
+            .take(limit)
+            .map(|entry| decode_stable::<BatchChannel>(entry.value()))
+            .collect()
+    })
+}
+
+#[query]
+fn batch_deleted_channels(limit: Option<u64>) -> Vec<BatchDeletedChannel> {
+    let limit = limit
+        .map(|value| value.min(MAX_BATCH_CHANNELS_LIST as u64) as usize)
+        .unwrap_or(MAX_BATCH_CHANNELS_LIST);
+    BATCH_DELETED_CHANNELS.with(|items| {
+        items
+            .borrow()
+            .iter()
+            .take(limit)
+            .map(|entry| decode_stable::<BatchDeletedChannel>(entry.value()))
+            .collect()
+    })
+}
+
+#[update]
+fn batch_update_channel(
+    channel_id: String,
+    expected_revision: Option<u64>,
+    update: BatchChannelUpdate,
+) -> BatchChannelUpdateResult {
+    if let Err(message) = validate_channel_id(&channel_id) {
+        return BatchChannelUpdateResult {
+            status: "invalid".to_string(),
+            channel: None,
+            current_revision: None,
+            message: Some(message),
+        };
+    }
+    let key = channel_id.to_ascii_lowercase();
+    let current = get_batch_channel(&key);
+    let current_revision = current.as_ref().map(|channel| channel.revision);
+    if expected_revision != current_revision {
+        return BatchChannelUpdateResult {
+            status: "conflict".to_string(),
+            channel: current,
+            current_revision,
+            message: Some("batch channel revision mismatch".to_string()),
+        };
+    }
+    match update.channel {
+        Some(mut channel) => {
+            let contract = match configured_batch_settlement_contract() {
+                Ok(contract) => contract,
+                Err(message) => {
+                    return BatchChannelUpdateResult {
+                        status: "invalid".to_string(),
+                        channel: current,
+                        current_revision,
+                        message: Some(message),
+                    };
+                }
+            };
+            if let Err(message) = validate_batch_channel(&key, &channel, &contract) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            if let Err(message) = validate_batch_channel_runtime_config(&channel) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            if let Err(message) = validate_batch_channel_transition(current.as_ref(), &channel) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            if let Err(message) = authorize_batch_channel_update(current.as_ref(), Some(&channel)) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            if !can_put_batch_channel(&key) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some("batch channel storage limit reached".to_string()),
+                };
+            }
+            channel.channel_id = key.clone();
+            channel.revision = current_revision.unwrap_or(0).saturating_add(1);
+            if let Err(message) = put_batch_channel(&key, channel.clone()) {
+                return BatchChannelUpdateResult {
+                    status: "invalid".to_string(),
+                    channel: current,
+                    current_revision,
+                    message: Some(message),
+                };
+            }
+            BatchChannelUpdateResult {
+                status: "updated".to_string(),
+                channel: Some(channel.clone()),
+                current_revision: Some(channel.revision),
+                message: None,
+            }
+        }
+        None => {
+            if let Some(channel) = current.as_ref() {
+                if let Err(message) = authorize_batch_channel_update(Some(channel), None) {
+                    return BatchChannelUpdateResult {
+                        status: "invalid".to_string(),
+                        channel: current,
+                        current_revision,
+                        message: Some(message),
+                    };
+                }
+                let now_ms = now_seconds().saturating_mul(1_000);
+                if channel
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|pending| pending.expires_at > now_ms)
+                    && !is_pending_only_provisional_channel(channel, now_ms)
+                {
+                    return BatchChannelUpdateResult {
+                        status: "invalid".to_string(),
+                        channel: current,
+                        current_revision,
+                        message: Some(
+                            "batch channel delete requires no live pendingRequest".to_string(),
+                        ),
+                    };
+                }
+                put_batch_deleted_channel(
+                    &key,
+                    BatchDeletedChannel {
+                        channel: channel.clone(),
+                        deleted_at: now_seconds(),
+                        deleted_by: batch_channel_update_caller_text(),
+                    },
+                );
+                BATCH_CHANNELS.with(|items| {
+                    items.borrow_mut().remove(&key);
+                });
+            }
+            BatchChannelUpdateResult {
+                status: if current.is_some() {
+                    "deleted".to_string()
+                } else {
+                    "unchanged".to_string()
+                },
+                channel: None,
+                current_revision: None,
+                message: None,
+            }
+        }
+    }
 }
 
 fn seller_credit_balance_for(seller: &str) -> u128 {
@@ -1771,6 +5720,24 @@ fn query_param(url: &str, name: &str) -> Option<String> {
     })
 }
 
+fn unique_query_param(url: &str, name: &str) -> Result<String, String> {
+    let query = url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default();
+    let values: Vec<&str> = query
+        .split('&')
+        .map(|part| part.split_once('=').unwrap_or((part, "")))
+        .filter_map(|(key, value)| (key == name).then_some(value))
+        .collect();
+    match values.as_slice() {
+        [] => Err(format!("missing {name} query parameter")),
+        [value] if !value.is_empty() => Ok((*value).to_string()),
+        [..] if values.len() > 1 => Err(format!("duplicate {name} query parameter")),
+        _ => Err(format!("{name} query parameter must not be empty")),
+    }
+}
+
 fn env(name: &str) -> Result<String, String> {
     if let Some(value) = ENV.with(|env| env.borrow().get(&name.to_string())) {
         if !value.trim().is_empty() {
@@ -1828,7 +5795,7 @@ fn settlement_key(body: &FacilitatorRequest) -> Result<String, String> {
     let signature = parse_hex(&body.payment_payload.payload.signature, Some(65))?;
     let signature_hash = keccak256(&signature);
     let identity = [
-        NETWORK.to_string(),
+        configured_network(),
         body.payment_requirements.asset.to_ascii_lowercase(),
         auth.from.to_ascii_lowercase(),
         auth.nonce.to_ascii_lowercase(),
@@ -1843,13 +5810,208 @@ fn settlement_key(body: &FacilitatorRequest) -> Result<String, String> {
 }
 
 fn insert_settlement(key: &str, mut record: SettlementRecord) -> SettlementRecord {
+    if let Some(previous) = get_settlement(key) {
+        remove_settlement_index_entry(key, &previous);
+        record.inherit_metadata_from(&previous);
+    }
+    let extra = record.response.extra.get_or_insert_with(BTreeMap::new);
+    let kind = record
+        .settlement_kind
+        .clone()
+        .or_else(|| extra.get("settlementKind").cloned())
+        .unwrap_or_else(|| "exact".to_string());
+    extra
+        .entry("settlementKind".to_string())
+        .or_insert_with(|| kind.clone());
+    let fee = record
+        .charged_fee
+        .clone()
+        .or_else(|| extra.get("settlementFee").cloned())
+        .unwrap_or_else(|| seller_settlement_fee_amount().unwrap_or(0).to_string());
+    extra
+        .entry("settlementFee".to_string())
+        .or_insert_with(|| fee.clone());
+    record.settlement_kind = Some(kind);
+    record.charged_fee = Some(fee);
+    extra.insert(
+        "confirmations".to_string(),
+        if record.response.success {
+            rpc_config()
+                .map(|config| config.min_confirmations)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+        .to_string(),
+    );
     attach_settlement_key(key, &mut record);
+    if let Some(seller) = record.pay_to.clone() {
+        let seller = seller.to_ascii_lowercase();
+        let index_key = format!("{seller}|{:020}|{key}", record.created_at);
+        SELLER_SETTLEMENT_INDEX.with(|items| {
+            items.borrow_mut().insert(index_key, key.to_string());
+        });
+    }
     SETTLEMENTS.with(|items| {
         items
             .borrow_mut()
             .insert(key.to_string(), encode_stable(&record));
     });
     record
+}
+
+fn rebuild_seller_settlement_index() {
+    let records = SETTLEMENTS.with(|items| {
+        items
+            .borrow()
+            .iter()
+            .filter_map(|entry| {
+                decode_stable_result::<SettlementRecord>(entry.value())
+                    .ok()
+                    .map(|record| (entry.key().clone(), record))
+            })
+            .collect::<Vec<_>>()
+    });
+    SELLER_SETTLEMENT_INDEX.with(|items| {
+        let mut items = items.borrow_mut();
+        let keys = items
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            items.remove(&key);
+        }
+        for (key, record) in records {
+            if let Some(seller) = record.pay_to {
+                let index_key = format!(
+                    "{}|{:020}|{}",
+                    seller.to_ascii_lowercase(),
+                    record.created_at,
+                    key
+                );
+                items.insert(index_key, key);
+            }
+        }
+    });
+}
+
+fn insert_batch_settlement(
+    key: &str,
+    mut record: SettlementRecord,
+    fee: Option<u128>,
+) -> SettlementRecord {
+    let extra = record.response.extra.get_or_insert_with(BTreeMap::new);
+    extra.insert("settlementKind".to_string(), "batch".to_string());
+    if let Some(fee) = fee {
+        extra.insert("settlementFee".to_string(), fee.to_string());
+        record.charged_fee = Some(fee.to_string());
+    } else if let Some(fee) = extra.get("settlementFee").cloned() {
+        extra.insert("settlementFee".to_string(), fee);
+    }
+    record.settlement_kind = Some("batch".to_string());
+    insert_settlement(key, record)
+}
+
+#[query]
+fn seller_settlements(
+    seller: String,
+    cursor: Option<String>,
+    limit: Option<u64>,
+) -> SellerSettlementPage {
+    let Ok(seller) = normalize_evm_address("seller", &seller) else {
+        return SellerSettlementPage {
+            items: Vec::new(),
+            next_cursor: None,
+        };
+    };
+    seller_settlements_page(&seller, cursor.as_deref(), limit.unwrap_or(20))
+}
+
+fn seller_settlements_page(seller: &str, cursor: Option<&str>, limit: u64) -> SellerSettlementPage {
+    let limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let prefix = format!("{}|", seller.to_ascii_lowercase());
+    let mut indexed = SELLER_SETTLEMENT_INDEX.with(|items| {
+        items
+            .borrow()
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>()
+    });
+    indexed.sort_by(|left, right| right.0.cmp(&left.0));
+    if let Some(cursor) = cursor {
+        indexed.retain(|(key, _)| key.as_str() < cursor);
+    }
+    let has_more = indexed.len() > limit;
+    indexed.truncate(limit);
+    let items = indexed
+        .iter()
+        .filter_map(|(_, key)| get_settlement(key).map(|record| settlement_item(key, record)))
+        .collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| indexed.last().map(|item| item.0.clone()))
+        .flatten();
+    SellerSettlementPage { items, next_cursor }
+}
+
+fn settlement_item(key: &str, record: SettlementRecord) -> SellerSettlementItem {
+    let kind = record
+        .response
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get("settlementKind"))
+        .cloned()
+        .unwrap_or_else(|| "exact".to_string());
+    let fee = record
+        .response
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get("settlementFee"))
+        .cloned()
+        .unwrap_or_else(|| {
+            if kind == "batch" {
+                batch_settlement_fee_amount().unwrap_or_else(|| "0".to_string())
+            } else {
+                seller_settlement_fee_amount().unwrap_or(0).to_string()
+            }
+        });
+    SellerSettlementItem {
+        key: key.to_string(),
+        kind,
+        status: record.status,
+        payer: record.response.payer.unwrap_or_default(),
+        seller: record.pay_to.unwrap_or_default(),
+        amount: record.response.amount.unwrap_or_default(),
+        fee,
+        transaction: record.response.transaction,
+        confirmations: record
+            .response
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("confirmations"))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        failure_reason: record.response.error_reason,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn seller_settlements_http(request: &HttpRequest) -> HttpResponse {
+    let seller = match seller_from_request(request) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(400, &retryable_error("invalid_request", &message, false))
+        }
+    };
+    let cursor = query_param(&request.url, "cursor");
+    let limit = query_param(&request.url, "limit")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+    json_response(
+        200,
+        &seller_settlements_page(&seller, cursor.as_deref(), limit),
+    )
 }
 
 fn attach_settlement_key(key: &str, record: &mut SettlementRecord) {
@@ -1859,32 +6021,32 @@ fn attach_settlement_key(key: &str, record: &mut SettlementRecord) {
 }
 
 fn remove_settlement(key: &str) {
+    if let Some(record) = get_settlement(key) {
+        remove_settlement_index_entry(key, &record);
+    }
     SETTLEMENTS.with(|items| {
         items.borrow_mut().remove(&key.to_string());
     });
 }
 
-fn purge_expired_settlements(now: u64) {
-    let expired_keys = SETTLEMENTS.with(|items| {
-        items
-            .borrow()
-            .iter()
-            .filter(|entry| {
-                let record = decode_stable::<SettlementRecord>(entry.value());
-                record.is_expired(now) && !record.is_broadcast()
-            })
-            .map(|entry| entry.key().clone())
-            .collect::<Vec<_>>()
+fn remove_settlement_index_entry(key: &str, record: &SettlementRecord) {
+    let Some(seller) = record.pay_to.as_deref() else {
+        return;
+    };
+    let index_key = format!(
+        "{}|{:020}|{}",
+        seller.to_ascii_lowercase(),
+        record.created_at,
+        key
+    );
+    SELLER_SETTLEMENT_INDEX.with(|items| {
+        items.borrow_mut().remove(&index_key);
     });
-    SETTLEMENTS.with(|items| {
-        let mut items = items.borrow_mut();
-        for key in &expired_keys {
-            items.remove(key);
-        }
-    });
-    for key in expired_keys {
-        release_active_settlement_by_key(&key);
-    }
+}
+
+fn purge_expired_settlements(_now: u64) {
+    // A `checking` record protects a reserved fee and nonce across awaits/upgrades.
+    // It is recovered only through the controller-only stale recovery flow.
 }
 
 fn settlement_cache_ttl_seconds() -> Result<u64, String> {
@@ -2004,6 +6166,15 @@ fn update_active_broadcast(from: &str, key: &str, nonce: u128, tx: &str) {
     }
 }
 
+fn rename_active_settlement_key(scope: &str, old_key: &str, new_key: &str) {
+    if let Some(mut active) =
+        get_active_settlement(scope).filter(|active| active.key == old_key && active.tx.is_none())
+    {
+        active.key = new_key.to_string();
+        put_active_settlement(scope, active);
+    }
+}
+
 #[cfg(test)]
 fn active_nonce(from: &str, key: &str) -> Option<u128> {
     get_active_settlement(from)
@@ -2016,6 +6187,15 @@ fn active_nonce_by_key(key: &str) -> Option<u128> {
         items.borrow().iter().find_map(|entry| {
             let active = decode_stable::<ActiveSettlement>(entry.value());
             (active.key == key).then_some(active.nonce).flatten()
+        })
+    })
+}
+
+fn get_active_settlement_by_key(key: &str) -> Option<ActiveSettlement> {
+    ACTIVE_SETTLEMENTS.with(|items| {
+        items.borrow().iter().find_map(|entry| {
+            let active = decode_stable::<ActiveSettlement>(entry.value());
+            (active.key == key).then_some(active)
         })
     })
 }
@@ -2151,8 +6331,48 @@ async fn maybe_replace_pending_settlement_record(
         return existing;
     }
     trace.step(labels.retry_window, 0);
-    match send_settlement(&config, &private_key, body, nonce).await {
-        Ok(SettlementOutcome::Settled(tx)) => {
+    let broadcast = match broadcast_settlement(&config, &private_key, body, nonce).await {
+        Ok(broadcast) => {
+            update_active_broadcast_by_key(key, broadcast.nonce, &broadcast.tx);
+            let record = SettlementRecord::broadcast(
+                broadcast.tx.clone(),
+                details.payer.clone(),
+                details.pay_to.clone(),
+                details.amount.clone(),
+                now_seconds(),
+                ttl,
+            );
+            insert_settlement(key, record);
+            broadcast
+        }
+        Err(SettlementSendError::GasTooExpensive) => {
+            trace.step(labels.send, 2);
+            return existing;
+        }
+        Err(SettlementSendError::Ambiguous {
+            nonce,
+            tx,
+            message: _,
+        }) => {
+            trace.step(labels.send, 5);
+            update_active_broadcast_by_key(key, nonce, &tx);
+            let record = SettlementRecord::broadcast(
+                tx,
+                details.payer,
+                details.pay_to,
+                details.amount,
+                now_seconds(),
+                ttl,
+            );
+            return insert_settlement(key, record);
+        }
+        Err(SettlementSendError::Other(_)) => {
+            trace.step(labels.send, 5);
+            return existing;
+        }
+    };
+    match confirm_settlement_broadcast(&config, body, &broadcast).await {
+        SettlementOutcome::Settled(tx) => {
             trace.step(labels.send, 5);
             let record = SettlementRecord::settled(
                 tx,
@@ -2166,7 +6386,7 @@ async fn maybe_replace_pending_settlement_record(
             release_active_settlement_by_key(key);
             record
         }
-        Ok(SettlementOutcome::Pending { nonce, tx }) => {
+        SettlementOutcome::Pending { nonce, tx } => {
             trace.step(labels.send, 5);
             update_active_broadcast_by_key(key, nonce, &tx);
             let record = SettlementRecord::broadcast(
@@ -2179,7 +6399,7 @@ async fn maybe_replace_pending_settlement_record(
             );
             insert_settlement(key, record)
         }
-        Ok(SettlementOutcome::Failed { tx, message }) => {
+        SettlementOutcome::Failed { tx, message } => {
             trace.step(labels.send, 5);
             let record = SettlementRecord::failed(
                 tx,
@@ -2193,13 +6413,139 @@ async fn maybe_replace_pending_settlement_record(
             release_active_settlement_by_key(key);
             record
         }
-        Err(SettlementSendError::GasTooExpensive) => {
-            trace.step(labels.send, 2);
-            existing
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_replace_pending_batch_settlement_record(
+    key: &str,
+    existing: SettlementRecord,
+    payload: &BatchRequestPayload,
+    requirements: &PaymentRequirements,
+    details: crate::state::BroadcastSettlement,
+    contract: &str,
+    expectation: &ContractExpectation,
+    ttl: u64,
+    trace: &mut CostTrace,
+) -> SettlementRecord {
+    let retry_after =
+        settlement_confirmation_timeout_seconds().unwrap_or(DEFAULT_CONFIRMATION_TIMEOUT_SECONDS);
+    if now_seconds().saturating_sub(existing.updated_at) < retry_after {
+        trace.step("batch_settle.replace_retry_window", 0);
+        return existing;
+    }
+    let private_key = match env("FACILITATOR_EVM_PRIVATE_KEY") {
+        Ok(value) => value,
+        Err(_) => {
+            trace.step("batch_settle.replace_config", 0);
+            return existing;
         }
-        Err(SettlementSendError::Other(_)) => {
-            trace.step(labels.send, 5);
-            existing
+    };
+    let from = match private_key_address(&private_key) {
+        Ok(value) => value,
+        Err(_) => {
+            trace.step("batch_settle.replace_config", 0);
+            return existing;
+        }
+    };
+    let Some(nonce) = active_nonce_by_key(key) else {
+        trace.step("batch_settle.replace_nonce", 0);
+        return existing;
+    };
+    let config = match rpc_config() {
+        Ok(value) => value,
+        Err(_) => {
+            trace.step("batch_settle.replace_rpc_config", 0);
+            return existing;
+        }
+    };
+    let to = match parse_address(contract, "BATCH_SETTLEMENT_CONTRACT") {
+        Ok(value) => value,
+        Err(_) => return existing,
+    };
+    let calldata = match batch_calldata(payload, contract) {
+        Ok(value) => value,
+        Err(_) => return existing,
+    };
+    let broadcast =
+        match broadcast_contract_transaction(&config, &private_key, to, calldata, nonce).await {
+            Ok(value) => value,
+            Err(SettlementSendError::Ambiguous {
+                nonce,
+                tx,
+                message: _,
+            }) => {
+                update_active_broadcast_by_key(key, nonce, &tx);
+                let record = SettlementRecord::broadcast(
+                    tx,
+                    details.payer,
+                    details.pay_to,
+                    details.amount,
+                    now_seconds(),
+                    ttl,
+                );
+                trace.step("batch_settle.replace_send", 5);
+                return insert_batch_settlement(key, record, None);
+            }
+            Err(SettlementSendError::GasTooExpensive | SettlementSendError::Other(_)) => {
+                trace.step("batch_settle.replace_send", 5);
+                return existing;
+            }
+        };
+    update_active_broadcast_by_key(key, broadcast.nonce, &broadcast.tx);
+    let record = SettlementRecord::broadcast(
+        broadcast.tx.clone(),
+        details.payer.clone(),
+        details.pay_to.clone(),
+        details.amount.clone(),
+        now_seconds(),
+        ttl,
+    );
+    insert_batch_settlement(key, record, None);
+    match confirm_contract_broadcast(&config, &broadcast, &to, Some(&from), expectation).await {
+        ContractSettlementOutcome::Settled { tx, settled_amount } => {
+            let record = batch_settled_record(BatchSettleRecordInput {
+                tx,
+                settled_amount,
+                payload,
+                requirements,
+                payer: Some(details.payer),
+                receiver: details.pay_to,
+                now: now_seconds(),
+                ttl,
+            })
+            .await;
+            let record = insert_batch_settlement(key, record, None);
+            release_active_settlement_by_key(key);
+            trace.step("batch_settle.replace_send", 5);
+            record
+        }
+        ContractSettlementOutcome::Pending { nonce, tx } => {
+            update_active_broadcast_by_key(key, nonce, &tx);
+            let record = SettlementRecord::broadcast(
+                tx,
+                details.payer,
+                details.pay_to,
+                details.amount,
+                now_seconds(),
+                ttl,
+            );
+            trace.step("batch_settle.replace_send", 5);
+            insert_batch_settlement(key, record, None)
+        }
+        ContractSettlementOutcome::Failed { tx, message } => {
+            let record = SettlementRecord::failed(
+                tx,
+                message,
+                details.payer,
+                details.pay_to,
+                now_seconds(),
+                ttl,
+            );
+            let record = insert_batch_settlement(key, record, None);
+            release_active_settlement_by_key(key);
+            trace.step("batch_settle.replace_send", 5);
+            record
         }
     }
 }
@@ -2220,7 +6566,6 @@ mod tests {
         set_env_value("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test");
         set_env_value("JPYC_EIP712_VERSION", "1");
         set_env_value("SELLER_CREDIT_PAY_TO", CREDIT_PAY_TO);
-        set_env_value("SELLER_CREDIT_TOPUP_AMOUNT", "1000");
         set_env_value("SELLER_SETTLEMENT_FEE_AMOUNT", "100");
         set_env_value("SELLER_CREDIT_MAX_TIMEOUT_SECONDS", "60");
     }
@@ -2228,7 +6573,7 @@ mod tests {
     fn seller_credit_request() -> HttpRequest {
         HttpRequest {
             method: "GET".to_string(),
-            url: format!("/seller-credit?seller={SELLER}"),
+            url: format!("/seller-credit?seller={SELLER}&amount=100"),
             headers: vec![],
             body: vec![],
             certificate_version: None,
@@ -2243,7 +6588,7 @@ mod tests {
                 scheme: "exact".to_string(),
                 network: NETWORK.to_string(),
                 asset: JPYC_POLYGON_ADDRESS.to_string(),
-                amount: "1000".to_string(),
+                amount: (100 * JPYC_ATOMIC_UNITS).to_string(),
                 pay_to: CREDIT_PAY_TO.to_lowercase(),
                 max_timeout_seconds: 60,
                 extra: serde_json::json!({
@@ -2257,7 +6602,7 @@ mod tests {
                 authorization: crate::types::Eip3009Authorization {
                     from: from.to_string(),
                     to: CREDIT_PAY_TO.to_lowercase(),
-                    value: "1000".to_string(),
+                    value: (100 * JPYC_ATOMIC_UNITS).to_string(),
                     valid_after: "0".to_string(),
                     valid_before: "9999999999".to_string(),
                     nonce: format!("0x{}", "22".repeat(32)),
@@ -2329,7 +6674,7 @@ mod tests {
     #[test]
     fn rpc_config_uses_default_settlement_fee_cap() {
         clear_env_values();
-        set_env_value("POLYGON_RPC_SERVICES", "https://polygon.example");
+        set_env_value("POLYGON_RPC_URL", "https://polygon.example");
         let config = rpc_config().unwrap();
         assert_eq!(
             config.max_settlement_fee_wei,
@@ -2342,7 +6687,7 @@ mod tests {
     fn rpc_config_rejects_invalid_settlement_fee_cap() {
         for value in ["0", "not-a-number"] {
             clear_env_values();
-            set_env_value("POLYGON_RPC_SERVICES", "https://polygon.example");
+            set_env_value("POLYGON_RPC_URL", "https://polygon.example");
             set_env_value("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", value);
             match rpc_config() {
                 Ok(_) => panic!("invalid settlement fee cap must fail"),
@@ -2392,10 +6737,103 @@ mod tests {
         assert_eq!(value["x402Version"], 2);
         assert_eq!(
             value["resource"]["url"],
-            format!("https://canister.example.test/seller-credit?seller={SELLER}")
+            format!("https://canister.example.test/seller-credit?seller={SELLER}&amount=100")
         );
-        assert_eq!(value["accepts"][0]["amount"], "1000");
+        assert_eq!(
+            value["accepts"][0]["amount"],
+            (100 * JPYC_ATOMIC_UNITS).to_string()
+        );
         assert_eq!(value["accepts"][0]["payTo"], CREDIT_PAY_TO.to_lowercase());
+    }
+
+    #[test]
+    fn parses_seller_credit_amount_as_18_decimal_jpyc() {
+        for (input, expected) in [
+            ("1", JPYC_ATOMIC_UNITS),
+            ("100", 100 * JPYC_ATOMIC_UNITS),
+            ("10000", SELLER_CREDIT_MAX_TOPUP_ATOMS),
+            ("1.000000000000000001", JPYC_ATOMIC_UNITS + 1),
+            ("0001.5", JPYC_ATOMIC_UNITS + JPYC_ATOMIC_UNITS / 2),
+        ] {
+            assert_eq!(parse_jpyc_decimal(input).unwrap(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_seller_credit_amounts() {
+        for input in [
+            "",
+            "0",
+            "0.999999999999999999",
+            "10000.000000000000000001",
+            "10001",
+            "1e2",
+            "1E2",
+            "+1",
+            "-1",
+            ".1",
+            "1.",
+            "1.0000000000000000000",
+        ] {
+            assert!(parse_jpyc_decimal(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_empty_and_duplicate_seller_credit_query_parameters() {
+        for url in [
+            format!("/seller-credit?seller={SELLER}"),
+            format!("/seller-credit?seller={SELLER}&amount="),
+            format!("/seller-credit?seller={SELLER}&amount=1&amount=2"),
+            format!("/seller-credit?seller={SELLER}&amount=1&amount"),
+            format!("/seller-credit?seller={SELLER}&amount&amount=1"),
+            format!("/seller-credit?seller={SELLER}&seller={SELLER}&amount=1"),
+            format!("/seller-credit?seller={SELLER}&seller&amount=1"),
+            format!("/seller-credit?seller&seller={SELLER}&amount=1"),
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                url,
+                headers: vec![],
+                body: vec![],
+                certificate_version: None,
+            };
+            assert_eq!(run_ready(seller_credit_http(request)).status_code, 400);
+        }
+    }
+
+    #[test]
+    fn seller_credit_query_route_validates_parameters_before_402_or_upgrade() {
+        set_test_env();
+        let valid = seller_credit_request();
+        assert_eq!(route(valid.clone(), false).status_code, 402);
+
+        let mut valid_with_debug = valid.clone();
+        valid_with_debug.url.push_str("&debugCost=1");
+        assert_eq!(route(valid_with_debug, false).status_code, 402);
+
+        for url in [
+            "/seller-credit?amount=1".to_string(),
+            "/seller-credit?seller=&amount=1".to_string(),
+            "/seller-credit?seller=invalid&amount=1".to_string(),
+            format!("/seller-credit?seller={SELLER}&seller&amount=1"),
+        ] {
+            let mut request = valid.clone();
+            request.url = url;
+            assert_eq!(route(request.clone(), false).status_code, 400);
+            request.headers.push(HeaderField(
+                "payment-signature".to_string(),
+                "invalid".to_string(),
+            ));
+            assert_eq!(route(request, false).status_code, 400);
+        }
+
+        let mut paid = valid;
+        paid.headers.push(HeaderField(
+            "payment-signature".to_string(),
+            "upgrade".to_string(),
+        ));
+        assert_eq!(route(paid, false).status_code, 202);
     }
 
     #[test]
@@ -2452,7 +6890,7 @@ mod tests {
         set_test_env();
         set_env_value("FACILITATOR_DEBUG_COST", "1");
         let mut request = seller_credit_request();
-        request.url = format!("/seller-credit?seller={SELLER}&debugCost=1");
+        request.url = format!("/seller-credit?seller={SELLER}&amount=100&debugCost=1");
         let payload = seller_credit_payload("0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993");
         request.headers.push(HeaderField(
             "payment-signature".to_string(),
@@ -2494,7 +6932,6 @@ mod tests {
         let seller = normalize_evm_address("seller", SELLER).unwrap();
         clear_seller_credits();
         clear_credited_settlements();
-        remove_env_value("SELLER_CREDIT_TOPUP_AMOUNT");
         let record = SettlementRecord::settled(
             "0xtx".to_string(),
             seller.clone(),
@@ -2545,6 +6982,7 @@ mod tests {
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+    use crate::batch::DEFAULT_BATCH_SETTLEMENT_CONTRACT;
     use candid::{CandidType, Deserialize as CandidDeserialize};
     use k256::ecdsa::signature::hazmat::PrehashSigner;
     use k256::ecdsa::{RecoveryId, Signature, SigningKey};
@@ -2558,6 +6996,37 @@ mod hardening_tests {
         "0x1111111111111111111111111111111111111111111111111111111111111111";
     const OTHER_PRIVATE_KEY: &str =
         "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const THIRD_PRIVATE_KEY: &str =
+        "0x3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn set_default_batch_contract() {
+        set_env_value(
+            "BATCH_SETTLEMENT_CONTRACT",
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+    }
+
+    fn set_default_batch_channel_runtime_config() {
+        set_default_batch_contract();
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value(
+            "BATCH_WITHDRAW_DELAY_SECONDS",
+            &DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS.to_string(),
+        );
+    }
+
+    fn set_full_batch_config() {
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_default_batch_channel_runtime_config();
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
+    }
 
     fn request_json() -> serde_json::Value {
         json!({
@@ -2598,6 +7067,134 @@ mod hardening_tests {
         })
     }
 
+    fn batch_requirements_json() -> serde_json::Value {
+        json!({
+            "scheme": BATCH_SCHEME,
+            "network": NETWORK,
+            "asset": JPYC_POLYGON_ADDRESS,
+            "amount": "0",
+            "payTo": PAY_TO,
+            "maxTimeoutSeconds": 60,
+            "extra": {
+                "receiverAuthorizer": private_key_address(OTHER_PRIVATE_KEY).unwrap(),
+                "withdrawDelay": DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS,
+                "assetTransferMethod": "eip3009",
+                "name": JPYC_EIP712_NAME,
+                "version": "1"
+            }
+        })
+    }
+
+    fn batch_settle_json() -> serde_json::Value {
+        json!({
+            "x402Version": 2,
+            "paymentPayload": {
+                "x402Version": 2,
+                "accepted": batch_requirements_json(),
+                "payload": {
+                    "type": "settle",
+                    "receiver": PAY_TO,
+                    "token": JPYC_POLYGON_ADDRESS
+                }
+            },
+            "paymentRequirements": batch_requirements_json()
+        })
+    }
+
+    fn batch_voucher_json(amount: &str, max_claimable: &str) -> serde_json::Value {
+        let mut requirements = batch_requirements_json();
+        requirements["amount"] = json!(amount);
+        let mut channel_config = test_batch_channel_config();
+        channel_config.payer = PAYER.to_string();
+        let channel_id =
+            compute_batch_channel_id(&channel_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            max_claimable,
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        json!({
+            "x402Version": 2,
+            "paymentPayload": {
+                "x402Version": 2,
+                "accepted": requirements.clone(),
+                "resource": { "url": "https://example.test/report" },
+                "payload": {
+                    "type": "voucher",
+                    "channelConfig": channel_config,
+                    "voucher": {
+                        "channelId": channel_id,
+                        "maxClaimableAmount": max_claimable,
+                        "signature": signature
+                    }
+                }
+            },
+            "paymentRequirements": requirements
+        })
+    }
+
+    fn batch_claim_json(max_claimable: &str, total_claimed: &str) -> serde_json::Value {
+        batch_claim_json_for_receiver_authorizer(max_claimable, total_claimed, None)
+    }
+
+    fn batch_claim_json_for_receiver_authorizer(
+        max_claimable: &str,
+        total_claimed: &str,
+        receiver_authorizer: Option<&str>,
+    ) -> serde_json::Value {
+        let requirements = batch_requirements_json();
+        let mut channel_config = test_batch_channel_config();
+        channel_config.payer = PAYER.to_string();
+        if let Some(receiver_authorizer) = receiver_authorizer {
+            channel_config.receiver_authorizer = receiver_authorizer.to_string();
+        }
+        let mut requirements = requirements;
+        requirements["extra"]["receiverAuthorizer"] =
+            json!(channel_config.receiver_authorizer.clone());
+        let channel_id =
+            compute_batch_channel_id(&channel_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            max_claimable,
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        json!({
+            "x402Version": 2,
+            "paymentPayload": {
+                "x402Version": 2,
+                "accepted": requirements.clone(),
+                "payload": {
+                    "type": "claim",
+                    "claims": [{
+                        "voucher": {
+                            "channel": channel_config,
+                            "maxClaimableAmount": max_claimable
+                        },
+                        "signature": signature,
+                        "totalClaimed": total_claimed
+                    }]
+                }
+            },
+            "paymentRequirements": requirements
+        })
+    }
+
+    fn batch_refund_json(amount: &str, refund_nonce: &str) -> serde_json::Value {
+        let mut body = batch_voucher_json("0", "0");
+        body["paymentPayload"]["payload"]["type"] = json!("refund");
+        body["paymentPayload"]["payload"]["amount"] = json!(amount);
+        body["paymentPayload"]["payload"]["refundNonce"] = json!(refund_nonce);
+        body
+    }
+
+    fn with_minimal_batch_operation_requirements(mut body: serde_json::Value) -> serde_json::Value {
+        body["paymentRequirements"]["extra"] = json!({});
+        body["paymentPayload"]["accepted"]["extra"] = json!({});
+        body
+    }
+
     fn request() -> FacilitatorRequest {
         serde_json::from_value(request_json()).unwrap()
     }
@@ -2617,6 +7214,37 @@ mod hardening_tests {
         bytes.extend_from_slice(&signature.to_bytes());
         bytes.push(u8::from(recovery) + 27);
         format!("0x{}", hex::encode(bytes))
+    }
+
+    fn acceptance_challenge_request(seller: &str) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            url: format!("/seller-acceptance/challenge?seller={seller}"),
+            headers: vec![],
+            body: b"{}".to_vec(),
+            certificate_version: None,
+        }
+    }
+
+    fn acceptance_submission_request(
+        challenge: &SellerAcceptanceChallenge,
+        private_key: &str,
+    ) -> HttpRequest {
+        let submission = serde_json::json!({
+            "seller": challenge.seller,
+            "nonce": challenge.nonce,
+            "expiresAt": challenge.expires_at,
+            "message": challenge.message,
+            "facilitatorSignature": challenge.facilitator_signature,
+            "signature": sign_message(private_key, &challenge.message),
+        });
+        HttpRequest {
+            method: "POST".to_string(),
+            url: "/seller-acceptance".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&submission).unwrap(),
+            certificate_version: None,
+        }
     }
 
     fn sign_eip3009(body: &mut FacilitatorRequest) {
@@ -2677,6 +7305,16 @@ mod hardening_tests {
         }
     }
 
+    fn batch_settle_request(value: &serde_json::Value) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            url: "/settle?debugCost=1".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(value).unwrap(),
+            certificate_version: None,
+        }
+    }
+
     fn http_request(body: Vec<u8>) -> HttpRequest {
         HttpRequest {
             method: "POST".to_string(),
@@ -2695,6 +7333,78 @@ mod hardening_tests {
     fn clear_settlement_state() {
         clear_active_state();
         clear_settlements();
+    }
+
+    fn test_batch_channel(channel_id: &str, charged: &str) -> BatchChannel {
+        test_batch_channel_for_config(channel_id, test_batch_channel_config(), charged)
+    }
+
+    fn test_batch_channel_for_config(
+        channel_id: &str,
+        channel_config: crate::batch::BatchChannelConfig,
+        charged: &str,
+    ) -> BatchChannel {
+        BatchChannel {
+            channel_id: channel_id.to_string(),
+            channel_config,
+            charged_cumulative_amount: charged.to_string(),
+            signed_max_claimable: charged.to_string(),
+            signature: crate::batch::sign_batch_voucher_for_test(
+                channel_id,
+                charged,
+                PAYER_PRIVATE_KEY,
+                DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+            ),
+            balance: "0".to_string(),
+            total_claimed: "0".to_string(),
+            withdraw_requested_at: 0,
+            refund_nonce: "0".to_string(),
+            onchain_synced_at: None,
+            last_request_timestamp: 1,
+            pending_request: None,
+            revision: 0,
+        }
+    }
+
+    fn test_initial_batch_channel(channel_id: &str, signed_max_claimable: &str) -> BatchChannel {
+        test_initial_batch_channel_for_config(
+            channel_id,
+            test_batch_channel_config(),
+            signed_max_claimable,
+        )
+    }
+
+    fn test_initial_batch_channel_for_config(
+        channel_id: &str,
+        channel_config: crate::batch::BatchChannelConfig,
+        signed_max_claimable: &str,
+    ) -> BatchChannel {
+        let mut channel = test_batch_channel_for_config(channel_id, channel_config, "0");
+        channel.signed_max_claimable = signed_max_claimable.to_string();
+        channel.signature = crate::batch::sign_batch_voucher_for_test(
+            channel_id,
+            signed_max_claimable,
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        channel.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: format!("request-{signed_max_claimable}"),
+            signed_max_claimable: signed_max_claimable.to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        channel
+    }
+
+    fn test_batch_channel_config() -> crate::batch::BatchChannelConfig {
+        crate::batch::BatchChannelConfig {
+            payer: PAYER.to_string(),
+            payer_authorizer: PAYER.to_string(),
+            receiver: PAY_TO.to_string(),
+            receiver_authorizer: private_key_address(OTHER_PRIVATE_KEY).unwrap(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            withdraw_delay: DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS,
+            salt: format!("0x{}", "33".repeat(32)),
+        }
     }
 
     fn run_ready<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -2716,6 +7426,787 @@ mod hardening_tests {
     }
 
     #[test]
+    fn batch_deposit_claim_and_refund_success_response_do_not_require_post_state_snapshot() {
+        let channel_id = format!("0x{}", "11".repeat(32));
+        let mut payload = crate::batch::BatchRequestPayload {
+            kind: "deposit".to_string(),
+            channel_config: Some(test_batch_channel_config()),
+            voucher: Some(crate::batch::BatchVoucher {
+                channel_id,
+                max_claimable_amount: "3900".to_string(),
+                signature: format!("0x{}", "11".repeat(65)),
+            }),
+            deposit: Some(crate::batch::BatchDeposit {
+                amount: "100".to_string(),
+                authorization: crate::batch::BatchDepositAuthorization {
+                    erc3009_authorization: None,
+                },
+            }),
+            amount: Some("100".to_string()),
+            refund_nonce: Some("0".to_string()),
+            claims: None,
+            refund_authorizer_signature: None,
+            claim_authorizer_signature: None,
+            receiver: None,
+            token: None,
+        };
+        let requirements: PaymentRequirements =
+            serde_json::from_value(batch_requirements_json()).unwrap();
+
+        let deposit = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            Some(PAYER.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(deposit.amount, Some("100".to_string()));
+        assert_eq!(deposit.extra_json, None);
+
+        payload.kind = "claim".to_string();
+        let claim = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            Some(PAYER.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(claim.payer, None);
+        assert_eq!(claim.amount, Some("0".to_string()));
+        assert_eq!(claim.extra_json, None);
+
+        payload.kind = "refund".to_string();
+        let refund = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            Some(PAYER.to_string()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(refund.payer, Some(test_batch_channel_config().payer));
+        assert_eq!(refund.amount, Some("100".to_string()));
+        assert_eq!(refund.extra_json, None);
+    }
+
+    #[test]
+    fn batch_settled_record_uses_success_status_without_post_state_evidence() {
+        let payload = crate::batch::BatchRequestPayload {
+            kind: "deposit".to_string(),
+            channel_config: Some(test_batch_channel_config()),
+            voucher: Some(crate::batch::BatchVoucher {
+                channel_id: format!("0x{}", "11".repeat(32)),
+                max_claimable_amount: "3900".to_string(),
+                signature: format!("0x{}", "11".repeat(65)),
+            }),
+            deposit: None,
+            amount: Some("100".to_string()),
+            refund_nonce: Some("0".to_string()),
+            claims: None,
+            refund_authorizer_signature: None,
+            claim_authorizer_signature: None,
+            receiver: None,
+            token: None,
+        };
+        let requirements: PaymentRequirements =
+            serde_json::from_value(batch_requirements_json()).unwrap();
+
+        let record = run_ready(batch_settled_record(BatchSettleRecordInput {
+            tx: "0xtx".to_string(),
+            settled_amount: None,
+            payload: &payload,
+            requirements: &requirements,
+            payer: Some(PAYER.to_string()),
+            receiver: PAY_TO.to_string(),
+            now: 1,
+            ttl: 60,
+        }));
+
+        assert_eq!(record.status_code(), 200);
+        assert!(record.response.success);
+        assert_eq!(record.response.extra_json, None);
+    }
+
+    #[test]
+    fn batch_settle_noop_success_response_returns_zero_without_tx() {
+        let payload = crate::batch::BatchRequestPayload {
+            kind: "settle".to_string(),
+            channel_config: None,
+            voucher: None,
+            deposit: None,
+            amount: None,
+            refund_nonce: None,
+            claims: None,
+            refund_authorizer_signature: None,
+            claim_authorizer_signature: None,
+            receiver: Some(PAY_TO.to_string()),
+            token: Some(JPYC_POLYGON_ADDRESS.to_string()),
+        };
+        let mut requirements_json = batch_requirements_json();
+        requirements_json["amount"] = serde_json::json!("0");
+        requirements_json["maxTimeoutSeconds"] = serde_json::json!(0);
+        requirements_json["extra"] = serde_json::json!({});
+        let requirements: PaymentRequirements = serde_json::from_value(requirements_json).unwrap();
+
+        let response = run_ready(batch_success_response(
+            String::new(),
+            &payload,
+            &requirements,
+            None,
+            None,
+        ))
+        .unwrap();
+
+        assert!(response.success);
+        assert_eq!(response.transaction, "");
+        assert_eq!(response.payer, None);
+        assert_eq!(response.amount, Some("0".to_string()));
+
+        assert_eq!(
+            run_ready(batch_success_response(
+                "0xtx".to_string(),
+                &payload,
+                &requirements,
+                None,
+                None,
+            ))
+            .unwrap_err(),
+            "batch settle event amount unavailable"
+        );
+
+        let response = run_ready(batch_success_response(
+            "0xtx".to_string(),
+            &payload,
+            &requirements,
+            None,
+            Some("42".to_string()),
+        ))
+        .unwrap();
+        assert_eq!(response.amount, Some("42".to_string()));
+    }
+
+    #[test]
+    fn batch_verify_snapshot_enforces_balance_and_claimed_bounds() {
+        fn voucher_payload(
+            kind: &str,
+            channel_id: &str,
+            max_claimable: &str,
+        ) -> crate::batch::BatchRequestPayload {
+            crate::batch::BatchRequestPayload {
+                kind: kind.to_string(),
+                channel_config: None,
+                voucher: Some(crate::batch::BatchVoucher {
+                    channel_id: channel_id.to_string(),
+                    max_claimable_amount: max_claimable.to_string(),
+                    signature: format!("0x{}", "11".repeat(65)),
+                }),
+                deposit: None,
+                amount: None,
+                refund_nonce: None,
+                claims: None,
+                refund_authorizer_signature: None,
+                claim_authorizer_signature: None,
+                receiver: None,
+                token: None,
+            }
+        }
+
+        let snapshot = BatchChannelSnapshot {
+            channel_id: format!("0x{}", "11".repeat(32)),
+            balance: "100".to_string(),
+            total_claimed: "40".to_string(),
+            withdraw_requested_at: 0,
+            refund_nonce: "0".to_string(),
+        };
+
+        assert!(validate_batch_verify_snapshot(
+            &voucher_payload("voucher", &snapshot.channel_id, "41"),
+            &snapshot
+        )
+        .is_ok());
+        assert_eq!(
+            validate_batch_verify_snapshot(
+                &voucher_payload("voucher", &snapshot.channel_id, "101"),
+                &snapshot
+            )
+            .unwrap_err(),
+            "invalid_batch_settlement_evm_cumulative_exceeds_balance"
+        );
+        assert_eq!(
+            validate_batch_verify_snapshot(
+                &voucher_payload("voucher", &snapshot.channel_id, "40"),
+                &snapshot
+            )
+            .unwrap_err(),
+            "invalid_batch_settlement_evm_cumulative_below_claimed"
+        );
+        assert!(validate_batch_verify_snapshot(
+            &voucher_payload("refund", &snapshot.channel_id, "40"),
+            &snapshot
+        )
+        .is_ok());
+        assert_eq!(
+            validate_batch_verify_snapshot(
+                &voucher_payload("refund", &snapshot.channel_id, "39"),
+                &snapshot
+            )
+            .unwrap_err(),
+            "invalid_batch_settlement_evm_cumulative_below_claimed"
+        );
+
+        let mut deposit = voucher_payload("deposit", &snapshot.channel_id, "140");
+        deposit.deposit = Some(crate::batch::BatchDeposit {
+            amount: "40".to_string(),
+            authorization: crate::batch::BatchDepositAuthorization {
+                erc3009_authorization: None,
+            },
+        });
+        assert!(validate_batch_verify_snapshot(&deposit, &snapshot).is_ok());
+
+        deposit.voucher.as_mut().unwrap().max_claimable_amount = "141".to_string();
+        assert_eq!(
+            validate_batch_verify_snapshot(&deposit, &snapshot).unwrap_err(),
+            "invalid_batch_settlement_evm_cumulative_exceeds_balance"
+        );
+        deposit.voucher.as_mut().unwrap().max_claimable_amount = "40".to_string();
+        assert_eq!(
+            validate_batch_verify_snapshot(&deposit, &snapshot).unwrap_err(),
+            "invalid_batch_settlement_evm_cumulative_below_claimed"
+        );
+
+        let empty_snapshot = BatchChannelSnapshot {
+            balance: "0".to_string(),
+            total_claimed: "0".to_string(),
+            ..snapshot
+        };
+        let mut first_deposit = voucher_payload("deposit", &empty_snapshot.channel_id, "40");
+        first_deposit.deposit = Some(crate::batch::BatchDeposit {
+            amount: "40".to_string(),
+            authorization: crate::batch::BatchDepositAuthorization {
+                erc3009_authorization: None,
+            },
+        });
+        assert!(validate_batch_verify_snapshot(&first_deposit, &empty_snapshot).is_ok());
+
+        assert_eq!(
+            validate_batch_verify_snapshot(
+                &voucher_payload("voucher", &empty_snapshot.channel_id, "1"),
+                &empty_snapshot
+            )
+            .unwrap_err(),
+            "invalid_batch_settlement_evm_channel_not_found"
+        );
+    }
+
+    #[test]
+    fn batch_verify_pending_gate_applies_to_deposit_voucher_and_refund() {
+        fn voucher_payload(
+            kind: &str,
+            channel_id: &str,
+            max_claimable: &str,
+        ) -> crate::batch::BatchRequestPayload {
+            crate::batch::BatchRequestPayload {
+                kind: kind.to_string(),
+                channel_config: None,
+                voucher: Some(crate::batch::BatchVoucher {
+                    channel_id: channel_id.to_string(),
+                    max_claimable_amount: max_claimable.to_string(),
+                    signature: format!("0x{}", "11".repeat(65)),
+                }),
+                deposit: None,
+                amount: None,
+                refund_nonce: None,
+                claims: None,
+                refund_authorizer_signature: None,
+                claim_authorizer_signature: None,
+                receiver: None,
+                token: None,
+            }
+        }
+
+        let channel_id = format!("0x{}", "22".repeat(32));
+        let mut channel = test_batch_channel(&channel_id, "25");
+        for kind in ["deposit", "voucher", "refund"] {
+            assert_eq!(
+                validate_batch_verify_pending(&voucher_payload(kind, &channel_id, "25"), &channel)
+                    .unwrap_err(),
+                "invalid_batch_settlement_evm_channel_not_reserved"
+            );
+        }
+
+        channel.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-1".to_string(),
+            signed_max_claimable: "25".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        for kind in ["deposit", "voucher", "refund"] {
+            assert!(validate_batch_verify_pending(
+                &voucher_payload(kind, &channel_id, "25"),
+                &channel
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn batch_verify_success_extra_wraps_channel_state_and_sdk_flat_fields() {
+        let snapshot = BatchChannelSnapshot {
+            channel_id: format!("0x{}", "11".repeat(32)),
+            balance: "1000".to_string(),
+            total_claimed: "300".to_string(),
+            withdraw_requested_at: 42,
+            refund_nonce: "2".to_string(),
+        };
+
+        let extra = batch_verify_success_extra(&snapshot);
+
+        assert_eq!(extra["channelState"]["channelId"], snapshot.channel_id);
+        assert_eq!(extra["channelState"]["balance"], "1000");
+        assert_eq!(extra["channelState"]["totalClaimed"], "300");
+        assert_eq!(extra["channelState"]["withdrawRequestedAt"], 42);
+        assert_eq!(extra["channelState"]["refundNonce"], "2");
+        assert_eq!(extra["channelId"], snapshot.channel_id);
+        assert_eq!(extra["balance"], "1000");
+        assert_eq!(extra["totalClaimed"], "300");
+        assert_eq!(extra["withdrawRequestedAt"], 42);
+        assert_eq!(extra["refundNonce"], "2");
+    }
+
+    #[test]
+    fn batch_verify_rejects_storage_miss_cumulative_mismatch_without_rpc() {
+        clear_batch_channels();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+
+        let response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&batch_voucher_json("25", "50")).unwrap(),
+            certificate_version: None,
+        }));
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 402);
+        assert_eq!(value["invalidReason"], "invalid_batch_settlement");
+        assert_eq!(
+            value["invalidMessage"],
+            "invalid_batch_settlement_evm_cumulative_amount_mismatch"
+        );
+    }
+
+    #[test]
+    fn batch_corrective_verify_extra_uses_canister_channel_storage() {
+        let mut channel_config = test_batch_channel_config();
+        channel_config.payer = PAYER.to_string();
+        let channel_id =
+            compute_batch_channel_id(&channel_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let mut channel = test_batch_channel_for_config(&channel_id, channel_config, "3200");
+        channel.balance = "100000".to_string();
+        channel.total_claimed = "500".to_string();
+        channel.refund_nonce = "1".to_string();
+        channel.withdraw_requested_at = 0;
+
+        let extra = batch_corrective_verify_extra(
+            Some(&channel),
+            "invalid_batch_settlement_evm_cumulative_amount_mismatch",
+        )
+        .unwrap();
+
+        assert_eq!(extra["channelState"]["channelId"], channel_id);
+        assert_eq!(extra["channelState"]["balance"], "100000");
+        assert_eq!(extra["channelState"]["totalClaimed"], "500");
+        assert_eq!(extra["channelState"]["refundNonce"], "1");
+        assert_eq!(extra["channelState"]["chargedCumulativeAmount"], "3200");
+        assert_eq!(extra["voucherState"]["signedMaxClaimable"], "3200");
+        assert_eq!(extra["voucherState"]["signature"], channel.signature);
+        assert!(
+            batch_corrective_verify_extra(Some(&channel), "batch voucher signer mismatch")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn batch_verify_corrective_402_uses_canister_channel_storage() {
+        clear_batch_channels();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let mut channel_config = test_batch_channel_config();
+        channel_config.payer = PAYER.to_string();
+        let channel_id =
+            compute_batch_channel_id(&channel_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let mut channel = test_batch_channel_for_config(&channel_id, channel_config, "3200");
+        channel.balance = "100000".to_string();
+        channel.total_claimed = "500".to_string();
+        channel.refund_nonce = "1".to_string();
+        put_batch_channel(&channel_id, channel.clone()).unwrap();
+        let before = get_batch_channel(&channel_id);
+        assert_eq!(batch_channel_count(), 1);
+
+        let response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&batch_voucher_json("25", "25")).unwrap(),
+            certificate_version: None,
+        }));
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 402);
+        assert_eq!(value["invalidReason"], "invalid_batch_settlement");
+        assert_eq!(
+            value["invalidMessage"],
+            "invalid_batch_settlement_evm_cumulative_amount_mismatch"
+        );
+        assert_eq!(value["payer"], PAYER.to_lowercase());
+        assert_eq!(value["extra"]["channelState"]["channelId"], channel_id);
+        assert_eq!(value["extra"]["channelState"]["balance"], "100000");
+        assert_eq!(value["extra"]["channelState"]["totalClaimed"], "500");
+        assert_eq!(value["extra"]["channelState"]["refundNonce"], "1");
+        assert_eq!(
+            value["extra"]["channelState"]["chargedCumulativeAmount"],
+            "3200"
+        );
+        assert_eq!(value["extra"]["voucherState"]["signedMaxClaimable"], "3200");
+        assert_eq!(
+            value["extra"]["voucherState"]["signature"],
+            channel.signature
+        );
+        assert_eq!(batch_channel_count(), 1);
+        assert_eq!(get_batch_channel(&channel_id), before);
+    }
+
+    #[test]
+    fn batch_verify_success_uses_canister_storage_without_rpc() {
+        clear_batch_channels();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let body = batch_voucher_json("25", "25");
+
+        let missing_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            certificate_version: None,
+        }));
+        let missing_value: Value = serde_json::from_slice(&missing_response.body).unwrap();
+        assert_eq!(missing_response.status_code, 402);
+        assert_eq!(
+            missing_value["invalidMessage"],
+            "invalid_batch_settlement_evm_channel_not_found"
+        );
+
+        let mut channel = test_batch_channel(&channel_id, "0");
+        channel.balance = "100".to_string();
+        put_batch_channel(&channel_id, channel.clone()).unwrap();
+
+        let unreserved_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            certificate_version: None,
+        }));
+        let unreserved_value: Value = serde_json::from_slice(&unreserved_response.body).unwrap();
+        assert_eq!(unreserved_response.status_code, 402);
+        assert_eq!(
+            unreserved_value["invalidMessage"],
+            "invalid_batch_settlement_evm_channel_not_reserved"
+        );
+
+        let mut expired = channel.clone();
+        expired.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-1".to_string(),
+            signed_max_claimable: "25".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
+        });
+        put_batch_channel(&channel_id, expired).unwrap();
+        let expired_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            certificate_version: None,
+        }));
+        let expired_value: Value = serde_json::from_slice(&expired_response.body).unwrap();
+        assert_eq!(expired_response.status_code, 402);
+        assert_eq!(
+            expired_value["invalidMessage"],
+            "invalid_batch_settlement_evm_channel_not_reserved"
+        );
+
+        channel.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-1".to_string(),
+            signed_max_claimable: "26".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, channel.clone()).unwrap();
+        let mismatch_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            certificate_version: None,
+        }));
+        let mismatch_value: Value = serde_json::from_slice(&mismatch_response.body).unwrap();
+        assert_eq!(mismatch_response.status_code, 402);
+        assert_eq!(
+            mismatch_value["invalidMessage"],
+            "invalid_batch_settlement_evm_pending_voucher_mismatch"
+        );
+
+        channel.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-1".to_string(),
+            signed_max_claimable: "25".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, channel).unwrap();
+
+        let response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            certificate_version: None,
+        }));
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(value["isValid"], true);
+        assert_eq!(value["payer"], PAYER.to_lowercase());
+        assert_eq!(value["extra"]["channelState"]["channelId"], channel_id);
+        assert_eq!(value["extra"]["channelState"]["balance"], "100");
+        assert_eq!(value["extra"]["channelState"]["totalClaimed"], "0");
+    }
+
+    #[test]
+    fn batch_settle_rejects_storage_miss_cumulative_mismatch_before_rpc() {
+        clear_settlement_state();
+        clear_batch_channels();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let mut body = batch_voucher_json("0", "100");
+        body["paymentPayload"]["payload"]["type"] = json!("refund");
+        body["paymentPayload"]["payload"]["amount"] = json!("1");
+        body["paymentPayload"]["payload"]["refundNonce"] = json!("0");
+
+        let response = run_ready(settle_http(batch_settle_request(&body)));
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 402);
+        assert_eq!(value["result"]["errorReason"], "invalid_batch_settlement");
+        assert_eq!(
+            value["result"]["errorMessage"],
+            "invalid_batch_settlement_evm_cumulative_amount_mismatch"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn supported_omits_batch_for_invalid_partial_batch_config() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        set_env_value("BATCH_WITHDRAW_DELAY_SECONDS", "2592001");
+
+        let response = supported_response();
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        let kinds = value["kinds"].as_array().unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(kinds
+            .iter()
+            .any(|kind| kind["scheme"] == "exact" && kind["network"] == NETWORK));
+        assert!(!kinds
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+    }
+
+    #[test]
+    fn supported_requires_full_batch_settlement_config_before_advertising_batch() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
+        set_env_value("BATCH_WITHDRAW_DELAY_SECONDS", "900");
+
+        let missing_contract = supported_response();
+        let missing_contract_value: Value = serde_json::from_slice(&missing_contract.body).unwrap();
+        assert_eq!(missing_contract.status_code, 200);
+        assert!(!missing_contract_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+
+        set_default_batch_contract();
+        let missing_fee = supported_response();
+        let missing_fee_value: Value = serde_json::from_slice(&missing_fee.body).unwrap();
+        assert_eq!(missing_fee.status_code, 200);
+        assert!(!missing_fee_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "0");
+        let invalid_fee = supported_response();
+        let invalid_fee_value: Value = serde_json::from_slice(&invalid_fee.body).unwrap();
+        assert_eq!(invalid_fee.status_code, 200);
+        assert!(!invalid_fee_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        set_env_value("BATCH_SETTLEMENT_CONTRACT", "not an address");
+        let invalid_contract = supported_response();
+        let invalid_contract_value: Value = serde_json::from_slice(&invalid_contract.body).unwrap();
+        assert_eq!(invalid_contract.status_code, 200);
+        assert!(!invalid_contract_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+
+        set_env_value(
+            "BATCH_SETTLEMENT_CONTRACT",
+            "0x0000000000000000000000000000000000000001",
+        );
+        let wrong_contract = supported_response();
+        let wrong_contract_value: Value = serde_json::from_slice(&wrong_contract.body).unwrap();
+        assert_eq!(wrong_contract.status_code, 200);
+        assert!(!wrong_contract_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+
+        set_default_batch_contract();
+        let missing_writer = supported_response();
+        let missing_writer_value: Value = serde_json::from_slice(&missing_writer.body).unwrap();
+        assert_eq!(missing_writer.status_code, 200);
+        assert!(!missing_writer_value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+    }
+
+    #[test]
+    fn supported_omits_batch_when_receiver_authorizer_key_is_unset() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_default_batch_contract();
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
+
+        let response = supported_response();
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        let kinds = value["kinds"].as_array().unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(kinds
+            .iter()
+            .any(|kind| kind["scheme"] == "exact" && kind["network"] == NETWORK));
+        assert!(!kinds
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+    }
+
+    #[test]
+    fn empty_env_value_removes_stale_batch_config() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_full_batch_config();
+
+        let enabled = supported_response();
+        let enabled_value: Value = serde_json::from_slice(&enabled.body).unwrap();
+        let enabled_kinds = enabled_value["kinds"].as_array().unwrap();
+        assert_eq!(enabled.status_code, 200);
+        assert!(enabled_kinds
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "");
+        assert!(optional_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY").is_none());
+
+        let disabled = supported_response();
+        let disabled_value: Value = serde_json::from_slice(&disabled.body).unwrap();
+        let disabled_kinds = disabled_value["kinds"].as_array().unwrap();
+        assert_eq!(disabled.status_code, 200);
+        assert!(!disabled_kinds
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+    }
+
+    #[test]
+    fn supported_omits_batch_for_invalid_batch_receiver_authorizer_key() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "not a private key");
+
+        let response = supported_response();
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(!value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+    }
+
+    #[test]
+    fn supported_omits_batch_when_receiver_authorizer_key_matches_facilitator_key() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+
+        let response = supported_response();
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 200);
+        assert!(!value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|kind| kind["scheme"] == BATCH_SCHEME && kind["network"] == NETWORK));
+    }
+
+    #[test]
     fn stable_state_decodes_legacy_without_active_state() {
         let legacy = LegacyStableState {
             env: std::collections::BTreeMap::new(),
@@ -2728,6 +8219,75 @@ mod hardening_tests {
 
         assert!(decoded.active_settlements.is_none());
         assert!(decoded.nonces.is_none());
+        assert!(decoded.batch_channels.is_none());
+    }
+
+    #[test]
+    fn stable_value_wrapper_decodes_versioned_and_legacy_blobs() {
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_batch_channel(&channel_id, "100");
+
+        let versioned = encode_stable(&channel);
+        let decoded: BatchChannel = decode_stable_result(versioned).unwrap();
+        assert_eq!(decoded.channel_id, channel_id);
+
+        let legacy = candid::encode_one(&channel).unwrap();
+        let legacy_decoded: BatchChannel = decode_stable_result(legacy).unwrap();
+        assert_eq!(legacy_decoded.channel_id, channel_id);
+
+        let broken = decode_stable_result::<BatchChannel>(b"not candid".to_vec()).unwrap_err();
+        assert!(broken.contains("stable value decode failed"));
+    }
+
+    #[test]
+    fn stable_memory_adapter_shares_sqlite_memory_manager_without_corruption() {
+        let manager = SqliteMemoryManager::init(SqliteDefaultMemoryImpl::default());
+        let stable_memory = StableMemoryAdapter(manager.get(MemoryId::new(0)));
+        let sqlite_memory = manager.get(MemoryId::new(120));
+        let mut map: StableBTreeMap<String, String, StableMemoryAdapter> =
+            StableBTreeMap::init(stable_memory);
+
+        map.insert("alpha".to_string(), "one".to_string());
+        assert_eq!(map.get(&"alpha".to_string()), Some("one".to_string()));
+
+        assert!(SqliteRawMemory::grow(&sqlite_memory, 1) >= 0);
+        SqliteRawMemory::write(&sqlite_memory, 0, b"sqlite");
+        let mut sqlite_bytes = [0_u8; 6];
+        SqliteRawMemory::read(&sqlite_memory, 0, &mut sqlite_bytes);
+        assert_eq!(&sqlite_bytes, b"sqlite");
+
+        map.insert("beta".to_string(), "two".to_string());
+        assert_eq!(map.get(&"alpha".to_string()), Some("one".to_string()));
+        assert_eq!(map.get(&"beta".to_string()), Some("two".to_string()));
+    }
+
+    #[test]
+    fn legacy_restore_is_attempted_only_when_stable_structures_are_empty() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        clear_batch_channels();
+        assert!(stable_structures_empty());
+
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        assert!(!stable_structures_empty());
+
+        clear_env_values();
+        assert!(stable_structures_empty());
+
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        put_batch_channel(&channel_id, test_batch_channel(&channel_id, "100")).unwrap();
+        assert!(!stable_structures_empty());
     }
 
     #[test]
@@ -2737,6 +8297,1234 @@ mod hardening_tests {
             parse_request(&request).unwrap_err(),
             "request body exceeds 64KiB"
         );
+    }
+
+    #[test]
+    fn verify_rejects_exact_scheme() {
+        let response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&request_json()).unwrap(),
+            certificate_version: None,
+        }));
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(value["invalidReason"], "unsupported_verify_scheme");
+    }
+
+    #[test]
+    fn batch_verify_requires_full_batch_settlement_config() {
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        let request = || HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&batch_voucher_json("25", "25")).unwrap(),
+            certificate_version: None,
+        };
+
+        let missing_key = run_ready(verify_http(request()));
+        let missing_key_value: Value = serde_json::from_slice(&missing_key.body).unwrap();
+        assert_eq!(missing_key.status_code, 500);
+        assert_eq!(missing_key_value["invalidReason"], "invalid_config");
+        assert!(missing_key_value["invalidMessage"]
+            .as_str()
+            .unwrap()
+            .contains("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"));
+
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
+        let missing_contract = run_ready(verify_http(request()));
+        let missing_contract_value: Value = serde_json::from_slice(&missing_contract.body).unwrap();
+        assert_eq!(missing_contract.status_code, 500);
+        assert_eq!(
+            missing_contract_value["invalidMessage"],
+            "missing required env: BATCH_SETTLEMENT_CONTRACT"
+        );
+
+        set_default_batch_contract();
+        let missing_fee = run_ready(verify_http(request()));
+        let missing_fee_value: Value = serde_json::from_slice(&missing_fee.body).unwrap();
+        assert_eq!(missing_fee.status_code, 500);
+        assert_eq!(
+            missing_fee_value["invalidMessage"],
+            "missing required env: BATCH_SETTLEMENT_FEE_AMOUNT"
+        );
+
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        let missing_scope = run_ready(verify_http(request()));
+        let missing_scope_value: Value = serde_json::from_slice(&missing_scope.body).unwrap();
+        assert_eq!(missing_scope.status_code, 500);
+        assert_eq!(
+            missing_scope_value["invalidMessage"],
+            "missing enabled batch writer receiver scope"
+        );
+    }
+
+    #[test]
+    fn batch_settle_requires_full_batch_settlement_config_before_credit_or_rpc() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+        set_default_batch_contract();
+
+        let missing_key = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+        let missing_key_value: Value = serde_json::from_slice(&missing_key.body).unwrap();
+        assert_eq!(missing_key.status_code, 400);
+        assert_eq!(missing_key_value["result"]["errorReason"], "invalid_config");
+        assert!(missing_key_value["result"]["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"));
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        assert_eq!(missing_key_value["cost"]["rpcCalls"], 0);
+        assert!(missing_key_value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
+        set_default_batch_contract();
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        let missing_scope = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+        let missing_scope_value: Value = serde_json::from_slice(&missing_scope.body).unwrap();
+        assert_eq!(missing_scope.status_code, 400);
+        assert_eq!(
+            missing_scope_value["result"]["errorReason"],
+            "invalid_config"
+        );
+        assert_eq!(
+            missing_scope_value["result"]["errorMessage"],
+            "missing enabled batch writer receiver scope"
+        );
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        assert_eq!(missing_scope_value["cost"]["rpcCalls"], 0);
+        assert!(missing_scope_value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_verify_and_settle_reject_eip712_version_before_rpc_or_credit() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let mut body = batch_refund_json("1", "0");
+        body["paymentRequirements"]["extra"]["version"] = json!("2");
+        body["paymentPayload"]["accepted"]["extra"]["version"] = json!("2");
+
+        let verify_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            certificate_version: None,
+        }));
+        let verify_value: Value = serde_json::from_slice(&verify_response.body).unwrap();
+        assert_eq!(verify_response.status_code, 402);
+        assert_eq!(verify_value["invalidReason"], "invalid_batch_settlement");
+        assert_eq!(
+            verify_value["invalidMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+
+        let settle_response = run_ready(settle_http(batch_settle_request(&body)));
+        let settle_value: Value = serde_json::from_slice(&settle_response.body).unwrap();
+        assert_eq!(settle_response.status_code, 402);
+        assert_eq!(
+            settle_value["result"]["errorReason"],
+            "invalid_batch_settlement"
+        );
+        assert_eq!(
+            settle_value["result"]["errorMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+        assert_eq!(settle_value["cost"]["rpcCalls"], 0);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+    }
+
+    #[test]
+    fn batch_verify_allows_minimal_operation_requirements_before_kind_validation() {
+        clear_batch_channels();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+
+        let claim = with_minimal_batch_operation_requirements(batch_claim_json("100", "75"));
+        let claim_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&claim).unwrap(),
+            certificate_version: None,
+        }));
+        let claim_value: Value = serde_json::from_slice(&claim_response.body).unwrap();
+        assert_ne!(
+            claim_value["invalidMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+
+        let settle = with_minimal_batch_operation_requirements(batch_settle_json());
+        let settle_response = run_ready(verify_http(HttpRequest {
+            method: "POST".to_string(),
+            url: "/verify".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&settle).unwrap(),
+            certificate_version: None,
+        }));
+        let settle_value: Value = serde_json::from_slice(&settle_response.body).unwrap();
+        assert_ne!(
+            settle_value["invalidMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+    }
+
+    #[test]
+    fn batch_settle_accepts_official_manager_minimal_claim_and_settle_requirements() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let receiver_authorizer = private_key_address(OTHER_PRIVATE_KEY).unwrap();
+
+        let claim = with_minimal_batch_operation_requirements(
+            batch_claim_json_for_receiver_authorizer("100", "75", Some(&receiver_authorizer)),
+        );
+        let claim_response = run_ready(settle_http(batch_settle_request(&claim)));
+        let claim_value: Value = serde_json::from_slice(&claim_response.body).unwrap();
+        assert_eq!(claim_response.status_code, 402);
+        assert_eq!(
+            claim_value["result"]["errorReason"],
+            "seller_insufficient_credit"
+        );
+        assert!(claim_value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["name"] == "batch_settle.reserve_seller_credit"));
+
+        let settle = with_minimal_batch_operation_requirements(batch_settle_json());
+        set_env_value("POLYGON_RPC_URL", "https://polygon.example");
+        crate::rpc::set_test_batch_receiver_state(Some(Ok(crate::rpc::BatchReceiverState {
+            total_claimed: "11".to_string(),
+            total_settled: "10".to_string(),
+        })));
+        let settle_response = run_ready(settle_http(batch_settle_request(&settle)));
+        crate::rpc::set_test_batch_receiver_state(None);
+        let settle_value: Value = serde_json::from_slice(&settle_response.body).unwrap();
+        assert_eq!(settle_response.status_code, 402);
+        assert_eq!(
+            settle_value["result"]["errorReason"],
+            "seller_insufficient_credit"
+        );
+        assert!(settle_value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["name"] == "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_rejects_optional_operation_version_mismatch_before_credit() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let receiver_authorizer = private_key_address(OTHER_PRIVATE_KEY).unwrap();
+        let mut claim =
+            batch_claim_json_for_receiver_authorizer("100", "75", Some(&receiver_authorizer));
+        claim["paymentRequirements"]["extra"]["version"] = json!("2");
+        claim["paymentPayload"]["accepted"]["extra"]["version"] = json!("2");
+
+        let claim_response = run_ready(settle_http(batch_settle_request(&claim)));
+        let claim_value: Value = serde_json::from_slice(&claim_response.body).unwrap();
+        assert_eq!(claim_response.status_code, 402);
+        assert_eq!(
+            claim_value["result"]["errorReason"],
+            "invalid_batch_settlement"
+        );
+        assert_eq!(
+            claim_value["result"]["errorMessage"],
+            "invalid_batch_settlement_evm_eip712_version"
+        );
+        assert_eq!(claim_value["cost"]["rpcCalls"], 0);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        assert!(claim_value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_channel_update_uses_revision_cas() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_initial_batch_channel(&channel_id, "200");
+
+        let missing_pending = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "100")),
+            },
+        );
+        assert_eq!(missing_pending.status, "invalid");
+        assert_eq!(
+            missing_pending.message,
+            Some("batch channel create requires pendingRequest".to_string())
+        );
+
+        let mut expired_pending = test_batch_channel(&channel_id, "100");
+        expired_pending.signed_max_claimable = "200".to_string();
+        expired_pending.signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            "200",
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        expired_pending.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-expired".to_string(),
+            signed_max_claimable: "200".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
+        });
+        let expired_create = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(expired_pending),
+            },
+        );
+        assert_eq!(expired_create.status, "invalid");
+        assert_eq!(
+            expired_create.message,
+            Some("batch channel create requires live pendingRequest".to_string())
+        );
+
+        let mut mismatch_pending = test_batch_channel(&channel_id, "100");
+        mismatch_pending.signed_max_claimable = "200".to_string();
+        mismatch_pending.signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            "200",
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        mismatch_pending.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-mismatch".to_string(),
+            signed_max_claimable: "201".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        let mismatch_create = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(mismatch_pending),
+            },
+        );
+        assert_eq!(mismatch_create.status, "invalid");
+        assert_eq!(
+            mismatch_create.message,
+            Some(
+                "batch channel signedMaxClaimable must match pendingRequest.signedMaxClaimable when creating"
+                    .to_string()
+            )
+        );
+
+        let initial_invariant_cases: [(&str, fn(&mut BatchChannel)); 6] = [
+            (
+                "batch channel create requires chargedCumulativeAmount 0",
+                |channel: &mut BatchChannel| channel.charged_cumulative_amount = "1".to_string(),
+            ),
+            (
+                "batch channel create requires balance 0",
+                |channel: &mut BatchChannel| channel.balance = "1".to_string(),
+            ),
+            (
+                "batch channel create requires totalClaimed 0",
+                |channel: &mut BatchChannel| {
+                    channel.total_claimed = "1".to_string();
+                    channel.balance = "1".to_string();
+                },
+            ),
+            (
+                "batch channel create requires refundNonce 0",
+                |channel: &mut BatchChannel| channel.refund_nonce = "1".to_string(),
+            ),
+            (
+                "batch channel create requires withdrawRequestedAt 0",
+                |channel: &mut BatchChannel| channel.withdraw_requested_at = 1,
+            ),
+            (
+                "batch channel create requires onchainSyncedAt empty",
+                |channel: &mut BatchChannel| channel.onchain_synced_at = Some(1),
+            ),
+        ];
+        for (message, mutate) in initial_invariant_cases {
+            let mut invalid_initial = test_initial_batch_channel(&channel_id, "200");
+            mutate(&mut invalid_initial);
+            let result = batch_update_channel(
+                channel_id.clone(),
+                None,
+                BatchChannelUpdate {
+                    channel: Some(invalid_initial),
+                },
+            );
+            assert_eq!(result.status, "invalid");
+            assert_eq!(result.message, Some(message.to_string()));
+        }
+
+        let missing_delete = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(missing_delete.status, "unchanged");
+        assert_eq!(missing_delete.current_revision, None);
+
+        let created = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(channel),
+            },
+        );
+        assert_eq!(created.status, "updated");
+        assert_eq!(created.current_revision, Some(1));
+        assert_eq!(batch_channel_count(), 1);
+
+        let conflict = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "200")),
+            },
+        );
+        assert_eq!(conflict.status, "conflict");
+        assert_eq!(conflict.current_revision, Some(1));
+
+        let updated = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "200")),
+            },
+        );
+        assert_eq!(updated.status, "updated");
+        assert_eq!(updated.current_revision, Some(2));
+        assert_eq!(
+            batch_channel(channel_id.clone())
+                .unwrap()
+                .charged_cumulative_amount,
+            "200"
+        );
+        let upper_channel_id = format!("0x{}", channel_id[2..].to_ascii_uppercase());
+        assert_eq!(
+            batch_channel(upper_channel_id)
+                .unwrap()
+                .charged_cumulative_amount,
+            "200"
+        );
+
+        let deleted = batch_update_channel(
+            channel_id.clone(),
+            Some(2),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(deleted.status, "deleted");
+        assert_eq!(batch_channel(channel_id.clone()), None);
+        let audit = batch_deleted_channel(channel_id.clone()).unwrap();
+        assert_eq!(audit.channel.channel_id, channel_id);
+        assert_eq!(audit.channel.charged_cumulative_amount, "200");
+        assert!(!audit.deleted_by.is_empty());
+        assert_eq!(batch_deleted_channel_count(), 1);
+        assert_eq!(batch_deleted_channels(Some(1)).len(), 1);
+    }
+
+    #[test]
+    fn batch_channel_update_allows_official_manager_delete() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let mut stored = test_batch_channel(&channel_id, "100");
+        stored.revision = 1;
+        put_batch_channel(&channel_id, stored).unwrap();
+
+        let deleted = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(deleted.status, "deleted");
+        assert_eq!(batch_channel(channel_id.clone()), None);
+        assert_eq!(
+            batch_deleted_channel(channel_id)
+                .unwrap()
+                .channel
+                .charged_cumulative_amount,
+            "100"
+        );
+    }
+
+    #[test]
+    fn batch_deleted_channel_audit_retention_keeps_existing_key_updates() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+
+        let deleted = |channel_id: &str, deleted_at: u64| BatchDeletedChannel {
+            channel: test_batch_channel(channel_id, "100"),
+            deleted_at,
+            deleted_by: "test-writer".to_string(),
+        };
+
+        let mut config_a = test_batch_channel_config();
+        config_a.salt = format!("0x{}", "45".repeat(32));
+        let id_a = compute_batch_channel_id(&config_a, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let mut config_b = test_batch_channel_config();
+        config_b.salt = format!("0x{}", "46".repeat(32));
+        let id_b = compute_batch_channel_id(&config_b, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let mut config_c = test_batch_channel_config();
+        config_c.salt = format!("0x{}", "47".repeat(32));
+        let id_c = compute_batch_channel_id(&config_c, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+
+        put_batch_deleted_channel(&id_a, deleted(&id_a, 10));
+        put_batch_deleted_channel(&id_b, deleted(&id_b, 20));
+        put_batch_deleted_channel(&id_b, deleted(&id_b, 30));
+
+        assert_eq!(batch_deleted_channel_count(), 2);
+        assert_eq!(batch_deleted_channel(id_a.clone()).unwrap().deleted_at, 10);
+        assert_eq!(batch_deleted_channel(id_b.clone()).unwrap().deleted_at, 30);
+
+        put_batch_deleted_channel(&id_c, deleted(&id_c, 40));
+
+        assert_eq!(batch_deleted_channel_count(), 2);
+        assert!(batch_deleted_channel(id_a).is_none());
+        assert_eq!(batch_deleted_channel(id_b).unwrap().deleted_at, 30);
+        assert_eq!(batch_deleted_channel(id_c).unwrap().deleted_at, 40);
+    }
+
+    #[test]
+    fn batch_channel_update_rejects_delete_with_live_pending_request() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let mut channel = test_batch_channel(&channel_id, "100");
+        channel.revision = 1;
+        channel.balance = "100".to_string();
+        channel.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-live".to_string(),
+            signed_max_claimable: "100".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, channel).unwrap();
+
+        let rejected = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(rejected.status, "invalid");
+        assert_eq!(
+            rejected.message,
+            Some("batch channel delete requires no live pendingRequest".to_string())
+        );
+        assert!(batch_channel(channel_id.clone()).is_some());
+
+        let mut expired = batch_channel(channel_id.clone()).unwrap();
+        expired.revision = 1;
+        expired.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-expired".to_string(),
+            signed_max_claimable: "100".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
+        });
+        put_batch_channel(&channel_id, expired).unwrap();
+
+        let deleted = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(deleted.status, "deleted");
+        assert_eq!(batch_channel(channel_id), None);
+    }
+
+    #[test]
+    fn batch_channel_update_allows_delete_of_pending_only_provisional_channel() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_initial_batch_channel(&channel_id, "100");
+        let created = batch_update_channel(
+            channel_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(channel),
+            },
+        );
+        assert_eq!(created.status, "updated");
+
+        let deleted = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(deleted.status, "deleted");
+        assert_eq!(batch_channel(channel_id), None);
+    }
+
+    #[test]
+    fn batch_channel_update_rejects_monotonic_state_rollbacks() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let mut current = test_batch_channel(&channel_id, "200");
+        current.charged_cumulative_amount = "100".to_string();
+        current.balance = "50".to_string();
+        current.total_claimed = "50".to_string();
+        current.refund_nonce = "3".to_string();
+        current.revision = 1;
+        put_batch_channel(&channel_id, current).unwrap();
+
+        for (mut rollback, expected_message) in [
+            (
+                {
+                    let mut channel = test_batch_channel(&channel_id, "200");
+                    channel.charged_cumulative_amount = "99".to_string();
+                    channel
+                },
+                "batch channel chargedCumulativeAmount must not decrease",
+            ),
+            (
+                {
+                    let mut channel = test_batch_channel(&channel_id, "150");
+                    channel.charged_cumulative_amount = "100".to_string();
+                    channel
+                },
+                "batch channel signedMaxClaimable must not decrease",
+            ),
+            (
+                {
+                    let mut channel = test_batch_channel(&channel_id, "200");
+                    channel.charged_cumulative_amount = "100".to_string();
+                    channel.balance = "49".to_string();
+                    channel.total_claimed = "49".to_string();
+                    channel
+                },
+                "batch channel totalClaimed must not decrease",
+            ),
+            (
+                {
+                    let mut channel = test_batch_channel(&channel_id, "200");
+                    channel.charged_cumulative_amount = "100".to_string();
+                    channel.balance = "50".to_string();
+                    channel.total_claimed = "50".to_string();
+                    channel.refund_nonce = "2".to_string();
+                    channel
+                },
+                "batch channel refundNonce must not decrease",
+            ),
+            (
+                {
+                    let mut channel = test_batch_channel(&channel_id, "200");
+                    channel.charged_cumulative_amount = "100".to_string();
+                    channel.balance = "50".to_string();
+                    channel.total_claimed = "50".to_string();
+                    channel.refund_nonce = "3".to_string();
+                    channel.last_request_timestamp = 0;
+                    channel
+                },
+                "batch channel lastRequestTimestamp must not decrease",
+            ),
+        ] {
+            rollback.revision = 1;
+            let result = batch_update_channel(
+                channel_id.clone(),
+                Some(1),
+                BatchChannelUpdate {
+                    channel: Some(rollback),
+                },
+            );
+            assert_eq!(result.status, "invalid");
+            assert_eq!(result.message, Some(expected_message.to_string()));
+        }
+
+        let stored = batch_channel(channel_id).unwrap();
+        assert_eq!(stored.charged_cumulative_amount, "100");
+        assert_eq!(stored.signed_max_claimable, "200");
+        assert_eq!(stored.total_claimed, "50");
+        assert_eq!(stored.refund_nonce, "3");
+    }
+
+    #[test]
+    fn batch_channel_update_requires_pending_request_for_charge_increase() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+
+        let mut current = test_batch_channel(&channel_id, "100");
+        current.revision = 1;
+        put_batch_channel(&channel_id, current).unwrap();
+
+        let without_pending = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "125")),
+            },
+        );
+        assert_eq!(without_pending.status, "invalid");
+        assert_eq!(
+            without_pending.message,
+            Some("batch channel charge increase requires pendingRequest".to_string())
+        );
+
+        let mut expired_current = test_batch_channel(&channel_id, "100");
+        expired_current.revision = 1;
+        expired_current.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-expired".to_string(),
+            signed_max_claimable: "125".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_sub(1),
+        });
+        put_batch_channel(&channel_id, expired_current).unwrap();
+        let expired = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "125")),
+            },
+        );
+        assert_eq!(expired.status, "invalid");
+        assert_eq!(
+            expired.message,
+            Some("batch channel charge increase requires live pendingRequest".to_string())
+        );
+
+        let mut mismatch_current = test_batch_channel(&channel_id, "100");
+        mismatch_current.revision = 1;
+        mismatch_current.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-130".to_string(),
+            signed_max_claimable: "130".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, mismatch_current).unwrap();
+        let mismatch = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(test_batch_channel(&channel_id, "125")),
+            },
+        );
+        assert_eq!(mismatch.status, "invalid");
+        assert_eq!(
+            mismatch.message,
+            Some(
+                "batch channel signedMaxClaimable must match pendingRequest.signedMaxClaimable when charge increases"
+                    .to_string()
+            )
+        );
+
+        let mut under_record_current = test_batch_channel(&channel_id, "100");
+        under_record_current.revision = 1;
+        under_record_current.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-under-record".to_string(),
+            signed_max_claimable: "130".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, under_record_current).unwrap();
+        let mut under_record_next = test_batch_channel(&channel_id, "125");
+        under_record_next.signed_max_claimable = "130".to_string();
+        under_record_next.signature = crate::batch::sign_batch_voucher_for_test(
+            &channel_id,
+            "130",
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        );
+        let under_record = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(under_record_next),
+            },
+        );
+        assert_eq!(under_record.status, "invalid");
+        assert_eq!(
+            under_record.message,
+            Some(
+                "batch channel chargedCumulativeAmount must match pendingRequest.signedMaxClaimable when charge increases"
+                    .to_string()
+            )
+        );
+
+        let mut unconsumed_current = test_batch_channel(&channel_id, "100");
+        unconsumed_current.revision = 1;
+        unconsumed_current.pending_request = Some(crate::batch::BatchPendingRequest {
+            pending_id: "request-125".to_string(),
+            signed_max_claimable: "125".to_string(),
+            expires_at: now_seconds().saturating_mul(1_000).saturating_add(60_000),
+        });
+        put_batch_channel(&channel_id, unconsumed_current.clone()).unwrap();
+        let mut unconsumed_next = test_batch_channel(&channel_id, "125");
+        unconsumed_next.pending_request = unconsumed_current.pending_request;
+        let unconsumed = batch_update_channel(
+            channel_id.clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(unconsumed_next),
+            },
+        );
+        assert_eq!(unconsumed.status, "invalid");
+        assert_eq!(
+            unconsumed.message,
+            Some("batch channel charge increase must consume pendingRequest".to_string())
+        );
+    }
+
+    #[test]
+    fn batch_channel_update_rejects_config_mismatch_and_storage_limit() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let mut mismatch = test_batch_channel(&channel_id, "100");
+        mismatch.channel_config.salt = format!("0x{}", "44".repeat(32));
+
+        let invalid = batch_update_channel(
+            channel_id,
+            None,
+            BatchChannelUpdate {
+                channel: Some(mismatch),
+            },
+        );
+        assert_eq!(invalid.status, "invalid");
+        assert_eq!(
+            invalid.message,
+            Some("batch channel config does not match channel id".to_string())
+        );
+
+        let mut created_ids = Vec::new();
+        for salt in ["45", "46"] {
+            let mut config = test_batch_channel_config();
+            config.salt = format!("0x{}", salt.repeat(32));
+            let id = compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+            let channel = test_initial_batch_channel_for_config(&id, config, "100");
+            let created = batch_update_channel(
+                id.clone(),
+                None,
+                BatchChannelUpdate {
+                    channel: Some(channel),
+                },
+            );
+            assert_eq!(created.status, "updated");
+            created_ids.push(id);
+        }
+
+        let mut existing_update = batch_channel(created_ids[0].clone()).unwrap();
+        existing_update.charged_cumulative_amount = "100".to_string();
+        existing_update.pending_request = None;
+        let updated_at_limit = batch_update_channel(
+            created_ids[0].clone(),
+            Some(1),
+            BatchChannelUpdate {
+                channel: Some(existing_update),
+            },
+        );
+        assert_eq!(updated_at_limit.status, "updated");
+        assert_eq!(updated_at_limit.current_revision, Some(2));
+
+        let mut extra_config = test_batch_channel_config();
+        extra_config.salt = format!("0x{}", "47".repeat(32));
+        let extra_id =
+            compute_batch_channel_id(&extra_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let over_limit = batch_update_channel(
+            extra_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some(test_initial_batch_channel_for_config(
+                    &extra_id,
+                    extra_config,
+                    "100",
+                )),
+            },
+        );
+        assert_eq!(over_limit.status, "invalid");
+        assert_eq!(
+            over_limit.message,
+            Some("batch channel storage limit reached".to_string())
+        );
+
+        let deleted = batch_update_channel(
+            created_ids[1].clone(),
+            Some(1),
+            BatchChannelUpdate { channel: None },
+        );
+        assert_eq!(deleted.status, "deleted");
+
+        let mut replacement_config = test_batch_channel_config();
+        replacement_config.salt = format!("0x{}", "48".repeat(32));
+        let replacement_id =
+            compute_batch_channel_id(&replacement_config, DEFAULT_BATCH_SETTLEMENT_CONTRACT)
+                .unwrap();
+        let replacement = batch_update_channel(
+            replacement_id.clone(),
+            None,
+            BatchChannelUpdate {
+                channel: Some({
+                    let channel = test_initial_batch_channel_for_config(
+                        &replacement_id,
+                        replacement_config,
+                        "100",
+                    );
+                    channel
+                }),
+            },
+        );
+        assert_eq!(replacement.status, "updated");
+    }
+
+    #[test]
+    fn batch_channel_update_rejects_runtime_config_mismatch() {
+        clear_batch_channels();
+        clear_env_values();
+        set_default_batch_channel_runtime_config();
+
+        let cases: [(&str, fn(&mut crate::batch::BatchChannelConfig), &str); 3] = [
+            (
+                "wrong token",
+                |config: &mut crate::batch::BatchChannelConfig| {
+                    config.token = "0x0000000000000000000000000000000000000001".to_string();
+                },
+                "batch channel token must be JPYC on Polygon",
+            ),
+            (
+                "wrong receiverAuthorizer",
+                |config: &mut crate::batch::BatchChannelConfig| {
+                    config.receiver_authorizer =
+                        "0x0000000000000000000000000000000000000002".to_string();
+                },
+                "batch channel receiverAuthorizer must match BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY",
+            ),
+            (
+                "wrong withdrawDelay",
+                |config: &mut crate::batch::BatchChannelConfig| {
+                    config.withdraw_delay = DEFAULT_BATCH_WITHDRAW_DELAY_SECONDS + 1;
+                },
+                "batch channel withdrawDelay must match BATCH_WITHDRAW_DELAY_SECONDS",
+            ),
+        ];
+
+        for (_name, mutate, expected) in cases {
+            let mut config = test_batch_channel_config();
+            mutate(&mut config);
+            let channel_id =
+                compute_batch_channel_id(&config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+            let channel = test_initial_batch_channel_for_config(&channel_id, config, "100");
+            let result = batch_update_channel(
+                channel_id,
+                None,
+                BatchChannelUpdate {
+                    channel: Some(channel),
+                },
+            );
+            assert_eq!(result.status, "invalid");
+            assert_eq!(result.message, Some(expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn batch_channel_update_authorizes_by_receiver_scope() {
+        clear_env_values();
+        let writer = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+        let other = Principal::from_text("r7inp-6aaaa-aaaaa-aaabq-cai").unwrap();
+        let channel_id = compute_batch_channel_id(
+            &test_batch_channel_config(),
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        let channel = test_initial_batch_channel(&channel_id, "100");
+
+        set_test_batch_caller(Principal::anonymous(), false);
+        assert_eq!(
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            "caller must be a non-system IC principal"
+        );
+
+        set_test_batch_caller(other, true);
+        assert!(authorize_batch_channel_update(None, Some(&channel)).is_ok());
+
+        set_test_batch_caller(other, false);
+        assert_eq!(
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            format!(
+                "caller is not authorized for receiver {}",
+                PAY_TO.to_ascii_lowercase()
+            )
+        );
+
+        set_test_batch_caller(writer, true);
+        batch_set_writer_receiver_scope(writer, PAY_TO.to_string(), true).unwrap();
+        set_test_batch_caller(writer, false);
+        assert_eq!(
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            format!(
+                "caller is not authorized for receiver {}",
+                PAY_TO.to_ascii_lowercase()
+            )
+        );
+
+        set_test_batch_caller(writer, true);
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        set_test_batch_caller(writer, false);
+        assert!(authorize_batch_channel_update(None, Some(&channel)).is_ok());
+
+        set_test_batch_caller(writer, true);
+        batch_set_writer_receiver_scope(writer, PAY_TO.to_string(), false).unwrap();
+        set_test_batch_caller(writer, false);
+        assert_eq!(
+            authorize_batch_channel_update(None, Some(&channel)).unwrap_err(),
+            format!(
+                "caller is not authorized for receiver {}",
+                PAY_TO.to_ascii_lowercase()
+            )
+        );
+    }
+
+    #[test]
+    fn batch_settlement_fee_amount_exposes_only_valid_public_fee() {
+        clear_env_values();
+        assert_eq!(batch_settlement_fee_amount(), None);
+
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        assert_eq!(batch_settlement_fee_amount(), Some("100".to_string()));
+
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "0");
+        assert_eq!(batch_settlement_fee_amount(), None);
+
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "1.5");
+        assert_eq!(batch_settlement_fee_amount(), None);
+    }
+
+    #[test]
+    fn batch_action_fee_profile_overrides_legacy_fee() {
+        clear_env_values();
+        set_env_value(BATCH_LEGACY_FEE_ENV, "100");
+        let deposit = batch_payload(&serde_json::json!({ "type": "deposit" })).unwrap();
+        let claim_body = batch_claim_json("100", "0");
+        let claim = batch_payload(&claim_body["paymentPayload"]["payload"]).unwrap();
+        let settle = batch_payload(&serde_json::json!({ "type": "settle" })).unwrap();
+        let refund = batch_payload(&serde_json::json!({ "type": "refund" })).unwrap();
+        assert_eq!(batch_fee_for_payload(&deposit), Ok(100));
+        assert_eq!(batch_fee_for_payload(&claim), Ok(100));
+
+        set_env_value(BATCH_DEPOSIT_FEE_ENV, "50");
+        set_env_value(BATCH_CLAIM_FEE_ENV, "60");
+        set_env_value(BATCH_SETTLE_FEE_ENV, "70");
+        set_env_value(BATCH_REFUND_FEE_ENV, "80");
+        assert_eq!(batch_fee_for_payload(&deposit), Ok(50));
+        assert_eq!(batch_fee_for_payload(&claim), Ok(60));
+        assert_eq!(batch_fee_for_payload(&settle), Ok(70));
+        assert_eq!(batch_fee_for_payload(&refund), Ok(80));
+    }
+
+    #[test]
+    fn batch_claim_fee_schedule_selects_count_and_refund_tiers() {
+        clear_env_values();
+        set_env_value(BATCH_LEGACY_FEE_ENV, "100");
+        set_env_value(BATCH_CLAIM_1_FEE_ENV, "11000000000000000000");
+        set_env_value(BATCH_CLAIM_10_FEE_ENV, "12000000000000000000");
+        set_env_value(BATCH_CLAIM_50_FEE_ENV, "13000000000000000000");
+        set_env_value(BATCH_CLAIM_100_FEE_ENV, "14000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_1_FEE_ENV, "21000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_10_FEE_ENV, "22000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_50_FEE_ENV, "23000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_100_FEE_ENV, "24000000000000000000");
+
+        let claim_for = |count: usize| {
+            let mut body = batch_claim_json("100", "0");
+            let claims = body["paymentPayload"]["payload"]["claims"]
+                .as_array_mut()
+                .unwrap();
+            let claim = claims[0].clone();
+            claims.resize(count, claim);
+            batch_payload(&body["paymentPayload"]["payload"]).unwrap()
+        };
+        let refund_for = |count: usize| {
+            let mut body = batch_claim_json("100", "0");
+            body["paymentPayload"]["payload"]["type"] = json!("refund");
+            let claims = body["paymentPayload"]["payload"]["claims"]
+                .as_array_mut()
+                .unwrap();
+            let claim = claims[0].clone();
+            claims.resize(count, claim);
+            batch_payload(&body["paymentPayload"]["payload"]).unwrap()
+        };
+
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(1)),
+            Ok(11000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(2)),
+            Ok(12000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(10)),
+            Ok(12000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(11)),
+            Ok(13000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(50)),
+            Ok(13000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(51)),
+            Ok(14000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&claim_for(100)),
+            Ok(14000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&refund_for(1)),
+            Ok(21000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&refund_for(10)),
+            Ok(22000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&refund_for(50)),
+            Ok(23000000000000000000)
+        );
+        assert_eq!(
+            batch_fee_for_payload(&refund_for(100)),
+            Ok(24000000000000000000)
+        );
+    }
+
+    #[test]
+    fn partial_or_non_monotonic_batch_claim_schedule_falls_back_to_legacy() {
+        clear_env_values();
+        set_env_value(BATCH_LEGACY_FEE_ENV, "100");
+        set_env_value(BATCH_CLAIM_1_FEE_ENV, "11000000000000000000");
+        set_env_value(BATCH_CLAIM_10_FEE_ENV, "12000000000000000000");
+        assert!(configured_batch_claim_fee_schedule().is_err());
+        let claim_body = batch_claim_json("100", "0");
+        let claim = batch_payload(&claim_body["paymentPayload"]["payload"]).unwrap();
+        assert_eq!(batch_fee_for_payload(&claim), Ok(100));
+
+        set_env_value(BATCH_CLAIM_50_FEE_ENV, "10000000000000000000");
+        set_env_value(BATCH_CLAIM_100_FEE_ENV, "14000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_1_FEE_ENV, "21000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_10_FEE_ENV, "22000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_50_FEE_ENV, "23000000000000000000");
+        set_env_value(BATCH_REFUND_WITH_CLAIM_100_FEE_ENV, "24000000000000000000");
+        assert!(configured_batch_claim_fee_schedule().is_err());
+        assert_eq!(batch_fee_for_payload(&claim), Ok(100));
+    }
+
+    #[test]
+    fn batch_settlement_contract_exposes_only_valid_public_contract() {
+        clear_env_values();
+        assert_eq!(batch_settlement_contract(), None);
+
+        set_default_batch_contract();
+        assert_eq!(
+            batch_settlement_contract(),
+            Some(DEFAULT_BATCH_SETTLEMENT_CONTRACT.to_ascii_lowercase())
+        );
+
+        set_env_value(
+            "BATCH_SETTLEMENT_CONTRACT",
+            "0x0000000000000000000000000000000000000000",
+        );
+        assert_eq!(batch_settlement_contract(), None);
+
+        set_env_value("BATCH_SETTLEMENT_CONTRACT", "not an address");
+        assert_eq!(batch_settlement_contract(), None);
+
+        set_env_value(
+            "BATCH_SETTLEMENT_CONTRACT",
+            "0x0000000000000000000000000000000000000001",
+        );
+        assert_eq!(batch_settlement_contract(), None);
+    }
+
+    #[test]
+    fn batch_receiver_authorizer_exposes_only_derived_public_address() {
+        clear_env_values();
+        assert_eq!(batch_receiver_authorizer(), None);
+
+        set_env_value(
+            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY",
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        assert_eq!(
+            batch_receiver_authorizer(),
+            Some("0x1563915e194d8cfba1943570603f7606a3115508".to_string())
+        );
+
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "not a private key");
+        assert_eq!(batch_receiver_authorizer(), None);
     }
 
     #[test]
@@ -2860,6 +9648,39 @@ mod hardening_tests {
     }
 
     #[test]
+    fn exact_settle_rejects_seller_without_current_acceptance() {
+        clear_settlement_state();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        let mut body = request_with_seller_auth();
+        sign_eip3009(&mut body);
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = true);
+
+        let response = run_ready(settle_http(settle_request(&body)));
+
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = false);
+        assert_eq!(response.status_code, 403);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["errorReason"], "seller_acceptance_required");
+    }
+
+    #[test]
+    fn batch_settle_rejects_seller_without_current_acceptance() {
+        clear_settlement_state();
+        clear_env_values();
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = true);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        TEST_ENFORCE_SELLER_ACCEPTANCE.with(|enabled| *enabled.borrow_mut() = false);
+        assert_eq!(response.status_code, 403);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["errorReason"], "seller_acceptance_required");
+    }
+
+    #[test]
     fn settle_with_valid_seller_authorization_reaches_reserve_path() {
         clear_settlement_state();
         clear_seller_credits();
@@ -2885,6 +9706,530 @@ mod hardening_tests {
             .iter()
             .any(|step| step["name"] == "settle.reserve_seller_credit"));
         assert!(steps.iter().any(|step| step["name"] == "settle.rpc_config"));
+    }
+
+    #[test]
+    fn batch_settle_rejects_new_target_without_credit_after_receiver_state() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("POLYGON_RPC_URL", "https://polygon.example");
+        set_full_batch_config();
+        crate::rpc::set_test_batch_receiver_state(Some(Ok(crate::rpc::BatchReceiverState {
+            total_claimed: "11".to_string(),
+            total_settled: "10".to_string(),
+        })));
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        crate::rpc::set_test_batch_receiver_state(None);
+        assert_eq!(response.status_code, 402);
+        assert_eq!(active_settlement_count(), 0);
+        assert_eq!(settlement_count(), 0);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "seller_insufficient_credit");
+        assert_eq!(value["cost"]["rpcCalls"], 1);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["name"] == "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_busy_lock_wins_before_credit_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        let from = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let scope = active_settlement_scope(&from, &seller).unwrap();
+        add_seller_credit(&seller, 50);
+        assert!(acquire_active_settlement(&scope, "busy-batch"));
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        release_active_settlement(&scope, "busy-batch");
+        assert_eq!(response.status_code, 429);
+        assert_eq!(seller_credit_balance_for(&seller), 50);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "settlement_queue_busy");
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        let steps = value["cost"]["steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "batch_settle.active_lock"));
+        assert!(steps
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_missing_fee_config_releases_active_lock_before_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        remove_env_value("BATCH_SETTLEMENT_FEE_AMOUNT");
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        assert_eq!(active_settlement_count(), 0);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        let steps = value["cost"]["steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "batch_settle.active_lock"));
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "batch_settle.fee_config"));
+        assert!(steps
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_cache_hit_does_not_require_full_batch_config_or_credit() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_default_batch_contract();
+        let body = batch_settle_json();
+        let parsed: BatchFacilitatorRequest = serde_json::from_value(body.clone()).unwrap();
+        let key = batch_settlement_key(&parsed, None).unwrap();
+        insert_settlement(
+            &key,
+            SettlementRecord::settled(
+                "0xsettled".to_string(),
+                PAY_TO.to_string(),
+                PAY_TO.to_string(),
+                "0".to_string(),
+                now_seconds(),
+                60,
+            ),
+        );
+
+        let response = run_ready(settle_http(batch_settle_request(&body)));
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(seller_credit_balance_for(PAY_TO), 0);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        let steps = value["cost"]["steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "batch_settle.cache_hit"));
+        assert!(steps
+            .iter()
+            .all(|step| step["name"] != "batch_settle.authorizer_config"));
+        assert!(steps
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_terminal_key_uses_receiver_token_and_target_total_claimed() {
+        let parsed: BatchFacilitatorRequest = serde_json::from_value(batch_settle_json()).unwrap();
+        let mut equivalent = parsed.clone();
+        equivalent.payment_requirements.amount = "999".to_string();
+
+        assert_eq!(
+            batch_settlement_key(&parsed, Some("10")).unwrap(),
+            batch_settlement_key(&equivalent, Some("10")).unwrap()
+        );
+        assert_ne!(
+            batch_settlement_key(&parsed, Some("10")).unwrap(),
+            batch_settlement_key(&parsed, Some("11")).unwrap()
+        );
+    }
+
+    #[test]
+    fn batch_settle_terminal_replay_does_not_require_credit() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("POLYGON_RPC_URL", "https://polygon.example");
+        set_full_batch_config();
+        let body = batch_settle_json();
+        let parsed: BatchFacilitatorRequest = serde_json::from_value(body.clone()).unwrap();
+        let payload = batch_payload(&parsed.payment_payload.payload).unwrap();
+        let key = batch_settlement_key(&parsed, Some("10")).unwrap();
+        let record = annotate_batch_settle_target(
+            SettlementRecord::settled(
+                "0xsettled".to_string(),
+                PAY_TO.to_string(),
+                PAY_TO.to_string(),
+                "10".to_string(),
+                now_seconds(),
+                60,
+            ),
+            &payload,
+            Some("10".to_string()),
+            Some("100".to_string()),
+        );
+        insert_batch_settlement(&key, record, Some(100));
+        crate::rpc::set_test_batch_receiver_state(Some(Ok(crate::rpc::BatchReceiverState {
+            total_claimed: "10".to_string(),
+            total_settled: "10".to_string(),
+        })));
+
+        let response = run_ready(settle_http(batch_settle_request(&body)));
+
+        crate::rpc::set_test_batch_receiver_state(None);
+        assert_eq!(response.status_code, 200);
+        assert_eq!(seller_credit_balance_for(PAY_TO), 0);
+        assert_eq!(active_settlement_count(), 0);
+        assert_eq!(settlement_count(), 1);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["transaction"], "0xsettled");
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_noop_does_not_require_credit() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("POLYGON_RPC_URL", "https://polygon.example");
+        set_full_batch_config();
+        crate::rpc::set_test_batch_receiver_state(Some(Ok(crate::rpc::BatchReceiverState {
+            total_claimed: "10".to_string(),
+            total_settled: "10".to_string(),
+        })));
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        crate::rpc::set_test_batch_receiver_state(None);
+        assert_eq!(response.status_code, 200);
+        assert_eq!(seller_credit_balance_for(PAY_TO), 0);
+        assert_eq!(active_settlement_count(), 0);
+        assert_eq!(settlement_count(), 1);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["transaction"], "");
+        assert_eq!(value["result"]["amount"], "0");
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_refunds_credit_on_config_failure_before_rpc() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+    }
+
+    #[test]
+    fn batch_settle_requires_receiver_authorizer_key_before_reserve_when_signature_missing() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_default_batch_contract();
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_claim_json(
+            "100", "75",
+        ))));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        assert!(value["result"]["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"));
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_rejects_receiver_authorizer_key_matching_facilitator_key_before_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_settle_json())));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        assert_eq!(
+            value["result"]["errorMessage"],
+            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY must not derive the FACILITATOR_EVM_PRIVATE_KEY address"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_rejects_mismatched_local_receiver_authorizer_key_before_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_default_batch_contract();
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_claim_json(
+            "100", "75",
+        ))));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        assert_eq!(
+            value["result"]["errorMessage"],
+            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY does not match receiverAuthorizer"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_refund_rejects_mismatched_local_receiver_authorizer_key_before_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_default_batch_contract();
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "100");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_env_value("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", THIRD_PRIVATE_KEY);
+        batch_set_seller(PAY_TO.to_string(), "active".to_string()).unwrap();
+        batch_set_writer_receiver_scope(
+            Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+            PAY_TO.to_string(),
+            true,
+        )
+        .unwrap();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+
+        let response = run_ready(settle_http(batch_settle_request(&batch_refund_json(
+            "1", "0",
+        ))));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        assert_eq!(
+            value["result"]["errorMessage"],
+            "BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY does not match receiverAuthorizer"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_settle_rejects_bad_supplied_receiver_authorizer_signature_before_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+        let receiver_authorizer = private_key_address(OTHER_PRIVATE_KEY).unwrap();
+        let mut body =
+            batch_claim_json_for_receiver_authorizer("100", "75", Some(&receiver_authorizer));
+        let payload = batch_payload(&body["paymentPayload"]["payload"]).unwrap();
+        let bad_signature = crate::tx::sign_batch_claims(
+            payload.claims.as_deref().unwrap(),
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        body["paymentPayload"]["payload"]["claimAuthorizerSignature"] = json!(bad_signature);
+
+        let response = run_ready(settle_http(batch_settle_request(&body)));
+
+        assert_eq!(response.status_code, 402);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_batch_settlement");
+        assert_eq!(
+            value["result"]["errorMessage"],
+            "batch claim authorizer signature mismatch"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn batch_calldata_uses_supplied_authorizer_signatures_without_local_key() {
+        clear_env_values();
+        let receiver_authorizer = private_key_address(OTHER_PRIVATE_KEY).unwrap();
+        let mut claim_body =
+            batch_claim_json_for_receiver_authorizer("100", "75", Some(&receiver_authorizer));
+        let claim_payload = batch_payload(&claim_body["paymentPayload"]["payload"]).unwrap();
+        let claim_signature = crate::tx::sign_batch_claims(
+            claim_payload.claims.as_deref().unwrap(),
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        claim_body["paymentPayload"]["payload"]["claimAuthorizerSignature"] =
+            json!(claim_signature);
+        let claim_payload = batch_payload(&claim_body["paymentPayload"]["payload"]).unwrap();
+        assert_eq!(
+            batch_authorizer_private_key_for_claim(&claim_payload).unwrap(),
+            ""
+        );
+        assert!(batch_calldata(&claim_payload, DEFAULT_BATCH_SETTLEMENT_CONTRACT).is_ok());
+
+        let mut refund_body = batch_refund_json("1", "0");
+        refund_body["paymentPayload"]["payload"]["refundAuthorizerSignature"] =
+            json!(format!("0x{}", "11".repeat(65)));
+        let refund_payload = batch_payload(&refund_body["paymentPayload"]["payload"]).unwrap();
+        assert_eq!(
+            batch_authorizer_private_key_for_refund(&refund_payload).unwrap(),
+            ""
+        );
+        assert!(batch_calldata(&refund_payload, DEFAULT_BATCH_SETTLEMENT_CONTRACT).is_ok());
+    }
+
+    #[test]
+    fn batch_calldata_requires_local_authorizer_key_for_missing_signatures() {
+        clear_env_values();
+        let claim_payload =
+            batch_payload(&batch_claim_json("100", "75")["paymentPayload"]["payload"]).unwrap();
+        assert!(batch_authorizer_private_key_for_claim(&claim_payload)
+            .unwrap_err()
+            .contains("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"));
+
+        let refund_payload =
+            batch_payload(&batch_refund_json("1", "0")["paymentPayload"]["payload"]).unwrap();
+        assert!(batch_authorizer_private_key_for_refund(&refund_payload)
+            .unwrap_err()
+            .contains("BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn batch_refund_rejects_bad_supplied_receiver_authorizer_signature_before_reserve() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_full_batch_config();
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 100);
+        let mut body = batch_refund_json("1", "0");
+        let payload = batch_payload(&body["paymentPayload"]["payload"]).unwrap();
+        let config = payload.channel_config.as_ref().unwrap();
+        let channel_id =
+            compute_batch_channel_id(config, DEFAULT_BATCH_SETTLEMENT_CONTRACT).unwrap();
+        let bad_signature = crate::tx::sign_batch_refund(
+            &channel_id,
+            payload.amount.as_deref().unwrap(),
+            payload.refund_nonce.as_deref().unwrap(),
+            PAYER_PRIVATE_KEY,
+            DEFAULT_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        body["paymentPayload"]["payload"]["refundAuthorizerSignature"] = json!(bad_signature);
+
+        let response = run_ready(settle_http(batch_settle_request(&body)));
+
+        assert_eq!(response.status_code, 402);
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_batch_settlement");
+        assert_eq!(
+            value["result"]["errorMessage"],
+            "batch refund authorizer signature mismatch"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        assert!(value["cost"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step["name"] != "batch_settle.reserve_seller_credit"));
     }
 
     #[test]
@@ -2957,6 +10302,31 @@ mod hardening_tests {
         assert_eq!(reserve_nonce(from, 3), 8);
         rollback_reserved_nonce(from, first);
         assert_eq!(reserve_nonce(from, 3), 9);
+    }
+
+    #[test]
+    fn batch_settle_noop_rollback_restores_fee_nonce_and_active_lock() {
+        clear_active_state();
+        clear_seller_credits();
+        let from = "0x0000000000000000000000000000000000000402";
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        let scope = active_settlement_scope(from, &seller).unwrap();
+        add_seller_credit(&seller, 500);
+
+        assert!(acquire_active_settlement(&scope, "batch-noop"));
+        reserve_seller_credit(&seller, 100).unwrap();
+        let nonce = reserve_nonce(from, 7);
+        assert_eq!(seller_credit_balance_for(&seller), 400);
+        assert!(!acquire_active_settlement(&scope, "batch-next"));
+
+        rollback_reserved_nonce(from, nonce);
+        refund_seller_credit(&seller, 100);
+        release_active_settlement(&scope, "batch-noop");
+
+        assert_eq!(seller_credit_balance_for(&seller), 500);
+        assert_eq!(reserve_nonce(from, 7), 7);
+        assert!(acquire_active_settlement(&scope, "batch-next"));
+        release_active_settlement(&scope, "batch-next");
     }
 
     #[test]
@@ -3071,6 +10441,626 @@ mod hardening_tests {
         assert_eq!(trace.steps.len(), 1);
         assert_eq!(trace.steps[0].name, "seller_credit.replace_config");
         assert_eq!(trace.steps[0].rpc_calls, 0);
+    }
+
+    #[test]
+    fn network_profile_is_atomic_and_rejects_mixed_contracts() {
+        clear_env_values();
+        let token = "0x1000000000000000000000000000000000000001";
+        let contract = CANONICAL_BATCH_SETTLEMENT_CONTRACT;
+        apply_network_profile("amoy", token, contract).unwrap();
+        assert_eq!(configured_network(), "eip155:80002");
+        assert!(same_address(&configured_token_address().unwrap(), token));
+        assert_eq!(configured_chain_id(), 80_002);
+        assert!(apply_network_profile("amoy", JPYC_POLYGON_ADDRESS, contract).is_err());
+    }
+
+    #[test]
+    fn amoy_batch_fails_closed_until_canonical_contract_code_is_verified() {
+        clear_env_values();
+        apply_network_profile(
+            "amoy",
+            "0x1000000000000000000000000000000000000001",
+            CANONICAL_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        assert!(require_amoy_batch_contract_code_verified().is_err());
+        set_env_value("AMOY_BATCH_CONTRACT_CODE_VERIFIED", "1");
+        assert!(require_amoy_batch_contract_code_verified().is_ok());
+        apply_network_profile(
+            "amoy",
+            "0x1000000000000000000000000000000000000001",
+            CANONICAL_BATCH_SETTLEMENT_CONTRACT,
+        )
+        .unwrap();
+        assert!(require_amoy_batch_contract_code_verified().is_err());
+    }
+
+    #[test]
+    fn polygon_profile_transition_rejects_preview_values_without_partial_apply() {
+        clear_env_values();
+        let token = "0x1000000000000000000000000000000000000001";
+        let contract = CANONICAL_BATCH_SETTLEMENT_CONTRACT;
+        apply_network_profile("amoy", token, contract).unwrap();
+        set_env_value("SELLER_SETTLEMENT_FEE_AMOUNT", "1");
+        set_env_value("BATCH_SETTLEMENT_FEE_AMOUNT", "1");
+        set_env_value("SELLER_TERMS_VERSION", "terms-draft");
+        set_env_value("PRIVACY_VERSION", "privacy-draft");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-draft");
+
+        let update = RuntimeProfileUpdate {
+            profile: "polygon".to_string(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: "1".to_string(),
+            batch_settlement_fee_amount: "1".to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-draft".to_string(),
+            asset_boundary_version: "asset-draft".to_string(),
+        };
+        assert!(set_runtime_profile(update).is_err());
+        assert_eq!(configured_network_profile().unwrap(), "amoy");
+        assert!(same_address(&configured_token_address().unwrap(), token));
+    }
+
+    #[test]
+    fn runtime_profile_validates_every_field_before_apply() {
+        clear_env_values();
+        let preview = RuntimeProfileUpdate {
+            profile: "amoy".to_string(),
+            token: "0x1000000000000000000000000000000000000001".to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: "1".to_string(),
+            batch_settlement_fee_amount: "1".to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-draft".to_string(),
+            asset_boundary_version: "asset-draft".to_string(),
+        };
+        set_runtime_profile(preview).unwrap();
+        let invalid = RuntimeProfileUpdate {
+            profile: "polygon".to_string(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: JPYC_ATOMIC_UNITS.to_string(),
+            batch_settlement_fee_amount: (10 * JPYC_ATOMIC_UNITS).to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+        };
+        assert!(set_runtime_profile(invalid).is_err());
+        assert_eq!(configured_network_profile().unwrap(), "amoy");
+        assert_eq!(env("SELLER_SETTLEMENT_FEE_AMOUNT").unwrap(), "1");
+
+        let production = RuntimeProfileUpdate {
+            profile: "polygon".to_string(),
+            token: JPYC_POLYGON_ADDRESS.to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: JPYC_ATOMIC_UNITS.to_string(),
+            batch_settlement_fee_amount: (10 * JPYC_ATOMIC_UNITS).to_string(),
+            terms_version: "terms-v1".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+        };
+        set_runtime_profile(production).unwrap();
+        assert_eq!(configured_network_profile().unwrap(), "polygon");
+        assert_eq!(env("SELLER_TERMS_VERSION").unwrap(), "terms-v1");
+    }
+
+    #[test]
+    fn raw_set_env_cannot_bypass_atomic_runtime_profile() {
+        for name in [
+            "NETWORK_PROFILE",
+            "BATCH_SETTLEMENT_CONTRACT",
+            "SELLER_SETTLEMENT_FEE_AMOUNT",
+            "BATCH_SETTLEMENT_FEE_AMOUNT",
+            "SELLER_TERMS_VERSION",
+            "PRIVACY_VERSION",
+            "ASSET_BOUNDARY_VERSION",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| set_env(name.to_string(), "unsafe".to_string()))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn polygon_acceptance_never_treats_draft_versions_as_current() {
+        clear_env_values();
+        set_env_value("NETWORK_PROFILE", "polygon");
+        set_env_value(
+            "SELLER_SETTLEMENT_FEE_AMOUNT",
+            &JPYC_ATOMIC_UNITS.to_string(),
+        );
+        set_env_value(
+            "BATCH_SETTLEMENT_FEE_AMOUNT",
+            &(10 * JPYC_ATOMIC_UNITS).to_string(),
+        );
+        set_env_value("SELLER_TERMS_VERSION", "terms-draft");
+        set_env_value("PRIVACY_VERSION", "privacy-v1");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-v1");
+        let acceptance = SellerAcceptance {
+            seller: PAY_TO.to_string(),
+            status: "active".to_string(),
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+            accepted_at: 1,
+            superseded: false,
+        };
+        assert!(!acceptance_versions_current(&acceptance));
+    }
+
+    #[test]
+    fn acceptance_message_binds_domain_versions_and_nonce() {
+        clear_env_values();
+        set_env_value("FACILITATOR_PUBLIC_ORIGIN", "https://facilitator.example");
+        set_env_value("SELLER_TERMS_VERSION", "terms-v2");
+        set_env_value("PRIVACY_VERSION", "privacy-v3");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-v4");
+        let message = seller_acceptance_message(PAY_TO, "0x1234", 1_700_000_300);
+        assert!(message.contains("canisterId=aaaaa-aa"));
+        assert!(message.contains("publicOrigin=https://facilitator.example"));
+        assert!(message.contains("chainId=137"));
+        assert!(message.contains("termsVersion=terms-v2"));
+        assert!(message.contains("privacyVersion=privacy-v3"));
+        assert!(message.contains("assetBoundaryVersion=asset-v4"));
+        assert!(message.contains("nonce=0x1234"));
+    }
+
+    #[test]
+    fn acceptance_challenge_is_stateless_and_replay_is_idempotent() {
+        clear_seller_acceptance_challenges();
+        SELLER_ACCEPTANCES.with(|items| {
+            let keys = items
+                .borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            for key in keys {
+                items.borrow_mut().remove(&key);
+            }
+        });
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let first_response =
+            seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let first: SellerAcceptanceChallenge =
+            serde_json::from_slice(&first_response.body).unwrap();
+        let second_response =
+            seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let second: SellerAcceptanceChallenge =
+            serde_json::from_slice(&second_response.body).unwrap();
+
+        assert_ne!(first.nonce, second.nonce);
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+        let accepted = seller_acceptance_submit_http(&acceptance_submission_request(
+            &first,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(accepted.status_code, 200);
+        let replay = seller_acceptance_submit_http(&acceptance_submission_request(
+            &first,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(replay.status_code, 200);
+    }
+
+    #[test]
+    fn acceptance_challenge_issuance_ignores_legacy_capacity() {
+        clear_seller_acceptance_challenges();
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        let now = now_seconds();
+        for index in 1..=MAX_SELLER_ACCEPTANCE_CHALLENGES {
+            let seller = format!("0x{index:040x}");
+            let challenge = SellerAcceptanceChallenge {
+                seller: seller.clone(),
+                nonce: format!("0x{index:064x}"),
+                expires_at: now + 300,
+                message: "active".to_string(),
+                facilitator_signature: "legacy".to_string(),
+            };
+            SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+                items
+                    .borrow_mut()
+                    .insert(seller, encode_seller_acceptance_challenge(&challenge));
+            });
+        }
+        let next_seller = format!("0x{:040x}", MAX_SELLER_ACCEPTANCE_CHALLENGES + 1);
+        let full = seller_acceptance_challenge_http(&acceptance_challenge_request(&next_seller));
+        assert_eq!(full.status_code, 200);
+        assert_eq!(
+            SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().len()),
+            MAX_SELLER_ACCEPTANCE_CHALLENGES
+        );
+    }
+
+    #[test]
+    fn acceptance_challenge_success_and_expiry_consume_transient_state() {
+        clear_seller_acceptance_challenges();
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let response = seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let challenge: SellerAcceptanceChallenge = serde_json::from_slice(&response.body).unwrap();
+        let accepted = seller_acceptance_submit_http(&acceptance_submission_request(
+            &challenge,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(accepted.status_code, 200);
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+
+        let expired_message = seller_acceptance_message(
+            &seller,
+            &format!("0x{}", "ab".repeat(32)),
+            now_seconds() - 1,
+        );
+        let expired = SellerAcceptanceChallenge {
+            seller: seller.clone(),
+            nonce: format!("0x{}", "ab".repeat(32)),
+            expires_at: now_seconds() - 1,
+            facilitator_signature: sign_message(SELLER_PRIVATE_KEY, &expired_message),
+            message: expired_message,
+        };
+        let rejected = seller_acceptance_submit_http(&acceptance_submission_request(
+            &expired,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(rejected.status_code, 410);
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+    }
+
+    #[test]
+    fn upgrade_cleanup_removes_challenges_but_keeps_acceptances() {
+        clear_seller_acceptance_challenges();
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let challenge = SellerAcceptanceChallenge {
+            seller: seller.clone(),
+            nonce: format!("0x{}", "cd".repeat(32)),
+            expires_at: now_seconds() + 300,
+            message: "pending".to_string(),
+            facilitator_signature: "legacy".to_string(),
+        };
+        SELLER_ACCEPTANCE_CHALLENGES.with(|items| {
+            items.borrow_mut().insert(
+                seller.clone(),
+                encode_seller_acceptance_challenge(&challenge),
+            );
+        });
+        let acceptance = SellerAcceptance {
+            seller: seller.clone(),
+            status: "active".to_string(),
+            terms_version: "terms-v1".to_string(),
+            privacy_version: "privacy-v1".to_string(),
+            asset_boundary_version: "asset-v1".to_string(),
+            accepted_at: now_seconds(),
+            superseded: false,
+        };
+        SELLER_ACCEPTANCES.with(|items| {
+            items
+                .borrow_mut()
+                .insert(seller.clone(), encode_stable(&acceptance));
+        });
+
+        finalize_post_upgrade_state();
+
+        assert!(SELLER_ACCEPTANCE_CHALLENGES.with(|items| items.borrow().is_empty()));
+        assert!(SELLER_ACCEPTANCES.with(|items| items.borrow().contains_key(&seller)));
+    }
+
+    #[test]
+    fn seller_settlement_history_is_filtered_and_newest_first() {
+        clear_settlements();
+        SELLER_SETTLEMENT_INDEX.with(|items| {
+            let keys = items
+                .borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            let mut items = items.borrow_mut();
+            for key in keys {
+                items.remove(&key);
+            }
+        });
+        insert_settlement(
+            "older",
+            SettlementRecord::settled(
+                "0x1".to_string(),
+                PAYER.to_string(),
+                PAY_TO.to_string(),
+                "10".to_string(),
+                10,
+                60,
+            ),
+        );
+        insert_settlement(
+            "newer",
+            SettlementRecord::settled(
+                "0x2".to_string(),
+                PAYER.to_string(),
+                PAY_TO.to_string(),
+                "20".to_string(),
+                20,
+                60,
+            ),
+        );
+        let page = seller_settlements_page(&PAY_TO.to_ascii_lowercase(), None, 20);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
+    }
+
+    #[test]
+    fn seller_settlement_index_is_backfilled_from_existing_stable_records() {
+        clear_settlements();
+        SELLER_SETTLEMENT_INDEX.with(|items| {
+            let keys = items
+                .borrow()
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            let mut items = items.borrow_mut();
+            for key in keys {
+                items.remove(&key);
+            }
+        });
+        let record = SettlementRecord::settled(
+            "0x1".to_string(),
+            PAYER.to_string(),
+            PAY_TO.to_string(),
+            "10".to_string(),
+            10,
+            60,
+        );
+        SETTLEMENTS.with(|items| {
+            items
+                .borrow_mut()
+                .insert("legacy".to_string(), encode_stable(&record));
+        });
+
+        rebuild_seller_settlement_index();
+
+        let page = seller_settlements_page(&PAY_TO.to_ascii_lowercase(), None, 20);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].key, "legacy");
+    }
+
+    #[test]
+    fn polygon_profile_rejects_draft_legal_versions_and_below_floor_fees() {
+        set_env_value("NETWORK_PROFILE", "polygon");
+        assert!(validate_env_update("SELLER_TERMS_VERSION", "2026-07-13-draft").is_err());
+        assert!(validate_env_update("PRIVACY_VERSION", "").is_err());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "999").is_err());
+        assert!(validate_env_update("BATCH_SETTLEMENT_FEE_AMOUNT", "999").is_err());
+        assert!(validate_env_update("BATCH_DEPOSIT_FEE_AMOUNT", "499999999999999999").is_err());
+        assert!(validate_env_update("SELLER_TERMS_VERSION", "2026-07-13").is_ok());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "500000000000000000").is_ok());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "1000000000000000000").is_ok());
+        assert!(validate_env_update("BATCH_SETTLEMENT_FEE_AMOUNT", "500000000000000000").is_ok());
+        assert!(validate_env_update("BATCH_DEPOSIT_FEE_AMOUNT", "500000000000000000").is_ok());
+    }
+
+    fn test_fee_schedule(base: u128) -> BatchClaimFeeSchedule {
+        BatchClaimFeeSchedule {
+            claim_1_fee_amount: base.to_string(),
+            claim_10_fee_amount: (base + 1).to_string(),
+            claim_50_fee_amount: (base + 2).to_string(),
+            claim_100_fee_amount: (base + 3).to_string(),
+            refund_with_claim_1_fee_amount: base.to_string(),
+            refund_with_claim_10_fee_amount: (base + 1).to_string(),
+            refund_with_claim_50_fee_amount: (base + 2).to_string(),
+            refund_with_claim_100_fee_amount: (base + 3).to_string(),
+        }
+    }
+
+    fn test_runtime_configuration(
+        schedule: Option<BatchClaimFeeSchedule>,
+    ) -> RuntimeConfigurationUpdate {
+        RuntimeConfigurationUpdate {
+            profile: "amoy".to_string(),
+            token: "0x1000000000000000000000000000000000000001".to_string(),
+            batch_contract: CANONICAL_BATCH_SETTLEMENT_CONTRACT.to_string(),
+            seller_settlement_fee_amount: "1".to_string(),
+            deposit_fee_amount: "2".to_string(),
+            claim_fee_amount: "3".to_string(),
+            settle_fee_amount: "4".to_string(),
+            refund_fee_amount: "5".to_string(),
+            claim_fee_schedule: schedule,
+            terms_version: "terms-draft".to_string(),
+            privacy_version: "privacy-draft".to_string(),
+            asset_boundary_version: "asset-draft".to_string(),
+        }
+    }
+
+    #[test]
+    fn runtime_configuration_is_all_or_nothing_and_none_clears_schedule() {
+        clear_env_values();
+        set_runtime_configuration(test_runtime_configuration(Some(test_fee_schedule(10)))).unwrap();
+        assert_eq!(env(BATCH_CLAIM_100_FEE_ENV).unwrap(), "13");
+        assert_eq!(env(BATCH_LEGACY_FEE_ENV).unwrap(), "13");
+
+        let mut invalid = test_runtime_configuration(Some(test_fee_schedule(20)));
+        invalid
+            .claim_fee_schedule
+            .as_mut()
+            .unwrap()
+            .claim_50_fee_amount = "1".to_string();
+        assert!(set_runtime_configuration(invalid).is_err());
+        assert_eq!(env(BATCH_CLAIM_100_FEE_ENV).unwrap(), "13");
+        assert_eq!(env(BATCH_DEPOSIT_FEE_ENV).unwrap(), "2");
+
+        let mut replacement = test_runtime_configuration(None);
+        replacement.deposit_fee_amount = "22".to_string();
+        set_runtime_configuration(replacement).unwrap();
+        assert_eq!(env(BATCH_DEPOSIT_FEE_ENV).unwrap(), "22");
+        assert!(configured_batch_claim_fee_schedule().unwrap().is_none());
+        assert_eq!(env(BATCH_LEGACY_FEE_ENV).unwrap(), "3");
+    }
+
+    #[test]
+    fn legacy_batch_fee_profile_rejects_partial_schedule_without_writes() {
+        clear_env_values();
+        set_env_value(BATCH_DEPOSIT_FEE_ENV, "2");
+        set_env_value(BATCH_CLAIM_FEE_ENV, "3");
+        set_env_value(BATCH_SETTLE_FEE_ENV, "4");
+        set_env_value(BATCH_REFUND_FEE_ENV, "5");
+        set_env_value(BATCH_LEGACY_FEE_ENV, "6");
+        set_env_value(BATCH_CLAIM_1_FEE_ENV, "10");
+
+        let result = set_batch_fee_profile(BatchFeeProfileUpdate {
+            deposit_fee_amount: "12".to_string(),
+            claim_fee_amount: "13".to_string(),
+            settle_fee_amount: "14".to_string(),
+            refund_fee_amount: "15".to_string(),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(env(BATCH_DEPOSIT_FEE_ENV).unwrap(), "2");
+        assert_eq!(env(BATCH_CLAIM_FEE_ENV).unwrap(), "3");
+        assert_eq!(env(BATCH_SETTLE_FEE_ENV).unwrap(), "4");
+        assert_eq!(env(BATCH_REFUND_FEE_ENV).unwrap(), "5");
+        assert_eq!(env(BATCH_LEGACY_FEE_ENV).unwrap(), "6");
+    }
+
+    #[test]
+    fn legacy_batch_fee_profile_keeps_effective_claim_100_fee() {
+        clear_env_values();
+        set_env_value("NETWORK_PROFILE", "amoy");
+        let schedule = test_fee_schedule(10);
+        for (name, value) in batch_claim_fee_schedule_values(&schedule) {
+            set_env_value(name, value);
+        }
+        set_batch_fee_profile(BatchFeeProfileUpdate {
+            deposit_fee_amount: "22".to_string(),
+            claim_fee_amount: "23".to_string(),
+            settle_fee_amount: "24".to_string(),
+            refund_fee_amount: "25".to_string(),
+        })
+        .unwrap();
+        assert_eq!(env(BATCH_LEGACY_FEE_ENV).unwrap(), "13");
+
+        clear_batch_claim_fee_schedule_values();
+        set_batch_fee_profile(BatchFeeProfileUpdate {
+            deposit_fee_amount: "32".to_string(),
+            claim_fee_amount: "33".to_string(),
+            settle_fee_amount: "34".to_string(),
+            refund_fee_amount: "35".to_string(),
+        })
+        .unwrap();
+        assert_eq!(env(BATCH_LEGACY_FEE_ENV).unwrap(), "33");
+    }
+
+    #[test]
+    fn stale_checking_recovery_refunds_once_and_releases_state() {
+        clear_settlement_state();
+        clear_seller_credits();
+        let seller = PAY_TO.to_ascii_lowercase();
+        add_seller_credit(&seller, 75);
+        let record = SettlementRecord::checking(
+            PAYER.to_ascii_lowercase(),
+            seller.clone(),
+            "100".to_string(),
+            now_seconds().saturating_sub(601),
+            60,
+        )
+        .with_metadata("exact", Some("25".to_string()), None);
+        insert_settlement("stale-key", record);
+        assert!(acquire_active_settlement(PAYER, "stale-key"));
+
+        let recovered = recover_stale_settlement("stale-key".to_string()).unwrap();
+
+        assert_eq!(recovered.refunded_fee, "25");
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+        assert!(get_settlement("stale-key").is_none());
+        assert!(get_active_settlement_by_key("stale-key").is_none());
+        assert!(recover_stale_settlement("stale-key".to_string()).is_err());
+        assert_eq!(seller_credit_balance_for(&seller), 100);
+    }
+
+    #[test]
+    fn settlement_replacement_preserves_creation_time_and_single_index_entry() {
+        clear_settlements();
+        let first = SettlementRecord::checking(
+            PAYER.to_string(),
+            PAY_TO.to_string(),
+            "10".to_string(),
+            10,
+            60,
+        );
+        insert_settlement("same-key", first);
+        insert_settlement(
+            "same-key",
+            SettlementRecord::settled(
+                "0xtx".to_string(),
+                PAYER.to_string(),
+                PAY_TO.to_string(),
+                "10".to_string(),
+                20,
+                60,
+            ),
+        );
+        let record = get_settlement("same-key").unwrap();
+        assert_eq!(record.created_at, 10);
+        let page = seller_settlements_page(&PAY_TO.to_ascii_lowercase(), None, 20);
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|item| item.key == "same-key")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn public_acceptance_does_not_reenable_disabled_seller() {
+        clear_env_values();
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", SELLER_PRIVATE_KEY);
+        set_env_value("SELLER_TERMS_VERSION", "terms-v2");
+        set_env_value("PRIVACY_VERSION", "privacy-v2");
+        set_env_value("ASSET_BOUNDARY_VERSION", "asset-v2");
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        TEST_BATCH_SELLERS.with(|sellers| {
+            sellers.borrow_mut().insert(
+                seller.clone(),
+                BatchSeller {
+                    receiver_address: seller.clone(),
+                    status: "disabled".to_string(),
+                    created_at: 1,
+                    updated_at: 2,
+                },
+            );
+        });
+        SELLER_ACCEPTANCES.with(|items| {
+            items.borrow_mut().remove(&seller);
+        });
+        let response = seller_acceptance_challenge_http(&acceptance_challenge_request(&seller));
+        let challenge: SellerAcceptanceChallenge = serde_json::from_slice(&response.body).unwrap();
+        let accepted = seller_acceptance_submit_http(&acceptance_submission_request(
+            &challenge,
+            SELLER_PRIVATE_KEY,
+        ));
+        assert_eq!(accepted.status_code, 200);
+        TEST_BATCH_SELLERS.with(|sellers| {
+            assert_eq!(sellers.borrow().get(&seller).unwrap().status, "disabled");
+        });
+    }
+
+    #[test]
+    fn amoy_profile_allows_draft_versions_and_test_fees() {
+        set_env_value("NETWORK_PROFILE", "amoy");
+        set_env_value(
+            "AMOY_JPYC_ADDRESS",
+            "0x1000000000000000000000000000000000000001",
+        );
+        set_env_value(
+            "AMOY_BATCH_SETTLEMENT_CONTRACT",
+            "0x2000000000000000000000000000000000000002",
+        );
+        assert!(validate_env_update("SELLER_TERMS_VERSION", "2026-07-13-draft").is_ok());
+        assert!(validate_env_update("SELLER_SETTLEMENT_FEE_AMOUNT", "1").is_ok());
     }
 }
 

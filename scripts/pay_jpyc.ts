@@ -52,6 +52,20 @@ type ValidatedPaidResponse = {
   readonly status: number;
 };
 
+export function validatePaidRetrySettlements(
+  first: SettleResponse,
+  retry: SettleResponse,
+): void {
+  const firstKey = (first as SettleResponse & { extra?: { settlementKey?: string } }).extra?.settlementKey;
+  const retryKey = (retry as SettleResponse & { extra?: { settlementKey?: string } }).extra?.settlementKey;
+  if (!firstKey || !retryKey || firstKey !== retryKey) {
+    throw new Error("paid retry settlement key mismatch");
+  }
+  if (first.transaction.toLowerCase() !== retry.transaction.toLowerCase()) {
+    throw new Error("paid retry transaction hash mismatch");
+  }
+}
+
 const PAID_REPORT = "paid JPYC access granted";
 
 function readEnv(name: string): string | undefined {
@@ -321,6 +335,7 @@ export async function payJpyc(options: PayJpycOptions): Promise<PayJpycResult> {
     }
   });
   const paidRetry = await validatePaidResponse(paidRetryResponse, client, account.address, options, "paid retry");
+  validatePaidRetrySettlements(paid.settlement, paidRetry.settlement);
   return {
     ...baseResult,
     paidRetryStatus: paidRetry.status,

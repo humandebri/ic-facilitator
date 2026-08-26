@@ -16,16 +16,26 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - run: npm ci
+      - run: npm run lint:hidden-unicode
       - run: cargo test -p jpyc_x402_facilitator
       - run: cargo fmt -- --check
       - run: cargo clippy -p jpyc_x402_facilitator -- -D warnings
       - run: npm test
       - run: npm run build
+        env:
+          VITE_APP_ENV: preview
+          VITE_CHAIN_ID: "80002"
+          VITE_FACILITATOR_URL: https://preview.invalid
+          VITE_TOKEN_ADDRESS: "0x1000000000000000000000000000000000000001"
+          VITE_BATCH_SETTLEMENT_CONTRACT: "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003"
+          VITE_SELLER_TERMS_VERSION: 2026-07-13-draft
+          VITE_PRIVACY_VERSION: 2026-07-13-draft
+          VITE_ASSET_BOUNDARY_VERSION: 2026-07-13-draft
       - run: npm audit --audit-level=high
-      - run: cargo install candid-extractor --locked
-      - run: mkdir -p dist
-      - run: candid-extractor target/wasm32-unknown-unknown/release/jpyc_x402_facilitator.wasm > dist/facilitator.did
-      - run: git ls-files --error-unmatch dist/facilitator.did
-      - run: git diff --exit-code -- dist/facilitator.did
+      - run: cargo install candid-extractor --version 0.1.6 --locked
+      - run: npm run did:generate
+      - run: npm run did:check

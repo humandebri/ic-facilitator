@@ -3,11 +3,13 @@ import { describe, expect, it } from "vitest";
 import type { Hex, TransactionReceipt } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { expectedTransferFromEnv, parseTxHash, verifySettlementReceipt } from "../scripts/settlement_receipt";
+import { expectedSettlementSenderFromEnv, expectedTransferFromEnv, parseTxHash, verifySettlementReceipt } from "../scripts/settlement_receipt";
 
 const hash: Hex = "0x0000000000000000000000000000000000000000000000000000000000000402";
 const jpyc: Hex = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const payer: Hex = "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993";
+const facilitatorPrivateKey: Hex = "0x0000000000000000000000000000000000000000000000000000000000000001";
+const facilitatorAddress = privateKeyToAccount(facilitatorPrivateKey).address;
 const sampleSeller: Hex = "0x0000000000000000000000000000000000000402";
 const seller: Hex = "0x1000000000000000000000000000000000000402";
 const transferTopic: Hex = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -54,21 +56,28 @@ describe("settlement receipt", () => {
     expect(() => parseTxHash("0x1234")).toThrow("settlement tx must be");
   });
 
+  it("requires facilitator key to build expected settlement sender checks", () => {
+    expect(() => expectedSettlementSenderFromEnv({})).toThrow("missing required env: FACILITATOR_EVM_PRIVATE_KEY");
+    expect(() => expectedSettlementSenderFromEnv({ FACILITATOR_EVM_PRIVATE_KEY: "0x1234" }))
+      .toThrow("FACILITATOR_EVM_PRIVATE_KEY must be a 32-byte 0x-prefixed hex private key");
+    expect(expectedSettlementSenderFromEnv({ FACILITATOR_EVM_PRIVATE_KEY: facilitatorPrivateKey }))
+      .toBe(facilitatorAddress);
+  });
+
   it("requires seller to build expected transfer checks", () => {
-    const privateKey: Hex = "0x0000000000000000000000000000000000000000000000000000000000000001";
     expect(() => expectedTransferFromEnv({})).toThrow("missing required env: SELLER_EVM_ADDRESS");
     expect(() => expectedTransferFromEnv({ SELLER_EVM_ADDRESS: "0x0000000000000000000000000000000000000000" }))
       .toThrow("expected transfer recipient must be a non-zero EVM address");
     expect(() => expectedTransferFromEnv({ SELLER_EVM_ADDRESS: sampleSeller }))
       .toThrow("SELLER_EVM_ADDRESS must be a real seller address");
     expect(expectedTransferFromEnv({
-      BUYER_EVM_PRIVATE_KEY: privateKey,
+      BUYER_EVM_PRIVATE_KEY: facilitatorPrivateKey,
       JPYC_PRICE: "0.5",
       SELLER_EVM_ADDRESS: seller
     })).toEqual({
       amount: "500000000000000000",
       asset: jpyc,
-      from: privateKeyToAccount(privateKey).address,
+      from: facilitatorAddress,
       to: seller
     });
   });
@@ -78,6 +87,9 @@ describe("settlement receipt", () => {
       expectedTo: jpyc,
       hash,
       reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
         async getTransactionReceipt() {
           return receipt;
         }
@@ -88,12 +100,44 @@ describe("settlement receipt", () => {
       expectedTo: jpyc,
       hash,
       reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
         async getTransactionReceipt() {
           return { ...receipt, to: seller };
         }
       }
     })).rejects.toThrow("settlement tx recipient mismatch");
   });
+
+  it("verifies the expected settlement sender", async () => {
+    await expect(verifySettlementReceipt({
+      expectedFrom: payer,
+      hash,
+      reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
+        async getTransactionReceipt() {
+          return receipt;
+        }
+      }
+    })).resolves.toMatchObject({ from: payer });
+
+    await expect(verifySettlementReceipt({
+      expectedFrom: facilitatorAddress,
+      hash,
+      reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
+        async getTransactionReceipt() {
+          return receipt;
+        }
+      }
+    })).rejects.toThrow("settlement tx sender mismatch");
+  });
+
 
   it("rejects non-positive expected JPYC transfer amounts", () => {
     expect(() =>
@@ -108,6 +152,9 @@ describe("settlement receipt", () => {
     const result = await verifySettlementReceipt({
       hash,
       reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
         async getTransactionReceipt(args) {
           expect(args.hash).toBe(hash);
           return receipt;
@@ -117,6 +164,7 @@ describe("settlement receipt", () => {
 
     expect(result).toEqual({
       blockNumber: "123",
+      confirmations: "3",
       from: payer,
       gasUsed: "21000",
       hash,
@@ -136,6 +184,9 @@ describe("settlement receipt", () => {
       },
       hash,
       reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
         async getTransactionReceipt() {
           return {
             ...receipt,
@@ -165,6 +216,42 @@ describe("settlement receipt", () => {
     });
   });
 
+  it("rejects removed JPYC transfer logs", async () => {
+    const amount = "1000000000000000000";
+    await expect(verifySettlementReceipt({
+      expectedTransfer: {
+        amount,
+        asset: jpyc,
+        from: payer,
+        to: seller
+      },
+      hash,
+      reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
+        async getTransactionReceipt() {
+          return {
+            ...receipt,
+            logs: [
+              {
+                address: jpyc,
+                blockHash: receipt.blockHash,
+                blockNumber: receipt.blockNumber,
+                data: uint256(BigInt(amount)),
+                logIndex: 0,
+                removed: true,
+                topics: [transferTopic, topicAddress(payer), topicAddress(seller)],
+                transactionHash: hash,
+                transactionIndex: receipt.transactionIndex
+              }
+            ]
+          };
+        }
+      }
+    })).rejects.toThrow("expected JPYC transfer log not found in settlement receipt");
+  });
+
   it("accepts uppercase transfer topics from RPC responses", async () => {
     const amount = "1000000000000000000";
     const upperTopic = `0x${transferTopic.slice(2).toUpperCase()}`;
@@ -180,6 +267,9 @@ describe("settlement receipt", () => {
       },
       hash,
       reader: {
+        async getBlockNumber() {
+          return 125n;
+        },
         async getTransactionReceipt() {
           return {
             ...receipt,
@@ -209,6 +299,9 @@ describe("settlement receipt", () => {
       verifySettlementReceipt({
         hash,
         reader: {
+          async getBlockNumber() {
+            return 125n;
+          },
           async getTransactionReceipt() {
             return {
               ...receipt,
@@ -225,6 +318,9 @@ describe("settlement receipt", () => {
       verifySettlementReceipt({
         hash,
         reader: {
+          async getBlockNumber() {
+            return 125n;
+          },
           async getTransactionReceipt() {
             return { ...receipt, status: "reverted" };
           }
@@ -244,11 +340,31 @@ describe("settlement receipt", () => {
         },
         hash,
         reader: {
+          async getBlockNumber() {
+            return 125n;
+          },
           async getTransactionReceipt() {
             return receipt;
           }
         }
       })
     ).rejects.toThrow("expected JPYC transfer log not found");
+  });
+
+  it("rejects receipts below the minimum confirmation count", async () => {
+    await expect(
+      verifySettlementReceipt({
+        hash,
+        minConfirmations: 3,
+        reader: {
+          async getBlockNumber() {
+            return 124n;
+          },
+          async getTransactionReceipt() {
+            return receipt;
+          }
+        }
+      })
+    ).rejects.toThrow("settlement tx confirmations below minimum: 2 < 3");
   });
 });
