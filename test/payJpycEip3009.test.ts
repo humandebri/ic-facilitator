@@ -17,6 +17,21 @@ const jpycAsset = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const sellerAddress = "0x1000000000000000000000000000000000000402";
 const atomicAmount = "1000000000000000000";
 const eip712Version = "1";
+const sellerAuthorization = {
+  version: 1,
+  scheme: "eip191",
+  seller: sellerAddress,
+  payer: buyerAddress,
+  amount: atomicAmount,
+  asset: jpycAsset,
+  network: "eip155:137",
+  resource: targetUrl,
+  validAfter: "0",
+  validBefore: "9999999999",
+  authorizationNonce: `0x${"22".repeat(32)}`,
+  expiresAt: "9999999999",
+  signature: `0x${"11".repeat(65)}`
+};
 
 const paymentRequired: PaymentRequired = {
   x402Version: 2,
@@ -37,7 +52,8 @@ const paymentRequired: PaymentRequired = {
       extra: {
         assetTransferMethod: "eip3009",
         name: "JPY Coin",
-        version: eip712Version
+        version: eip712Version,
+        sellerAuthorization
       }
     }
   ]
@@ -115,6 +131,7 @@ describe("payJpyc EIP-3009 payload", () => {
 
     expect(callCount).toBe(2);
     expect(decoded.accepted).toEqual(paymentRequired.accepts[0]);
+    expect(decoded.accepted.extra?.sellerAuthorization).toEqual(sellerAuthorization);
     expect(property(decoded.payload, "permit2Authorization")).toBeUndefined();
     expect(lower(property(authorization, "from"), "authorization.from")).toBe(buyerAddress.toLowerCase());
     expect(lower(property(authorization, "to"), "authorization.to")).toBe(sellerAddress.toLowerCase());

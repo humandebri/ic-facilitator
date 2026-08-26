@@ -16,7 +16,7 @@ const jpyc: Hex = "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB";
 const transferTopic: Hex = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const facilitatorKeyEnv = ["FACILITATOR", "EVM", "PRIVATE", "KEY"].join("_");
 const envNamesOutput = `(
-  vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_SERVICES"; "SELLER_CREDIT_PAY_TO"; "SELLER_CREDIT_TOPUP_AMOUNT"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLEMENT_CACHE_TTL_SECONDS";},
+  vec { "${facilitatorKeyEnv}"; "FACILITATOR_MAX_GAS"; "FACILITATOR_MAX_SETTLEMENT_FEE_WEI"; "FACILITATOR_PUBLIC_ORIGIN"; "JPYC_EIP712_VERSION"; "POLYGON_RPC_SERVICES"; "SELLER_CREDIT_PAY_TO"; "SELLER_CREDIT_TOPUP_AMOUNT"; "SELLER_SETTLEMENT_FEE_AMOUNT"; "SETTLE_CONFIRMATION_TIMEOUT_SECONDS"; "SETTLE_MIN_CONFIRMATIONS"; "SETTLEMENT_CACHE_TTL_SECONDS";},
 )`;
 
 const paymentRequired: PaymentRequired = {
@@ -84,6 +84,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
       JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
@@ -99,6 +100,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
       JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
@@ -113,6 +115,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
       JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
@@ -128,6 +131,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
       JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,
@@ -168,6 +172,7 @@ describe("jpyc readiness", () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BUYER_EVM_PRIVATE_KEY: privateKey,
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
       JPYC_EIP712_VERSION: "1",
       JPYC_POLYGON_ADDRESS: jpyc,
       POLYGON_RPC_URL: "https://polygon.example",
@@ -186,6 +191,7 @@ describe("jpyc readiness", () => {
   it("does not mark settlement verified without the buyer key", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
       JPYC_EIP712_VERSION: "1",
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: seller,

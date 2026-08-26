@@ -14,7 +14,7 @@ pub fn strip_0x(value: &str) -> &str {
 
 pub fn parse_hex(value: &str, expected_len: Option<usize>) -> Result<Vec<u8>, String> {
     let raw = strip_0x(value);
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return Err("hex length must be even".to_string());
     }
     let bytes = hex::decode(raw).map_err(|_| "invalid hex".to_string())?;
@@ -85,7 +85,7 @@ pub fn parse_u256_hex(value: &str, label: &str) -> Result<[u8; 32], String> {
     if raw.is_empty() {
         return Ok([0u8; 32]);
     }
-    let padded = if raw.len() % 2 == 0 {
+    let padded = if raw.len().is_multiple_of(2) {
         raw.to_string()
     } else {
         format!("0{raw}")

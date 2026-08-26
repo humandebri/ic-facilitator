@@ -12,6 +12,7 @@ import {
   hasInstalledRustTarget,
   isEvmAddress,
   isHttpUrl,
+  isHttpsOrigin,
   isPositiveIntegerString,
   isPrivateKey,
   isSingleHttpsRpcServices,
@@ -19,6 +20,18 @@ import {
 } from "../scripts/doctor";
 
 const privateKey = `0x${"1".repeat(64)}`;
+
+function canisterEnv(publicOrigin: string): NodeJS.ProcessEnv {
+  return {
+    FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+    FACILITATOR_PUBLIC_ORIGIN: publicOrigin,
+    JPYC_EIP712_VERSION: "1",
+    POLYGON_RPC_SERVICES: "https://polygon.example",
+    SELLER_CREDIT_PAY_TO: "0x2000000000000000000000000000000000000402",
+    SELLER_CREDIT_TOPUP_AMOUNT: "1000",
+    SELLER_SETTLEMENT_FEE_AMOUNT: "100"
+  };
+}
 
 describe("doctor helpers", () => {
   it("parses supported modes", () => {
@@ -60,12 +73,14 @@ describe("doctor helpers", () => {
       FACILITATOR_EVM_PRIVATE_KEY: "0x1",
       FACILITATOR_MAX_GAS: "0",
       FACILITATOR_MAX_SETTLEMENT_FEE_WEI: "0",
+      FACILITATOR_PUBLIC_ORIGIN: "http://canister.example.test",
       JPYC_POLYGON_ADDRESS: "0x402",
       POLYGON_RPC_SERVICES: "http://polygon.example",
       SELLER_CREDIT_PAY_TO: "0x402",
       SELLER_CREDIT_TOPUP_AMOUNT: "0",
       SELLER_SETTLEMENT_FEE_AMOUNT: "1.5",
       SETTLE_CONFIRMATION_TIMEOUT_SECONDS: "0",
+      SETTLE_MIN_CONFIRMATIONS: "0",
       SETTLEMENT_CACHE_TTL_SECONDS: "1.5"
     }, "canister");
 
@@ -74,11 +89,30 @@ describe("doctor helpers", () => {
     expect(checks.some((check) => check.name === "env-format:POLYGON_RPC_SERVICES")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_MAX_GAS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:FACILITATOR_MAX_SETTLEMENT_FEE_WEI")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:FACILITATOR_PUBLIC_ORIGIN")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_PAY_TO")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SELLER_CREDIT_TOPUP_AMOUNT")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SELLER_SETTLEMENT_FEE_AMOUNT")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLE_CONFIRMATION_TIMEOUT_SECONDS")).toBe(true);
+    expect(checks.some((check) => check.name === "env-format:SETTLE_MIN_CONFIRMATIONS")).toBe(true);
     expect(checks.some((check) => check.name === "env-format:SETTLEMENT_CACHE_TTL_SECONDS")).toBe(true);
+  }, 10_000);
+
+  it("validates facilitator public origin as a strict HTTPS origin", () => {
+    expect(isHttpsOrigin("https://canister.example.test")).toBe(true);
+    expect(isHttpsOrigin("https://canister.example.test:443")).toBe(true);
+
+    for (const origin of [
+      "https://trusted.example@evil.example",
+      "https://canister.example.test/path",
+      "https://canister.example.test?x=1",
+      "https://canister.example.test#x"
+    ]) {
+      expect(isHttpsOrigin(origin)).toBe(false);
+    }
+
+    const checks = collectChecks(".", canisterEnv("https://trusted.example@evil.example"), "canister");
+    expect(checks.some((check) => check.name === "env-format:FACILITATOR_PUBLIC_ORIGIN")).toBe(true);
   }, 10_000);
 
   it("validates optional buyer env formats", () => {
@@ -125,6 +159,7 @@ describe("doctor helpers", () => {
         env: {
           ...process.env,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
+          FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
           JPYC_EIP712_VERSION: "1",
           POLYGON_RPC_SERVICES: "https://polygon.example",
@@ -145,6 +180,7 @@ describe("doctor helpers", () => {
       expect(output).toContain('"SELLER_SETTLEMENT_FEE_AMOUNT", "100"');
       expect(output).toContain('"FACILITATOR_MAX_GAS", "500000"');
       expect(output).toContain('"FACILITATOR_MAX_SETTLEMENT_FEE_WEI", "30000000000000000"');
+      expect(output).toContain('"FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test"');
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }

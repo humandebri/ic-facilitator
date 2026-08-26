@@ -2,6 +2,7 @@
 use candid::{CandidType, Deserialize as CandidDeserialize};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +87,8 @@ pub struct SettleResponse {
     pub error_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]

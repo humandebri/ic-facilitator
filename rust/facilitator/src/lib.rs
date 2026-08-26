@@ -10,15 +10,23 @@ mod types;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use candid::CandidType;
+use candid::{CandidType, Deserialize as CandidDeserialize};
 use ic_cdk::{post_upgrade, pre_upgrade, query, update};
+use ic_stable_structures::{
+    memory_manager::{MemoryId, MemoryManager, VirtualMemory},
+    DefaultMemoryImpl, StableBTreeMap,
+};
 use k256::ecdsa::SigningKey;
 use serde::Serialize;
 
-use crate::facilitator::{failed_settlement, supported, validate_request};
+use crate::eip712::recover_eip191_signer;
+use crate::facilitator::{
+    failed_settlement, supported, validate_request, validate_request_before_signature,
+    validate_request_signature,
+};
 use crate::hexutil::{
-    address_hex, keccak256, parse_address, parse_hex, JPYC_EIP712_NAME, JPYC_POLYGON_ADDRESS,
-    NETWORK,
+    address_hex, keccak256, parse_address, parse_hex, same_address, JPYC_EIP712_NAME,
+    JPYC_POLYGON_ADDRESS, NETWORK,
 };
 use crate::rpc::{
     pending_nonce, refresh_settlement, send_settlement, ExpectedTransfer, RpcConfig,
@@ -34,10 +42,20 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_GAS: u128 = 500_000;
 const DEFAULT_MAX_SETTLEMENT_FEE_WEI: u128 = 30_000_000_000_000_000;
 const DEFAULT_CONFIRMATION_TIMEOUT_SECONDS: u64 = 60;
+const DEFAULT_MIN_CONFIRMATIONS: u64 = 3;
 const DEFAULT_SETTLEMENT_CACHE_TTL_SECONDS: u64 = 86_400;
 const GAS_TOO_EXPENSIVE_MESSAGE: &str = "estimated POL settlement fee exceeds configured cap";
+const SELLER_AUTH_MESSAGE_PREFIX: &str = "IC_JPYC_X402_SELLER_AUTH_V1";
 
-#[derive(Clone, Debug, CandidType, candid::Deserialize)]
+type Memory = VirtualMemory<DefaultMemoryImpl>;
+const ENV_MEM_ID: MemoryId = MemoryId::new(0);
+const SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(1);
+const SELLER_CREDITS_MEM_ID: MemoryId = MemoryId::new(2);
+const CREDITED_SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(3);
+const ACTIVE_SETTLEMENTS_MEM_ID: MemoryId = MemoryId::new(4);
+const NONCES_MEM_ID: MemoryId = MemoryId::new(5);
+
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct StableState {
     env: BTreeMap<String, String>,
     settlements: BTreeMap<String, SettlementRecord>,
@@ -48,28 +66,36 @@ struct StableState {
 }
 
 thread_local! {
-    static ENV: RefCell<BTreeMap<String, String>> = RefCell::new(BTreeMap::new());
-    static SETTLEMENTS: RefCell<BTreeMap<String, SettlementRecord>> = RefCell::new(BTreeMap::new());
-    static SELLER_CREDITS: RefCell<BTreeMap<String, SellerCredit>> = RefCell::new(BTreeMap::new());
-    static CREDITED_SETTLEMENTS: RefCell<BTreeMap<String, String>> = RefCell::new(BTreeMap::new());
-    static ACTIVE_SETTLEMENTS: RefCell<BTreeMap<String, ActiveSettlement>> = RefCell::new(BTreeMap::new());
-    static NONCES: RefCell<BTreeMap<String, NonceState>> = RefCell::new(BTreeMap::new());
+    static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
+        RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
+    static ENV: RefCell<StableBTreeMap<String, String, Memory>> =
+        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(ENV_MEM_ID))));
+    static SETTLEMENTS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(SETTLEMENTS_MEM_ID))));
+    static SELLER_CREDITS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(SELLER_CREDITS_MEM_ID))));
+    static CREDITED_SETTLEMENTS: RefCell<StableBTreeMap<String, String, Memory>> =
+        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(CREDITED_SETTLEMENTS_MEM_ID))));
+    static ACTIVE_SETTLEMENTS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(ACTIVE_SETTLEMENTS_MEM_ID))));
+    static NONCES: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> =
+        RefCell::new(StableBTreeMap::init(MEMORY_MANAGER.with(|m| m.borrow().get(NONCES_MEM_ID))));
 }
 
-#[derive(Clone, Debug, CandidType, candid::Deserialize)]
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct SellerCredit {
     credit_atoms: u128,
     updated_at: u64,
 }
 
-#[derive(Clone, Debug, CandidType, candid::Deserialize)]
+#[derive(Clone, Debug, CandidType, CandidDeserialize)]
 struct ActiveSettlement {
     key: String,
     nonce: Option<u128>,
     tx: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, CandidType, candid::Deserialize)]
+#[derive(Clone, Debug, Default, CandidType, CandidDeserialize)]
 struct NonceState {
     next_nonce: Option<u128>,
 }
@@ -108,7 +134,6 @@ fn http_request(request: HttpRequest) -> HttpResponse {
 async fn http_request_update(request: HttpRequest) -> HttpResponse {
     match (request.method.as_str(), path(&request.url).as_str()) {
         ("GET", "/seller-credit") => seller_credit_http(request).await,
-        ("POST", "/verify") => verify_http(request).await,
         ("POST", "/settle") => settle_http(request).await,
         _ => route(request, true),
     }
@@ -120,9 +145,7 @@ fn set_env(name: String, value: String) {
     if !ic_cdk::api::is_controller(&caller) {
         ic_cdk::trap("caller is not a controller");
     }
-    ENV.with(|env| {
-        env.borrow_mut().insert(name, value);
-    });
+    set_env_value(&name, &value);
 }
 
 #[query]
@@ -131,38 +154,222 @@ fn env_names() -> Vec<String> {
     if !ic_cdk::api::is_controller(&caller) {
         ic_cdk::trap("caller is not a controller");
     }
-    ENV.with(|env| env.borrow().keys().cloned().collect())
+    ENV.with(|env| {
+        env.borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    })
 }
 
 #[pre_upgrade]
-fn pre_upgrade() {
-    let env = ENV.with(|items| items.borrow().clone());
-    let settlements = SETTLEMENTS.with(|items| items.borrow().clone());
-    let seller_credits = SELLER_CREDITS.with(|items| items.borrow().clone());
-    let credited_settlements = CREDITED_SETTLEMENTS.with(|items| items.borrow().clone());
-    let active_settlements = ACTIVE_SETTLEMENTS.with(|items| items.borrow().clone());
-    let nonces = NONCES.with(|items| items.borrow().clone());
-    let state = StableState {
-        env,
-        settlements,
-        seller_credits,
-        credited_settlements,
-        active_settlements: Some(active_settlements),
-        nonces: Some(nonces),
-    };
-    ic_cdk::storage::stable_save((state,)).expect("stable_save");
-}
+fn pre_upgrade() {}
 
 #[post_upgrade]
 fn post_upgrade() {
-    let (state,) = ic_cdk::storage::stable_restore::<(StableState,)>().expect("stable_restore");
-    ENV.with(|items| *items.borrow_mut() = state.env);
-    SETTLEMENTS.with(|items| *items.borrow_mut() = state.settlements);
-    SELLER_CREDITS.with(|items| *items.borrow_mut() = state.seller_credits);
-    CREDITED_SETTLEMENTS.with(|items| *items.borrow_mut() = state.credited_settlements);
-    ACTIVE_SETTLEMENTS
-        .with(|items| *items.borrow_mut() = state.active_settlements.unwrap_or_default());
-    NONCES.with(|items| *items.borrow_mut() = state.nonces.unwrap_or_default());
+    if let Ok((state,)) = ic_cdk::storage::stable_restore::<(StableState,)>() {
+        migrate_legacy_state(state);
+    }
+}
+
+fn encode_stable<T: CandidType>(value: &T) -> Vec<u8> {
+    candid::encode_one(value).expect("stable value must encode")
+}
+
+fn decode_stable<T: CandidType + for<'de> CandidDeserialize<'de>>(bytes: Vec<u8>) -> T {
+    candid::decode_one(&bytes).expect("stable value must decode")
+}
+
+fn set_env_value(name: &str, value: &str) {
+    ENV.with(|env| {
+        env.borrow_mut().insert(name.to_string(), value.to_string());
+    });
+}
+
+fn clear_env_values_runtime() {
+    ENV.with(|env| {
+        let keys = env
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut env = env.borrow_mut();
+        for key in keys {
+            env.remove(&key);
+        }
+    });
+}
+
+#[cfg(test)]
+fn remove_env_value(name: &str) {
+    ENV.with(|env| {
+        env.borrow_mut().remove(&name.to_string());
+    });
+}
+
+#[cfg(test)]
+fn clear_env_values() {
+    clear_env_values_runtime();
+}
+
+fn get_settlement(key: &str) -> Option<SettlementRecord> {
+    SETTLEMENTS.with(|items| {
+        items
+            .borrow()
+            .get(&key.to_string())
+            .map(decode_stable::<SettlementRecord>)
+    })
+}
+
+fn put_seller_credit(seller: &str, credit: SellerCredit) {
+    SELLER_CREDITS.with(|items| {
+        items
+            .borrow_mut()
+            .insert(seller.to_string(), encode_stable(&credit));
+    });
+}
+
+fn get_seller_credit(seller: &str) -> Option<SellerCredit> {
+    SELLER_CREDITS.with(|items| {
+        items
+            .borrow()
+            .get(&seller.to_string())
+            .map(decode_stable::<SellerCredit>)
+    })
+}
+
+fn put_active_settlement(from: &str, active: ActiveSettlement) {
+    ACTIVE_SETTLEMENTS.with(|items| {
+        items
+            .borrow_mut()
+            .insert(from.to_string(), encode_stable(&active));
+    });
+}
+
+fn get_active_settlement(from: &str) -> Option<ActiveSettlement> {
+    ACTIVE_SETTLEMENTS.with(|items| {
+        items
+            .borrow()
+            .get(&from.to_string())
+            .map(decode_stable::<ActiveSettlement>)
+    })
+}
+
+fn put_nonce_state(from: &str, state: NonceState) {
+    NONCES.with(|items| {
+        items
+            .borrow_mut()
+            .insert(from.to_string(), encode_stable(&state));
+    });
+}
+
+fn get_nonce_state(from: &str) -> NonceState {
+    NONCES.with(|items| {
+        items
+            .borrow()
+            .get(&from.to_string())
+            .map(decode_stable::<NonceState>)
+            .unwrap_or_default()
+    })
+}
+
+fn clear_settlements() {
+    SETTLEMENTS.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+fn clear_seller_credits() {
+    SELLER_CREDITS.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+fn clear_credited_settlements() {
+    CREDITED_SETTLEMENTS.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+fn clear_active_settlements() {
+    ACTIVE_SETTLEMENTS.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+fn clear_nonces() {
+    NONCES.with(|items| {
+        let keys = items
+            .borrow()
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for key in keys {
+            items.remove(&key);
+        }
+    });
+}
+
+fn migrate_legacy_state(state: StableState) {
+    clear_env_values_runtime();
+    clear_settlements();
+    clear_seller_credits();
+    clear_credited_settlements();
+    clear_active_settlements();
+    clear_nonces();
+    for (key, value) in state.env {
+        set_env_value(&key, &value);
+    }
+    for (key, record) in state.settlements {
+        insert_settlement(&key, record);
+    }
+    for (key, credit) in state.seller_credits {
+        put_seller_credit(&key, credit);
+    }
+    for (key, seller) in state.credited_settlements {
+        CREDITED_SETTLEMENTS.with(|items| {
+            items.borrow_mut().insert(key, seller);
+        });
+    }
+    for (key, active) in state.active_settlements.unwrap_or_default() {
+        put_active_settlement(&key, active);
+    }
+    for (key, nonce) in state.nonces.unwrap_or_default() {
+        put_nonce_state(&key, nonce);
+    }
 }
 
 fn route(request: HttpRequest, updated: bool) -> HttpResponse {
@@ -191,7 +398,7 @@ fn route(request: HttpRequest, updated: bool) -> HttpResponse {
                 json_response(400, &retryable_error("invalid_request", &message, false))
             })
         }
-        ("POST", "/verify") | ("POST", "/settle") if !updated => HttpResponse {
+        ("POST", "/settle") if !updated => HttpResponse {
             status_code: 202,
             headers: vec![HeaderField(
                 "content-type".to_string(),
@@ -202,16 +409,6 @@ fn route(request: HttpRequest, updated: bool) -> HttpResponse {
         },
         _ => text_response(404, "not found"),
     }
-}
-
-async fn verify_http(request: HttpRequest) -> HttpResponse {
-    let mut trace = CostTrace::for_request(&request);
-    trace.step("verify.unsupported", 0);
-    json_response_with_cost(
-        501,
-        &retryable_error("unsupported", "verify is disabled; use settle", false),
-        &trace,
-    )
 }
 
 async fn settle_http(request: HttpRequest) -> HttpResponse {
@@ -228,15 +425,56 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         }
     };
     trace.step("settle.parse", 0);
-    let payer = match validate_request(&body) {
+    let untrusted_payer = body.payment_payload.payload.authorization.from.clone();
+    if let Err(err) = validate_request_before_signature(&body) {
+        trace.step("settle.cheap_validation", 0);
+        let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
+        return json_response_with_cost(402, &response, &trace);
+    }
+    trace.step("settle.cheap_validation", 0);
+    let eip712_version = match env("JPYC_EIP712_VERSION") {
+        Ok(value) => value,
+        Err(message) => {
+            trace.step("settle.version_config", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_config", &message, Some(untrusted_payer)),
+                &trace,
+            );
+        }
+    };
+    trace.step("settle.version_config", 0);
+    if let Err(err) = validate_eip712_version(&body, &eip712_version) {
+        trace.step("settle.version_validation", 0);
+        return json_response_with_cost(
+            402,
+            &failed_settlement(NETWORK, &err.reason, &err.message, err.payer),
+            &trace,
+        );
+    }
+    trace.step("settle.version_validation", 0);
+    if let Err(message) = validate_seller_authorization(&body) {
+        trace.step("settle.seller_authorization", 0);
+        return json_response_with_cost(
+            402,
+            &settle_error(
+                "invalid_seller_authorization",
+                &message,
+                Some(untrusted_payer),
+            ),
+            &trace,
+        );
+    }
+    trace.step("settle.seller_authorization", 0);
+    let payer = match validate_request_signature(&body) {
         Ok(payer) => payer,
         Err(err) => {
-            trace.step("settle.local_validation", 0);
+            trace.step("settle.signature_validation", 0);
             let response = failed_settlement(NETWORK, &err.reason, &err.message, err.payer);
             return json_response_with_cost(402, &response, &trace);
         }
     };
-    trace.step("settle.local_validation", 0);
+    trace.step("settle.signature_validation", 0);
     let key = match settlement_key(&body) {
         Ok(key) => key,
         Err(message) => {
@@ -250,7 +488,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     };
     trace.step("settle.key", 0);
     purge_expired_settlements(now_seconds());
-    if let Some(existing) = SETTLEMENTS.with(|items| items.borrow().get(&key).cloned()) {
+    if let Some(existing) = get_settlement(&key) {
         return cached_settlement_response(&key, existing, &body, &mut trace).await;
     }
     let private_key = match env("FACILITATOR_EVM_PRIVATE_KEY") {
@@ -276,13 +514,25 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         }
     };
     trace.step("settle.config", 0);
-    if !acquire_active_settlement(&from, &key) {
+    let active_scope = match active_settlement_scope(&from, &body.payment_requirements.pay_to) {
+        Ok(value) => value,
+        Err(message) => {
+            trace.step("settle.active_scope", 0);
+            return json_response_with_cost(
+                400,
+                &settle_error("invalid_request", &message, Some(payer)),
+                &trace,
+            );
+        }
+    };
+    trace.step("settle.active_scope", 0);
+    if !acquire_active_settlement(&active_scope, &key) {
         trace.step("settle.active_lock", 0);
         return json_response_with_cost(
             429,
             &settle_error(
                 "settlement_queue_busy",
-                "another settlement is active for this facilitator address",
+                "another settlement is active for this seller",
                 Some(payer),
             ),
             &trace,
@@ -292,7 +542,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     let ttl = match settlement_cache_ttl_seconds() {
         Ok(ttl) => ttl,
         Err(message) => {
-            release_active_settlement(&from, &key);
+            release_active_settlement(&active_scope, &key);
             trace.step("settle.ttl", 0);
             return json_response_with_cost(
                 400,
@@ -305,7 +555,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     let settlement_fee = match seller_settlement_fee_amount() {
         Ok(value) => value,
         Err(message) => {
-            release_active_settlement(&from, &key);
+            release_active_settlement(&active_scope, &key);
             trace.step("settle.seller_fee_config", 0);
             return json_response_with_cost(
                 400,
@@ -316,7 +566,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     };
     trace.step("settle.seller_fee_config", 0);
     if let Err(message) = reserve_seller_credit(&body.payment_requirements.pay_to, settlement_fee) {
-        release_active_settlement(&from, &key);
+        release_active_settlement(&active_scope, &key);
         trace.step("settle.reserve_seller_credit", 0);
         return json_response_with_cost(
             402,
@@ -340,7 +590,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         Err(message) => {
             remove_settlement(&key);
             refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&from, &key);
+            release_active_settlement(&active_scope, &key);
             trace.step("settle.rpc_config", 0);
             return json_response_with_cost(
                 400,
@@ -355,7 +605,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
         Err(message) => {
             remove_settlement(&key);
             refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&from, &key);
+            release_active_settlement(&active_scope, &key);
             trace.step("settle.pending_nonce", 1);
             return json_response_with_cost(
                 502,
@@ -368,7 +618,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
     let nonce = reserve_nonce(&from, rpc_nonce);
     match send_settlement(&config, &private_key, &body, nonce).await {
         Ok(SettlementOutcome::Settled(tx)) => {
-            trace.step("settle.send_settlement", 4);
+            trace.step("settle.send_settlement", 5);
             let record = SettlementRecord::settled(
                 tx,
                 payer,
@@ -377,13 +627,13 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(&key, record.clone());
-            release_active_settlement(&from, &key);
+            let record = insert_settlement(&key, record);
+            release_active_settlement(&active_scope, &key);
             json_response_with_cost(200, &record.response, &trace)
         }
         Ok(SettlementOutcome::Pending { nonce, tx }) => {
-            trace.step("settle.send_settlement", 4);
-            update_active_broadcast(&from, &key, nonce, &tx);
+            trace.step("settle.send_settlement", 5);
+            update_active_broadcast(&active_scope, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
                 tx,
                 payer,
@@ -392,11 +642,11 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(&key, record.clone());
+            let record = insert_settlement(&key, record);
             json_response_with_cost(202, &record.response, &trace)
         }
         Ok(SettlementOutcome::Failed { tx, message }) => {
-            trace.step("settle.send_settlement", 4);
+            trace.step("settle.send_settlement", 5);
             let record = SettlementRecord::failed(
                 tx,
                 message,
@@ -405,8 +655,8 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(&key, record.clone());
-            release_active_settlement(&from, &key);
+            let record = insert_settlement(&key, record);
+            release_active_settlement(&active_scope, &key);
             json_response_with_cost(502, &record.response, &trace)
         }
         Err(SettlementSendError::GasTooExpensive) => {
@@ -414,7 +664,7 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             rollback_reserved_nonce(&from, nonce);
             remove_settlement(&key);
             refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&from, &key);
+            release_active_settlement(&active_scope, &key);
             json_response_with_cost(
                 503,
                 &settle_error("gas_too_expensive", GAS_TOO_EXPENSIVE_MESSAGE, Some(payer)),
@@ -422,11 +672,11 @@ async fn settle_http(request: HttpRequest) -> HttpResponse {
             )
         }
         Err(SettlementSendError::Other(message)) => {
-            trace.step("settle.send_settlement", 4);
+            trace.step("settle.send_settlement", 5);
             rollback_reserved_nonce(&from, nonce);
             remove_settlement(&key);
             refund_seller_credit(&body.payment_requirements.pay_to, settlement_fee);
-            release_active_settlement(&from, &key);
+            release_active_settlement(&active_scope, &key);
             json_response_with_cost(
                 502,
                 &settle_error("settlement_failed", &message, Some(payer)),
@@ -462,7 +712,7 @@ async fn cached_settlement_response(
     let refreshed = match refresh_settlement(&config, &details.tx, &expected).await {
         Ok(outcome) => outcome,
         Err(message) => {
-            trace.step("settle.refresh", 1);
+            trace.step("settle.refresh", 2);
             return json_response_with_cost(
                 502,
                 &settle_error("rpc_error", &message, Some(details.payer)),
@@ -470,7 +720,7 @@ async fn cached_settlement_response(
             );
         }
     };
-    trace.step("settle.refresh", 1);
+    trace.step("settle.refresh", 2);
     let ttl = settlement_cache_ttl_seconds();
     let ttl = match ttl {
         Ok(ttl) => ttl,
@@ -490,7 +740,7 @@ async fn cached_settlement_response(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
+            let record = insert_settlement(key, record);
             release_active_settlement_by_key(key);
             json_response_with_cost(200, &record.response, trace)
         }
@@ -516,7 +766,7 @@ async fn cached_settlement_response(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
+            let record = insert_settlement(key, record);
             release_active_settlement_by_key(key);
             json_response_with_cost(502, &record.response, trace)
         }
@@ -644,7 +894,7 @@ async fn settle_seller_credit_payment(
     };
     trace.step("seller_credit.key", 0);
     purge_expired_settlements(now_seconds());
-    if let Some(existing) = SETTLEMENTS.with(|items| items.borrow().get(&key).cloned()) {
+    if let Some(existing) = get_settlement(&key) {
         return cached_seller_credit_response(&seller, &key, existing, &body, trace).await;
     }
     let private_key = match env("FACILITATOR_EVM_PRIVATE_KEY") {
@@ -737,7 +987,7 @@ async fn settle_seller_credit_payment(
     let nonce = reserve_nonce(&from, rpc_nonce);
     match send_settlement(&config, &private_key, &body, nonce).await {
         Ok(SettlementOutcome::Settled(tx)) => {
-            trace.step("seller_credit.send_settlement", 4);
+            trace.step("seller_credit.send_settlement", 5);
             let record = SettlementRecord::settled(
                 tx,
                 payer,
@@ -746,7 +996,7 @@ async fn settle_seller_credit_payment(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(&key, record.clone());
+            let record = insert_settlement(&key, record);
             release_active_settlement(&from, &key);
             if let Err(message) = credit_seller_from_record_once(&key, &seller, &record) {
                 return json_response_with_cost(
@@ -758,7 +1008,7 @@ async fn settle_seller_credit_payment(
             seller_credit_paid_response(200, &seller, &record, trace)
         }
         Ok(SettlementOutcome::Pending { nonce, tx }) => {
-            trace.step("seller_credit.send_settlement", 4);
+            trace.step("seller_credit.send_settlement", 5);
             update_active_broadcast(&from, &key, nonce, &tx);
             let record = SettlementRecord::broadcast(
                 tx,
@@ -768,11 +1018,11 @@ async fn settle_seller_credit_payment(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(&key, record.clone());
+            let record = insert_settlement(&key, record);
             seller_credit_paid_response(202, &seller, &record, trace)
         }
         Ok(SettlementOutcome::Failed { tx, message }) => {
-            trace.step("seller_credit.send_settlement", 4);
+            trace.step("seller_credit.send_settlement", 5);
             let record = SettlementRecord::failed(
                 tx,
                 message,
@@ -781,7 +1031,7 @@ async fn settle_seller_credit_payment(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(&key, record.clone());
+            let record = insert_settlement(&key, record);
             release_active_settlement(&from, &key);
             seller_credit_paid_response(502, &seller, &record, trace)
         }
@@ -797,7 +1047,7 @@ async fn settle_seller_credit_payment(
             )
         }
         Err(SettlementSendError::Other(message)) => {
-            trace.step("seller_credit.send_settlement", 4);
+            trace.step("seller_credit.send_settlement", 5);
             rollback_reserved_nonce(&from, nonce);
             remove_settlement(&key);
             release_active_settlement(&from, &key);
@@ -846,7 +1096,7 @@ async fn cached_seller_credit_response(
     let refreshed = match refresh_settlement(&config, &details.tx, &expected).await {
         Ok(outcome) => outcome,
         Err(message) => {
-            trace.step("seller_credit.refresh", 1);
+            trace.step("seller_credit.refresh", 2);
             return json_response_with_cost(
                 502,
                 &settle_error("rpc_error", &message, Some(details.payer)),
@@ -854,7 +1104,7 @@ async fn cached_seller_credit_response(
             );
         }
     };
-    trace.step("seller_credit.refresh", 1);
+    trace.step("seller_credit.refresh", 2);
     let ttl = match settlement_cache_ttl_seconds() {
         Ok(ttl) => ttl,
         Err(_) => {
@@ -873,7 +1123,7 @@ async fn cached_seller_credit_response(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
+            let record = insert_settlement(key, record);
             release_active_settlement_by_key(key);
             if let Err(message) = credit_seller_from_record_once(key, seller, &record) {
                 return json_response_with_cost(
@@ -915,7 +1165,7 @@ async fn cached_seller_credit_response(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
+            let record = insert_settlement(key, record);
             release_active_settlement_by_key(key);
             seller_credit_paid_response(502, seller, &record, trace)
         }
@@ -935,10 +1185,13 @@ fn rpc_config() -> Result<RpcConfig, String> {
         "FACILITATOR_MAX_SETTLEMENT_FEE_WEI",
         DEFAULT_MAX_SETTLEMENT_FEE_WEI,
     )?;
+    let min_confirmations =
+        optional_positive_u64("SETTLE_MIN_CONFIRMATIONS", DEFAULT_MIN_CONFIRMATIONS)?;
     Ok(RpcConfig {
         services: env("POLYGON_RPC_SERVICES")?,
         max_gas,
         max_settlement_fee_wei,
+        min_confirmations,
     })
 }
 
@@ -1017,6 +1270,9 @@ impl CostTrace {
 }
 
 fn debug_cost_enabled(request: &HttpRequest) -> bool {
+    if env("FACILITATOR_DEBUG_COST").as_deref() != Ok("1") {
+        return false;
+    }
     let query_enabled = query_param(&request.url, "debugCost").as_deref() == Some("1");
     let header_enabled = header_value(request, "x-debug-cost")
         .map(|value| value.trim() == "1")
@@ -1120,6 +1376,190 @@ fn validate_seller_credit_seller(seller: &str, payload: &PaymentPayload) -> Resu
     Ok(())
 }
 
+fn validate_eip712_version(
+    request: &FacilitatorRequest,
+    expected: &str,
+) -> Result<(), crate::facilitator::VerifyFailure> {
+    let requirement_version = request
+        .payment_requirements
+        .extra
+        .get("version")
+        .and_then(|value| value.as_str());
+    let accepted_version = request
+        .payment_payload
+        .accepted
+        .extra
+        .get("version")
+        .and_then(|value| value.as_str());
+    if requirement_version != Some(expected) || accepted_version != Some(expected) {
+        return Err(crate::facilitator::VerifyFailure {
+            reason: "invalid_exact_evm_eip712_version".to_string(),
+            message: "EIP-712 domain version does not match JPYC_EIP712_VERSION".to_string(),
+            payer: Some(request.payment_payload.payload.authorization.from.clone()),
+        });
+    }
+    Ok(())
+}
+
+struct SellerAuthorization {
+    seller: String,
+    payer: String,
+    amount: String,
+    asset: String,
+    network: String,
+    resource: String,
+    valid_after: String,
+    valid_before: String,
+    authorization_nonce: String,
+    expires_at: String,
+    signature: String,
+}
+
+fn validate_seller_authorization(request: &FacilitatorRequest) -> Result<(), String> {
+    let authorization = seller_authorization_from_request(request)?;
+    let auth = &request.payment_payload.payload.authorization;
+    let pay_to = normalize_evm_address(
+        "paymentRequirements.payTo",
+        &request.payment_requirements.pay_to,
+    )?;
+    if authorization.seller != pay_to {
+        return Err("sellerAuthorization.seller must match paymentRequirements.payTo".to_string());
+    }
+    let payer = normalize_evm_address("authorization.from", &auth.from)?;
+    if authorization.payer != payer {
+        return Err("sellerAuthorization.payer must match authorization.from".to_string());
+    }
+    if authorization.amount != request.payment_requirements.amount
+        || authorization.amount != auth.value
+    {
+        return Err("sellerAuthorization.amount must match settlement amount".to_string());
+    }
+    let asset = normalize_evm_address(
+        "paymentRequirements.asset",
+        &request.payment_requirements.asset,
+    )?;
+    if authorization.asset != asset {
+        return Err("sellerAuthorization.asset must match paymentRequirements.asset".to_string());
+    }
+    if authorization.network != request.payment_requirements.network {
+        return Err(
+            "sellerAuthorization.network must match paymentRequirements.network".to_string(),
+        );
+    }
+    let resource = request
+        .payment_payload
+        .resource
+        .as_ref()
+        .map(|item| item.url.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "paymentPayload.resource.url is required for seller authorization".to_string()
+        })?;
+    if authorization.resource != resource {
+        return Err(
+            "sellerAuthorization.resource must match paymentPayload.resource.url".to_string(),
+        );
+    }
+    if authorization.valid_after != auth.valid_after {
+        return Err(
+            "sellerAuthorization.validAfter must match authorization.validAfter".to_string(),
+        );
+    }
+    if authorization.valid_before != auth.valid_before {
+        return Err(
+            "sellerAuthorization.validBefore must match authorization.validBefore".to_string(),
+        );
+    }
+    if authorization.authorization_nonce != auth.nonce.to_ascii_lowercase() {
+        return Err(
+            "sellerAuthorization.authorizationNonce must match authorization.nonce".to_string(),
+        );
+    }
+    let expires_at = authorization
+        .expires_at
+        .parse::<u64>()
+        .map_err(|_| "sellerAuthorization.expiresAt must be an integer string".to_string())?;
+    if expires_at < now_seconds().saturating_add(6) {
+        return Err("sellerAuthorization.expiresAt is expired".to_string());
+    }
+    let message = seller_authorization_message(&authorization);
+    let recovered = recover_eip191_signer(&message, &authorization.signature)?;
+    if !same_address(&recovered, &authorization.seller) {
+        return Err("sellerAuthorization.signature signer must match seller".to_string());
+    }
+    Ok(())
+}
+
+fn seller_authorization_from_request(
+    request: &FacilitatorRequest,
+) -> Result<SellerAuthorization, String> {
+    let value = request
+        .payment_requirements
+        .extra
+        .get("sellerAuthorization")
+        .ok_or_else(|| "paymentRequirements.extra.sellerAuthorization is required".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "sellerAuthorization must be an object".to_string())?;
+    if object.get("version").and_then(|value| value.as_u64()) != Some(1) {
+        return Err("sellerAuthorization.version must be 1".to_string());
+    }
+    if object.get("scheme").and_then(|value| value.as_str()) != Some("eip191") {
+        return Err("sellerAuthorization.scheme must be eip191".to_string());
+    }
+    Ok(SellerAuthorization {
+        seller: normalize_evm_address(
+            "sellerAuthorization.seller",
+            required_object_string(object, "seller")?,
+        )?,
+        payer: normalize_evm_address(
+            "sellerAuthorization.payer",
+            required_object_string(object, "payer")?,
+        )?,
+        amount: required_object_string(object, "amount")?.to_string(),
+        asset: normalize_evm_address(
+            "sellerAuthorization.asset",
+            required_object_string(object, "asset")?,
+        )?,
+        network: required_object_string(object, "network")?.to_string(),
+        resource: required_object_string(object, "resource")?.to_string(),
+        valid_after: required_object_string(object, "validAfter")?.to_string(),
+        valid_before: required_object_string(object, "validBefore")?.to_string(),
+        authorization_nonce: required_object_string(object, "authorizationNonce")?
+            .to_ascii_lowercase(),
+        expires_at: required_object_string(object, "expiresAt")?.to_string(),
+        signature: required_object_string(object, "signature")?.to_string(),
+    })
+}
+
+fn required_object_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(name)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("sellerAuthorization.{name} is required"))
+}
+
+fn seller_authorization_message(authorization: &SellerAuthorization) -> String {
+    [
+        SELLER_AUTH_MESSAGE_PREFIX.to_string(),
+        format!("seller={}", authorization.seller),
+        format!("payer={}", authorization.payer),
+        format!("amount={}", authorization.amount),
+        format!("asset={}", authorization.asset),
+        format!("network={}", authorization.network),
+        format!("resource={}", authorization.resource),
+        format!("validAfter={}", authorization.valid_after),
+        format!("validBefore={}", authorization.valid_before),
+        format!("authorizationNonce={}", authorization.authorization_nonce),
+        format!("expiresAt={}", authorization.expires_at),
+    ]
+    .join("\n")
+}
+
 fn normalize_evm_address(label: &str, value: &str) -> Result<String, String> {
     parse_address(value, label).map(|address| address_hex(&address))
 }
@@ -1146,26 +1586,22 @@ fn parse_positive_u128(label: &str, value: &str) -> Result<u128, String> {
 
 fn reserve_seller_credit(seller: &str, amount: u128) -> Result<(), String> {
     let seller = normalize_evm_address("seller", seller)?;
-    SELLER_CREDITS.with(|items| {
-        let mut items = items.borrow_mut();
-        let current = items
-            .get(&seller)
-            .map(|item| item.credit_atoms)
-            .unwrap_or(0);
-        if current < amount {
-            return Err(format!(
-                "seller credit is below required fee: required={amount}, current={current}"
-            ));
-        }
-        items.insert(
-            seller,
-            SellerCredit {
-                credit_atoms: current - amount,
-                updated_at: now_seconds(),
-            },
-        );
-        Ok(())
-    })
+    let current = get_seller_credit(&seller)
+        .map(|item| item.credit_atoms)
+        .unwrap_or(0);
+    if current < amount {
+        return Err(format!(
+            "seller credit is below required fee: required={amount}, current={current}"
+        ));
+    }
+    put_seller_credit(
+        &seller,
+        SellerCredit {
+            credit_atoms: current - amount,
+            updated_at: now_seconds(),
+        },
+    );
+    Ok(())
 }
 
 fn refund_seller_credit(seller: &str, amount: u128) {
@@ -1183,7 +1619,7 @@ fn credit_seller_once(settlement_key: &str, seller: &str, amount: u128) {
     };
     let should_credit = CREDITED_SETTLEMENTS.with(|items| {
         let mut items = items.borrow_mut();
-        if items.contains_key(settlement_key) {
+        if items.contains_key(&settlement_key.to_string()) {
             false
         } else {
             items.insert(settlement_key.to_string(), seller.clone());
@@ -1215,17 +1651,16 @@ fn settlement_credit_amount(record: &SettlementRecord) -> Result<u128, String> {
 }
 
 fn add_seller_credit(seller: &str, amount: u128) {
-    SELLER_CREDITS.with(|items| {
-        let mut items = items.borrow_mut();
-        let current = items.get(seller).map(|item| item.credit_atoms).unwrap_or(0);
-        items.insert(
-            seller.to_string(),
-            SellerCredit {
-                credit_atoms: current.saturating_add(amount),
-                updated_at: now_seconds(),
-            },
-        );
-    });
+    let current = get_seller_credit(seller)
+        .map(|item| item.credit_atoms)
+        .unwrap_or(0);
+    put_seller_credit(
+        seller,
+        SellerCredit {
+            credit_atoms: current.saturating_add(amount),
+            updated_at: now_seconds(),
+        },
+    );
 }
 
 #[query]
@@ -1236,14 +1671,25 @@ fn seller_credit(seller: String) -> u128 {
         .unwrap_or(0)
 }
 
+#[query]
+fn settlement(key: String) -> Option<SettlementRecord> {
+    get_settlement(&key)
+}
+
+#[query]
+fn settlement_count() -> u64 {
+    SETTLEMENTS.with(|items| items.borrow().len())
+}
+
+#[query]
+fn active_settlement_count() -> u64 {
+    ACTIVE_SETTLEMENTS.with(|items| items.borrow().len())
+}
+
 fn seller_credit_balance_for(seller: &str) -> u128 {
-    SELLER_CREDITS.with(|items| {
-        items
-            .borrow()
-            .get(seller)
-            .map(|item| item.credit_atoms)
-            .unwrap_or(0)
-    })
+    get_seller_credit(seller)
+        .map(|item| item.credit_atoms)
+        .unwrap_or(0)
 }
 
 fn payment_payload_from_header(value: &str) -> Result<PaymentPayload, String> {
@@ -1270,12 +1716,47 @@ fn header_value(request: &HttpRequest, name: &str) -> Option<String> {
 }
 
 fn request_url(request: &HttpRequest) -> Result<String, String> {
-    if request.url.starts_with("https://") || request.url.starts_with("http://") {
-        return Ok(request.url.clone());
+    let origin = public_origin()?;
+    Ok(format!("{origin}{}", request_path_and_query(&request.url)))
+}
+
+fn public_origin() -> Result<String, String> {
+    let value = env("FACILITATOR_PUBLIC_ORIGIN")?;
+    let host = value
+        .strip_prefix("https://")
+        .ok_or_else(|| "FACILITATOR_PUBLIC_ORIGIN must be an https origin".to_string())?;
+    if host.is_empty()
+        || host.contains('@')
+        || host.contains('/')
+        || host.contains('?')
+        || host.contains('#')
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err("FACILITATOR_PUBLIC_ORIGIN must be an https origin".to_string());
     }
-    let host = header_value(request, "host").ok_or_else(|| "missing host header".to_string())?;
-    let proto = header_value(request, "x-forwarded-proto").unwrap_or_else(|| "https".to_string());
-    Ok(format!("{proto}://{host}{}", request.url))
+    if let Some((hostname, port)) = host.rsplit_once(':') {
+        if hostname.is_empty()
+            || hostname.contains(':')
+            || port.is_empty()
+            || !port.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Err("FACILITATOR_PUBLIC_ORIGIN must be an https origin".to_string());
+        }
+    }
+    Ok(value)
+}
+
+fn request_path_and_query(url: &str) -> String {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return url.to_string();
+    }
+    let Some(after_scheme) = url.split_once("://").map(|(_, rest)| rest) else {
+        return "/".to_string();
+    };
+    after_scheme
+        .find('/')
+        .map(|index| after_scheme[index..].to_string())
+        .unwrap_or_else(|| "/".to_string())
 }
 
 fn query_param(url: &str, name: &str) -> Option<String> {
@@ -1291,7 +1772,7 @@ fn query_param(url: &str, name: &str) -> Option<String> {
 }
 
 fn env(name: &str) -> Result<String, String> {
-    if let Some(value) = ENV.with(|env| env.borrow().get(name).cloned()) {
+    if let Some(value) = ENV.with(|env| env.borrow().get(&name.to_string())) {
         if !value.trim().is_empty() {
             return Ok(value);
         }
@@ -1361,15 +1842,25 @@ fn settlement_key(body: &FacilitatorRequest) -> Result<String, String> {
     Ok(format!("0x{}", hex::encode(keccak256(identity.as_bytes()))))
 }
 
-fn insert_settlement(key: &str, record: SettlementRecord) {
+fn insert_settlement(key: &str, mut record: SettlementRecord) -> SettlementRecord {
+    attach_settlement_key(key, &mut record);
     SETTLEMENTS.with(|items| {
-        items.borrow_mut().insert(key.to_string(), record);
+        items
+            .borrow_mut()
+            .insert(key.to_string(), encode_stable(&record));
     });
+    record
+}
+
+fn attach_settlement_key(key: &str, record: &mut SettlementRecord) {
+    let mut extra = record.response.extra.clone().unwrap_or_default();
+    extra.insert("settlementKey".to_string(), key.to_string());
+    record.response.extra = Some(extra);
 }
 
 fn remove_settlement(key: &str) {
     SETTLEMENTS.with(|items| {
-        items.borrow_mut().remove(key);
+        items.borrow_mut().remove(&key.to_string());
     });
 }
 
@@ -1378,14 +1869,18 @@ fn purge_expired_settlements(now: u64) {
         items
             .borrow()
             .iter()
-            .filter(|(_, record)| record.is_expired(now))
-            .map(|(key, _)| key.clone())
+            .filter(|entry| {
+                let record = decode_stable::<SettlementRecord>(entry.value());
+                record.is_expired(now) && !record.is_broadcast()
+            })
+            .map(|entry| entry.key().clone())
             .collect::<Vec<_>>()
     });
     SETTLEMENTS.with(|items| {
-        items
-            .borrow_mut()
-            .retain(|_, record| !record.is_expired(now));
+        let mut items = items.borrow_mut();
+        for key in &expired_keys {
+            items.remove(key);
+        }
     });
     for key in expired_keys {
         release_active_settlement_by_key(&key);
@@ -1484,88 +1979,107 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn acquire_active_settlement(from: &str, key: &str) -> bool {
-    ACTIVE_SETTLEMENTS.with(|items| {
-        let mut items = items.borrow_mut();
-        match items.get(from) {
-            Some(active) if active.key != key => false,
-            Some(_) => true,
-            None => {
-                items.insert(
-                    from.to_string(),
-                    ActiveSettlement {
-                        key: key.to_string(),
-                        nonce: None,
-                        tx: None,
-                    },
-                );
-                true
-            }
+    match get_active_settlement(from) {
+        Some(active) if active.key != key => false,
+        Some(_) => true,
+        None => {
+            put_active_settlement(
+                from,
+                ActiveSettlement {
+                    key: key.to_string(),
+                    nonce: None,
+                    tx: None,
+                },
+            );
+            true
         }
-    })
+    }
 }
 
 fn update_active_broadcast(from: &str, key: &str, nonce: u128, tx: &str) {
-    ACTIVE_SETTLEMENTS.with(|items| {
-        let mut items = items.borrow_mut();
-        if let Some(active) = items.get_mut(from).filter(|active| active.key == key) {
-            active.nonce = Some(nonce);
-            active.tx = Some(tx.to_string());
-        }
-    });
+    if let Some(mut active) = get_active_settlement(from).filter(|active| active.key == key) {
+        active.nonce = Some(nonce);
+        active.tx = Some(tx.to_string());
+        put_active_settlement(from, active);
+    }
 }
 
+#[cfg(test)]
 fn active_nonce(from: &str, key: &str) -> Option<u128> {
+    get_active_settlement(from)
+        .filter(|active| active.key == key)
+        .and_then(|active| active.nonce)
+}
+
+fn active_nonce_by_key(key: &str) -> Option<u128> {
     ACTIVE_SETTLEMENTS.with(|items| {
-        items
-            .borrow()
-            .get(from)
-            .filter(|active| active.key == key)
-            .and_then(|active| active.nonce)
+        items.borrow().iter().find_map(|entry| {
+            let active = decode_stable::<ActiveSettlement>(entry.value());
+            (active.key == key).then_some(active.nonce).flatten()
+        })
     })
 }
 
-fn release_active_settlement(from: &str, key: &str) {
-    ACTIVE_SETTLEMENTS.with(|items| {
-        let should_remove = items
-            .borrow()
-            .get(from)
-            .map(|active| active.key == key)
-            .unwrap_or(false);
-        if should_remove {
-            items.borrow_mut().remove(from);
-        }
+fn update_active_broadcast_by_key(key: &str, nonce: u128, tx: &str) {
+    let scope = ACTIVE_SETTLEMENTS.with(|items| {
+        items.borrow().iter().find_map(|entry| {
+            let active = decode_stable::<ActiveSettlement>(entry.value());
+            (active.key == key).then(|| entry.key().clone())
+        })
     });
+    if let Some(scope) = scope {
+        update_active_broadcast(&scope, key, nonce, tx);
+    }
+}
+
+fn release_active_settlement(from: &str, key: &str) {
+    if get_active_settlement(from)
+        .map(|active| active.key == key)
+        .unwrap_or(false)
+    {
+        ACTIVE_SETTLEMENTS.with(|items| {
+            items.borrow_mut().remove(&from.to_string());
+        });
+    }
 }
 
 fn release_active_settlement_by_key(key: &str) {
     ACTIVE_SETTLEMENTS.with(|items| {
-        items.borrow_mut().retain(|_, active| active.key != key);
+        let keys = items
+            .borrow()
+            .iter()
+            .filter(|entry| decode_stable::<ActiveSettlement>(entry.value()).key == key)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut items = items.borrow_mut();
+        for from in keys {
+            items.remove(&from);
+        }
     });
 }
 
 fn reserve_nonce(from: &str, rpc_pending_nonce: u128) -> u128 {
-    NONCES.with(|items| {
-        let mut items = items.borrow_mut();
-        let state = items.entry(from.to_string()).or_default();
-        let nonce = state
-            .next_nonce
-            .map(|next| next.max(rpc_pending_nonce))
-            .unwrap_or(rpc_pending_nonce);
-        state.next_nonce = Some(nonce.saturating_add(1));
-        nonce
-    })
+    let mut state = get_nonce_state(from);
+    let nonce = state
+        .next_nonce
+        .map(|next| next.max(rpc_pending_nonce))
+        .unwrap_or(rpc_pending_nonce);
+    state.next_nonce = Some(nonce.saturating_add(1));
+    put_nonce_state(from, state);
+    nonce
 }
 
 fn rollback_reserved_nonce(from: &str, nonce: u128) {
-    NONCES.with(|items| {
-        let mut items = items.borrow_mut();
-        let Some(state) = items.get_mut(from) else {
-            return;
-        };
-        if state.next_nonce == Some(nonce.saturating_add(1)) {
-            state.next_nonce = Some(nonce);
-        }
-    });
+    let mut state = get_nonce_state(from);
+    if state.next_nonce == Some(nonce.saturating_add(1)) {
+        state.next_nonce = Some(nonce);
+        put_nonce_state(from, state);
+    }
+}
+
+fn active_settlement_scope(from: &str, seller: &str) -> Result<String, String> {
+    let seller = normalize_evm_address("seller", seller)?;
+    Ok(format!("{}|{}", from.to_ascii_lowercase(), seller))
 }
 
 #[derive(Clone, Copy)]
@@ -1609,7 +2123,7 @@ async fn maybe_replace_pending_settlement_record(
             return existing;
         }
     };
-    let from = match private_key_address(&private_key) {
+    let _from = match private_key_address(&private_key) {
         Ok(value) => value,
         Err(_) => {
             trace.step(labels.config, 0);
@@ -1617,7 +2131,7 @@ async fn maybe_replace_pending_settlement_record(
         }
     };
     trace.step(labels.config, 0);
-    let Some(nonce) = active_nonce(&from, key) else {
+    let Some(nonce) = active_nonce_by_key(key) else {
         trace.step(labels.nonce, 0);
         return existing;
     };
@@ -1639,7 +2153,7 @@ async fn maybe_replace_pending_settlement_record(
     trace.step(labels.retry_window, 0);
     match send_settlement(&config, &private_key, body, nonce).await {
         Ok(SettlementOutcome::Settled(tx)) => {
-            trace.step(labels.send, 4);
+            trace.step(labels.send, 5);
             let record = SettlementRecord::settled(
                 tx,
                 details.payer.clone(),
@@ -1648,13 +2162,13 @@ async fn maybe_replace_pending_settlement_record(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
-            release_active_settlement(&from, key);
+            let record = insert_settlement(key, record);
+            release_active_settlement_by_key(key);
             record
         }
         Ok(SettlementOutcome::Pending { nonce, tx }) => {
-            trace.step(labels.send, 4);
-            update_active_broadcast(&from, key, nonce, &tx);
+            trace.step(labels.send, 5);
+            update_active_broadcast_by_key(key, nonce, &tx);
             let record = SettlementRecord::broadcast(
                 tx,
                 details.payer,
@@ -1663,11 +2177,10 @@ async fn maybe_replace_pending_settlement_record(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
-            record
+            insert_settlement(key, record)
         }
         Ok(SettlementOutcome::Failed { tx, message }) => {
-            trace.step(labels.send, 4);
+            trace.step(labels.send, 5);
             let record = SettlementRecord::failed(
                 tx,
                 message,
@@ -1676,8 +2189,8 @@ async fn maybe_replace_pending_settlement_record(
                 now_seconds(),
                 ttl,
             );
-            insert_settlement(key, record.clone());
-            release_active_settlement(&from, key);
+            let record = insert_settlement(key, record);
+            release_active_settlement_by_key(key);
             record
         }
         Err(SettlementSendError::GasTooExpensive) => {
@@ -1685,7 +2198,7 @@ async fn maybe_replace_pending_settlement_record(
             existing
         }
         Err(SettlementSendError::Other(_)) => {
-            trace.step(labels.send, 4);
+            trace.step(labels.send, 5);
             existing
         }
     }
@@ -1703,33 +2216,20 @@ mod tests {
     const CREDIT_PAY_TO: &str = "0x2000000000000000000000000000000000000402";
 
     fn set_test_env() {
-        ENV.with(|items| {
-            let mut items = items.borrow_mut();
-            items.insert("JPYC_EIP712_VERSION".to_string(), "1".to_string());
-            items.insert(
-                "SELLER_CREDIT_PAY_TO".to_string(),
-                CREDIT_PAY_TO.to_string(),
-            );
-            items.insert("SELLER_CREDIT_TOPUP_AMOUNT".to_string(), "1000".to_string());
-            items.insert(
-                "SELLER_SETTLEMENT_FEE_AMOUNT".to_string(),
-                "100".to_string(),
-            );
-            items.insert(
-                "SELLER_CREDIT_MAX_TIMEOUT_SECONDS".to_string(),
-                "60".to_string(),
-            );
-        });
+        clear_env_values();
+        set_env_value("FACILITATOR_PUBLIC_ORIGIN", "https://canister.example.test");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("SELLER_CREDIT_PAY_TO", CREDIT_PAY_TO);
+        set_env_value("SELLER_CREDIT_TOPUP_AMOUNT", "1000");
+        set_env_value("SELLER_SETTLEMENT_FEE_AMOUNT", "100");
+        set_env_value("SELLER_CREDIT_MAX_TIMEOUT_SECONDS", "60");
     }
 
     fn seller_credit_request() -> HttpRequest {
         HttpRequest {
             method: "GET".to_string(),
             url: format!("/seller-credit?seller={SELLER}"),
-            headers: vec![HeaderField(
-                "host".to_string(),
-                "canister.example.test".to_string(),
-            )],
+            headers: vec![],
             body: vec![],
             certificate_version: None,
         }
@@ -1778,48 +2278,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_is_unsupported_without_parsing_body() {
-        let request = HttpRequest {
-            method: "POST".to_string(),
-            url: "/verify".to_string(),
-            headers: vec![],
-            body: b"{".to_vec(),
-            certificate_version: None,
-        };
-        let response = run_ready(verify_http(request));
-        assert_eq!(response.status_code, 501);
-        let value: Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(value["error"], "unsupported");
-        assert_eq!(value["message"], "verify is disabled; use settle");
-        assert_eq!(value["retryable"], false);
-        assert!(value.get("cost").is_none());
-    }
-
-    #[test]
-    fn verify_debug_cost_wraps_unsupported_response() {
-        let request = HttpRequest {
-            method: "POST".to_string(),
-            url: "/verify?debugCost=1".to_string(),
-            headers: vec![],
-            body: b"{".to_vec(),
-            certificate_version: None,
-        };
-        let response = run_ready(verify_http(request));
-        assert_eq!(response.status_code, 501);
-        let value: Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(value["result"]["error"], "unsupported");
-        assert_eq!(value["result"]["message"], "verify is disabled; use settle");
-        assert_eq!(value["result"]["retryable"], false);
-        assert_eq!(value["cost"]["rpcCalls"], 0);
-        assert_eq!(value["cost"]["steps"][0]["name"], "verify.unsupported");
-        assert_eq!(value["cost"]["steps"][0]["rpcCalls"], 0);
-    }
-
-    #[test]
     fn cost_report_is_debug_only() {
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
         let request = HttpRequest {
             method: "POST".to_string(),
-            url: "/verify?debugCost=1".to_string(),
+            url: "/settle?debugCost=1".to_string(),
             headers: vec![],
             body: vec![],
             certificate_version: None,
@@ -1832,9 +2295,10 @@ mod tests {
         assert_eq!(value["cost"]["rpcCalls"], 3);
         assert_eq!(value["cost"]["steps"][0]["name"], "test.snapshot");
 
+        remove_env_value("FACILITATOR_DEBUG_COST");
         let request = HttpRequest {
             method: "POST".to_string(),
-            url: "/verify".to_string(),
+            url: "/settle?debugCost=1".to_string(),
             headers: vec![],
             body: vec![],
             certificate_version: None,
@@ -1849,6 +2313,7 @@ mod tests {
 
     #[test]
     fn cost_debug_can_use_header() {
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
         let request = HttpRequest {
             method: "POST".to_string(),
             url: "/settle".to_string(),
@@ -1857,40 +2322,28 @@ mod tests {
             certificate_version: None,
         };
         assert!(debug_cost_enabled(&request));
+        remove_env_value("FACILITATOR_DEBUG_COST");
+        assert!(!debug_cost_enabled(&request));
     }
 
     #[test]
     fn rpc_config_uses_default_settlement_fee_cap() {
-        ENV.with(|items| {
-            let mut items = items.borrow_mut();
-            items.clear();
-            items.insert(
-                "POLYGON_RPC_SERVICES".to_string(),
-                "https://polygon.example".to_string(),
-            );
-        });
+        clear_env_values();
+        set_env_value("POLYGON_RPC_SERVICES", "https://polygon.example");
         let config = rpc_config().unwrap();
         assert_eq!(
             config.max_settlement_fee_wei,
             DEFAULT_MAX_SETTLEMENT_FEE_WEI
         );
+        assert_eq!(config.min_confirmations, DEFAULT_MIN_CONFIRMATIONS);
     }
 
     #[test]
     fn rpc_config_rejects_invalid_settlement_fee_cap() {
         for value in ["0", "not-a-number"] {
-            ENV.with(|items| {
-                let mut items = items.borrow_mut();
-                items.clear();
-                items.insert(
-                    "POLYGON_RPC_SERVICES".to_string(),
-                    "https://polygon.example".to_string(),
-                );
-                items.insert(
-                    "FACILITATOR_MAX_SETTLEMENT_FEE_WEI".to_string(),
-                    value.to_string(),
-                );
-            });
+            clear_env_values();
+            set_env_value("POLYGON_RPC_SERVICES", "https://polygon.example");
+            set_env_value("FACILITATOR_MAX_SETTLEMENT_FEE_WEI", value);
             match rpc_config() {
                 Ok(_) => panic!("invalid settlement fee cap must fail"),
                 Err(message) => assert_eq!(
@@ -1903,6 +2356,7 @@ mod tests {
 
     #[test]
     fn gas_too_expensive_response_uses_settle_response_shape() {
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
         let request = HttpRequest {
             method: "POST".to_string(),
             url: "/settle?debugCost=1".to_string(),
@@ -1945,6 +2399,36 @@ mod tests {
     }
 
     #[test]
+    fn public_origin_rejects_userinfo_path_query_fragment_and_trailing_slash() {
+        for value in [
+            "https://trusted.example@evil.example",
+            "https://canister.example.test/path",
+            "https://canister.example.test?x=1",
+            "https://canister.example.test#x",
+            "https://canister.example.test/",
+        ] {
+            clear_env_values();
+            set_env_value("FACILITATOR_PUBLIC_ORIGIN", value);
+            assert_eq!(
+                public_origin().unwrap_err(),
+                "FACILITATOR_PUBLIC_ORIGIN must be an https origin"
+            );
+        }
+    }
+
+    #[test]
+    fn public_origin_accepts_https_host_and_port() {
+        for value in [
+            "https://canister.example.test",
+            "https://canister.example.test:443",
+        ] {
+            clear_env_values();
+            set_env_value("FACILITATOR_PUBLIC_ORIGIN", value);
+            assert_eq!(public_origin().unwrap(), value);
+        }
+    }
+
+    #[test]
     fn seller_credit_seller_validation_accepts_matching_payer() {
         let seller = normalize_evm_address("seller", SELLER).unwrap();
         let payload = seller_credit_payload(SELLER);
@@ -1966,6 +2450,7 @@ mod tests {
     #[test]
     fn seller_credit_rejects_mismatched_payer_before_rpc() {
         set_test_env();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
         let mut request = seller_credit_request();
         request.url = format!("/seller-credit?seller={SELLER}&debugCost=1");
         let payload = seller_credit_payload("0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993");
@@ -1991,8 +2476,8 @@ mod tests {
     #[test]
     fn reserves_refunds_and_credits_seller_once() {
         let seller = normalize_evm_address("seller", SELLER).unwrap();
-        SELLER_CREDITS.with(|items| items.borrow_mut().clear());
-        CREDITED_SETTLEMENTS.with(|items| items.borrow_mut().clear());
+        clear_seller_credits();
+        clear_credited_settlements();
         add_seller_credit(&seller, 150);
         reserve_seller_credit(&seller, 100).unwrap();
         assert_eq!(seller_credit_balance_for(&seller), 50);
@@ -2007,11 +2492,9 @@ mod tests {
     fn credits_seller_from_settlement_record_amount_after_env_changes() {
         set_test_env();
         let seller = normalize_evm_address("seller", SELLER).unwrap();
-        SELLER_CREDITS.with(|items| items.borrow_mut().clear());
-        CREDITED_SETTLEMENTS.with(|items| items.borrow_mut().clear());
-        ENV.with(|items| {
-            items.borrow_mut().remove("SELLER_CREDIT_TOPUP_AMOUNT");
-        });
+        clear_seller_credits();
+        clear_credited_settlements();
+        remove_env_value("SELLER_CREDIT_TOPUP_AMOUNT");
         let record = SettlementRecord::settled(
             "0xtx".to_string(),
             seller.clone(),
@@ -2063,10 +2546,18 @@ mod tests {
 mod hardening_tests {
     use super::*;
     use candid::{CandidType, Deserialize as CandidDeserialize};
-    use serde_json::json;
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey};
+    use serde_json::{json, Value};
 
     const PAYER: &str = "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993";
     const PAY_TO: &str = "0x1000000000000000000000000000000000000402";
+    const PAYER_PRIVATE_KEY: &str =
+        "0x59c6995e998f97a5a0044966f094538db1f78e001b7e6f2480d4ef9f4a3a9a8e";
+    const SELLER_PRIVATE_KEY: &str =
+        "0x1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER_PRIVATE_KEY: &str =
+        "0x2222222222222222222222222222222222222222222222222222222222222222";
 
     fn request_json() -> serde_json::Value {
         json!({
@@ -2082,7 +2573,7 @@ mod hardening_tests {
                         "to": PAY_TO,
                         "value": "1000000000000000000",
                         "validAfter": "0",
-                        "validBefore": "9999999999",
+                        "validBefore": "1700000050",
                         "nonce": format!("0x{}", "22".repeat(32))
                     }
                 }
@@ -2111,6 +2602,81 @@ mod hardening_tests {
         serde_json::from_value(request_json()).unwrap()
     }
 
+    fn request_for_settle_validation() -> FacilitatorRequest {
+        let mut body = request();
+        body.payment_payload.payload.authorization.valid_before =
+            now_seconds().saturating_add(60).to_string();
+        body
+    }
+
+    fn sign_message(private_key: &str, message: &str) -> String {
+        let key = SigningKey::from_slice(&parse_hex(private_key, Some(32)).unwrap()).unwrap();
+        let digest = crate::eip712::eip191_digest(message);
+        let (signature, recovery): (Signature, RecoveryId) = key.sign_prehash(&digest).unwrap();
+        let mut bytes = Vec::with_capacity(65);
+        bytes.extend_from_slice(&signature.to_bytes());
+        bytes.push(u8::from(recovery) + 27);
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    fn sign_eip3009(body: &mut FacilitatorRequest) {
+        let key = SigningKey::from_slice(&parse_hex(PAYER_PRIVATE_KEY, Some(32)).unwrap()).unwrap();
+        let digest = crate::eip712::eip3009_digest(&body.payment_payload).unwrap();
+        let (signature, recovery): (Signature, RecoveryId) = key.sign_prehash(&digest).unwrap();
+        let mut bytes = Vec::with_capacity(65);
+        bytes.extend_from_slice(&signature.to_bytes());
+        bytes.push(u8::from(recovery) + 27);
+        body.payment_payload.payload.signature = format!("0x{}", hex::encode(bytes));
+    }
+
+    fn request_with_seller_auth() -> FacilitatorRequest {
+        let seller = private_key_address(SELLER_PRIVATE_KEY).unwrap();
+        let mut body = request_for_settle_validation();
+        body.payment_requirements.pay_to = seller.clone();
+        body.payment_payload.accepted.pay_to = seller.clone();
+        body.payment_payload.payload.authorization.to = seller.clone();
+        body.payment_payload.resource = Some(ResourceInfo {
+            url: "https://example.test/report".to_string(),
+            description: None,
+            mime_type: None,
+        });
+        let mut authorization = serde_json::json!({
+            "version": 1,
+            "scheme": "eip191",
+            "seller": seller,
+            "payer": PAYER,
+            "amount": body.payment_requirements.amount,
+            "asset": body.payment_requirements.asset,
+            "network": body.payment_requirements.network,
+            "resource": "https://example.test/report",
+            "validAfter": body.payment_payload.payload.authorization.valid_after,
+            "validBefore": body.payment_payload.payload.authorization.valid_before,
+            "authorizationNonce": body.payment_payload.payload.authorization.nonce,
+            "expiresAt": "1700000120",
+            "signature": "0x"
+        });
+        body.payment_requirements.extra["sellerAuthorization"] = authorization.clone();
+        body.payment_payload.accepted.extra = body.payment_requirements.extra.clone();
+        let parsed = seller_authorization_from_request(&body).unwrap();
+        authorization["signature"] = json!(sign_message(
+            SELLER_PRIVATE_KEY,
+            &seller_authorization_message(&parsed),
+        ));
+        body.payment_requirements.extra["sellerAuthorization"] = authorization;
+        body.payment_payload.accepted.extra = body.payment_requirements.extra.clone();
+        body
+    }
+
+    fn settle_request(body: &FacilitatorRequest) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            url: "/settle?debugCost=1".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(body).unwrap(),
+            certificate_version: None,
+        }
+    }
+
     fn http_request(body: Vec<u8>) -> HttpRequest {
         HttpRequest {
             method: "POST".to_string(),
@@ -2122,13 +2688,13 @@ mod hardening_tests {
     }
 
     fn clear_active_state() {
-        ACTIVE_SETTLEMENTS.with(|items| items.borrow_mut().clear());
-        NONCES.with(|items| items.borrow_mut().clear());
+        clear_active_settlements();
+        clear_nonces();
     }
 
     fn clear_settlement_state() {
         clear_active_state();
-        SETTLEMENTS.with(|items| items.borrow_mut().clear());
+        clear_settlements();
     }
 
     fn run_ready<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -2182,8 +2748,143 @@ mod hardening_tests {
 
         let mut body = request();
         body.payment_payload.payload.signature = "0x01".to_string();
-        let err = validate_request(&body).unwrap_err();
+        let err = validate_request_signature(&body).unwrap_err();
         assert_eq!(err.reason, "invalid_exact_evm_signature");
+    }
+
+    #[test]
+    fn eip712_version_must_match_config() {
+        let mut body = request();
+        body.payment_requirements.extra["version"] = json!("2");
+        let err = validate_eip712_version(&body, "1").unwrap_err();
+        assert_eq!(err.reason, "invalid_exact_evm_eip712_version");
+
+        let mut body = request();
+        body.payment_payload.accepted.extra["version"] = json!("2");
+        let err = validate_eip712_version(&body, "1").unwrap_err();
+        assert_eq!(err.reason, "invalid_exact_evm_eip712_version");
+
+        let body = request_for_settle_validation();
+        validate_eip712_version(&body, "1").unwrap();
+    }
+
+    #[test]
+    fn seller_authorization_requires_pay_to_signature_and_matching_fields() {
+        let body = request_for_settle_validation();
+        assert_eq!(
+            validate_seller_authorization(&body).unwrap_err(),
+            "paymentRequirements.extra.sellerAuthorization is required"
+        );
+
+        let body = request_with_seller_auth();
+        validate_seller_authorization(&body).unwrap();
+
+        let mut amount_mismatch = body.clone();
+        amount_mismatch.payment_requirements.extra["sellerAuthorization"]["amount"] =
+            json!("2000000000000000000");
+        assert_eq!(
+            validate_seller_authorization(&amount_mismatch).unwrap_err(),
+            "sellerAuthorization.amount must match settlement amount"
+        );
+
+        let mut resource_mismatch = body.clone();
+        resource_mismatch
+            .payment_payload
+            .resource
+            .as_mut()
+            .unwrap()
+            .url = "https://example.test/other".to_string();
+        assert_eq!(
+            validate_seller_authorization(&resource_mismatch).unwrap_err(),
+            "sellerAuthorization.resource must match paymentPayload.resource.url"
+        );
+
+        let mut nonce_mismatch = body.clone();
+        nonce_mismatch.payment_payload.payload.authorization.nonce =
+            format!("0x{}", "33".repeat(32));
+        assert_eq!(
+            validate_seller_authorization(&nonce_mismatch).unwrap_err(),
+            "sellerAuthorization.authorizationNonce must match authorization.nonce"
+        );
+
+        let mut expired = body.clone();
+        expired.payment_requirements.extra["sellerAuthorization"]["expiresAt"] = json!("1");
+        expired.payment_payload.accepted.extra = expired.payment_requirements.extra.clone();
+        assert_eq!(
+            validate_seller_authorization(&expired).unwrap_err(),
+            "sellerAuthorization.expiresAt is expired"
+        );
+
+        let mut signer_mismatch = body.clone();
+        let parsed = seller_authorization_from_request(&signer_mismatch).unwrap();
+        signer_mismatch.payment_requirements.extra["sellerAuthorization"]["signature"] = json!(
+            sign_message(OTHER_PRIVATE_KEY, &seller_authorization_message(&parsed))
+        );
+        signer_mismatch.payment_payload.accepted.extra =
+            signer_mismatch.payment_requirements.extra.clone();
+        assert_eq!(
+            validate_seller_authorization(&signer_mismatch).unwrap_err(),
+            "sellerAuthorization.signature signer must match seller"
+        );
+    }
+
+    #[test]
+    fn settle_rejects_missing_seller_authorization_before_credit_or_lock() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        let seller = normalize_evm_address("seller", PAY_TO).unwrap();
+        add_seller_credit(&seller, 500);
+        let body = request_for_settle_validation();
+
+        let response = run_ready(settle_http(settle_request(&body)));
+
+        assert_eq!(response.status_code, 402);
+        assert_eq!(seller_credit_balance_for(&seller), 500);
+        assert_eq!(active_settlement_count(), 0);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            value["result"]["errorReason"],
+            "invalid_seller_authorization"
+        );
+        assert_eq!(value["cost"]["rpcCalls"], 0);
+        let steps = value["cost"]["steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "settle.seller_authorization"));
+        assert!(!steps
+            .iter()
+            .any(|step| step["name"] == "settle.reserve_seller_credit"));
+    }
+
+    #[test]
+    fn settle_with_valid_seller_authorization_reaches_reserve_path() {
+        clear_settlement_state();
+        clear_seller_credits();
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
+        set_env_value("JPYC_EIP712_VERSION", "1");
+        set_env_value("FACILITATOR_EVM_PRIVATE_KEY", OTHER_PRIVATE_KEY);
+        set_env_value("SELLER_SETTLEMENT_FEE_AMOUNT", "100");
+        let mut body = request_with_seller_auth();
+        sign_eip3009(&mut body);
+        let seller = normalize_evm_address("seller", &body.payment_requirements.pay_to).unwrap();
+        add_seller_credit(&seller, 500);
+
+        let response = run_ready(settle_http(settle_request(&body)));
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(seller_credit_balance_for(&seller), 500);
+        assert_eq!(active_settlement_count(), 0);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["result"]["errorReason"], "invalid_config");
+        let steps = value["cost"]["steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "settle.reserve_seller_credit"));
+        assert!(steps.iter().any(|step| step["name"] == "settle.rpc_config"));
     }
 
     #[test]
@@ -2272,7 +2973,21 @@ mod hardening_tests {
     }
 
     #[test]
-    fn purge_expired_settlements_releases_matching_active_lock() {
+    fn active_settlement_scope_blocks_same_seller_only() {
+        clear_active_state();
+        let from = "0x0000000000000000000000000000000000000402";
+        let seller_a = "0x1000000000000000000000000000000000000402";
+        let seller_b = "0x2000000000000000000000000000000000000402";
+        let scope_a = active_settlement_scope(from, seller_a).unwrap();
+        let scope_b = active_settlement_scope(from, seller_b).unwrap();
+
+        assert!(acquire_active_settlement(&scope_a, "key-a"));
+        assert!(!acquire_active_settlement(&scope_a, "key-b"));
+        assert!(acquire_active_settlement(&scope_b, "key-b"));
+    }
+
+    #[test]
+    fn purge_expired_settlements_keeps_expired_broadcast_active_lock() {
         clear_settlement_state();
         let from = "0x0000000000000000000000000000000000000402";
         insert_settlement(
@@ -2291,8 +3006,8 @@ mod hardening_tests {
 
         purge_expired_settlements(now_seconds());
 
-        assert!(SETTLEMENTS.with(|items| items.borrow().get("key-a").is_none()));
-        assert!(acquire_active_settlement(from, "key-b"));
+        assert!(get_settlement("key-a").is_some());
+        assert!(!acquire_active_settlement(from, "key-b"));
     }
 
     #[test]
@@ -2314,14 +3029,15 @@ mod hardening_tests {
 
         purge_expired_settlements(now_seconds());
 
-        assert!(SETTLEMENTS.with(|items| items.borrow().get("key-a").is_some()));
+        assert!(get_settlement("key-a").is_some());
         assert!(!acquire_active_settlement(from, "key-b"));
     }
 
     #[test]
     fn seller_credit_pending_replacement_uses_seller_credit_trace_labels() {
         clear_settlement_state();
-        ENV.with(|items| items.borrow_mut().clear());
+        clear_env_values();
+        set_env_value("FACILITATOR_DEBUG_COST", "1");
         let existing = SettlementRecord::broadcast(
             "0xtx".to_string(),
             PAYER.to_lowercase(),

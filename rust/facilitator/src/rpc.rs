@@ -1,9 +1,7 @@
 // rust/facilitator/src/rpc.rs: EVM RPC canister 経由で Polygon の読取・署名済みtx送信を実行する。
 use candid::Principal;
 use evm_rpc_client::{EvmRpcClient, EVM_RPC_CANISTER};
-use evm_rpc_types::{
-    ConsensusStrategy, Hex, MultiRpcResult, RpcApi, RpcServices, SendRawTransactionStatus,
-};
+use evm_rpc_types::{Hex, MultiRpcResult, RpcApi, RpcServices, SendRawTransactionStatus};
 use ic_canister_runtime::IcRuntime;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -21,6 +19,7 @@ const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a116
 pub struct RpcConfig {
     pub max_gas: u128,
     pub max_settlement_fee_wei: u128,
+    pub min_confirmations: u64,
     pub services: String,
 }
 
@@ -145,7 +144,16 @@ async fn receipt_status_for_tx(
     expected: &ExpectedTransfer,
 ) -> Result<ReceiptStatus, String> {
     let result = rpc_value(config, "eth_getTransactionReceipt", json!([tx])).await?;
-    Ok(receipt_status(&result, expected))
+    if result.is_null() {
+        return Ok(ReceiptStatus::Pending);
+    }
+    let latest_block = rpc_hex_u128(config, "eth_blockNumber", json!([])).await?;
+    Ok(receipt_status(
+        &result,
+        expected,
+        latest_block,
+        config.min_confirmations,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,14 +163,27 @@ enum ReceiptStatus {
     Pending,
 }
 
-fn receipt_status(result: &Value, expected: &ExpectedTransfer) -> ReceiptStatus {
-    if result.is_null() {
-        return ReceiptStatus::Pending;
-    }
+fn receipt_status(
+    result: &Value,
+    expected: &ExpectedTransfer,
+    latest_block: u128,
+    min_confirmations: u64,
+) -> ReceiptStatus {
     match result.get("status").and_then(Value::as_str) {
         Some("0x0") => return ReceiptStatus::Failed("settlement tx failed".to_string()),
         Some("0x1") => {}
         _ => return ReceiptStatus::Pending,
+    }
+    let Some(block_number) = result
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_hex_quantity("blockNumber", value).ok())
+    else {
+        return ReceiptStatus::Pending;
+    };
+    let confirmations = latest_block.saturating_sub(block_number).saturating_add(1);
+    if confirmations < u128::from(min_confirmations) {
+        return ReceiptStatus::Pending;
     }
     let expected_to = match settle_to_address().map(|address| crate::hexutil::address_hex(&address))
     {
@@ -301,10 +322,6 @@ fn client(
     let canister_id = evm_rpc_canister_id()?;
     Ok(EvmRpcClient::builder(IcRuntime::new(), canister_id)
         .with_rpc_sources(rpc_services(&config.services)?)
-        .with_consensus_strategy(ConsensusStrategy::Threshold {
-            total: Some(1),
-            min: 1,
-        })
         .with_response_size_estimate(RESPONSE_SIZE_BYTES)
         .build())
 }
@@ -500,6 +517,7 @@ mod tests {
         };
         let success_receipt = json!({
             "status":"0x1",
+            "blockNumber":"0x64",
             "to": JPYC_POLYGON_ADDRESS,
             "logs": [{
                 "address": JPYC_POLYGON_ADDRESS,
@@ -512,28 +530,36 @@ mod tests {
             }]
         });
         assert_eq!(
-            receipt_status(&Value::Null, &expected),
-            ReceiptStatus::Pending
-        );
-        assert_eq!(
-            receipt_status(&success_receipt, &expected),
+            receipt_status(&success_receipt, &expected, 102, 3),
             ReceiptStatus::Success
         );
         assert_eq!(
-            receipt_status(&json!({"status":"0x0"}), &expected),
+            receipt_status(&success_receipt, &expected, 101, 3),
+            ReceiptStatus::Pending
+        );
+        assert_eq!(
+            receipt_status(&json!({"status":"0x0"}), &expected, 102, 3),
             ReceiptStatus::Failed("settlement tx failed".to_string())
         );
         assert_eq!(
+            receipt_status(&json!({"status":"0x1"}), &expected, 102, 3),
+            ReceiptStatus::Pending
+        );
+        assert_eq!(
             receipt_status(
-                &json!({"status":"0x1","to":JPYC_POLYGON_ADDRESS,"logs":[]}),
-                &expected
+                &json!({"status":"0x1","blockNumber":"0x64","to":JPYC_POLYGON_ADDRESS,"logs":[]}),
+                &expected,
+                102,
+                3
             ),
             ReceiptStatus::Failed("expected JPYC transfer log not found".to_string())
         );
         assert_eq!(
             receipt_status(
-                &json!({"status":"0x1","to":"0x0000000000000000000000000000000000000001","logs":[]}),
-                &expected
+                &json!({"status":"0x1","blockNumber":"0x64","to":"0x0000000000000000000000000000000000000001","logs":[]}),
+                &expected,
+                102,
+                3
             ),
             ReceiptStatus::Failed("settlement tx recipient mismatch".to_string())
         );
@@ -541,7 +567,7 @@ mod tests {
         let mut token_mismatch = success_receipt.clone();
         token_mismatch["logs"][0]["address"] = json!("0x0000000000000000000000000000000000000001");
         assert_eq!(
-            receipt_status(&token_mismatch, &expected),
+            receipt_status(&token_mismatch, &expected, 102, 3),
             ReceiptStatus::Failed("expected JPYC transfer log not found".to_string())
         );
 
@@ -549,7 +575,7 @@ mod tests {
         from_mismatch["logs"][0]["topics"][1] =
             json!("0x000000000000000000000000000000000000000000000001");
         assert_eq!(
-            receipt_status(&from_mismatch, &expected),
+            receipt_status(&from_mismatch, &expected, 102, 3),
             ReceiptStatus::Failed("expected JPYC transfer log not found".to_string())
         );
 
@@ -557,14 +583,14 @@ mod tests {
         to_mismatch["logs"][0]["topics"][2] =
             json!("0x000000000000000000000000000000000000000000000001");
         assert_eq!(
-            receipt_status(&to_mismatch, &expected),
+            receipt_status(&to_mismatch, &expected, 102, 3),
             ReceiptStatus::Failed("expected JPYC transfer log not found".to_string())
         );
 
         let mut amount_mismatch = success_receipt;
         amount_mismatch["logs"][0]["data"] = json!("0x65");
         assert_eq!(
-            receipt_status(&amount_mismatch, &expected),
+            receipt_status(&amount_mismatch, &expected, 102, 3),
             ReceiptStatus::Failed("expected JPYC transfer log not found".to_string())
         );
     }

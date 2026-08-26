@@ -28,11 +28,23 @@ pub fn supported(facilitator_address: String, eip712_version: &str) -> Supported
 }
 
 pub fn validate_request(request: &FacilitatorRequest) -> Result<String, VerifyFailure> {
+    validate_request_before_signature(request)?;
+    validate_request_signature(request)
+}
+
+pub fn validate_request_before_signature(
+    request: &FacilitatorRequest,
+) -> Result<(), VerifyFailure> {
     if request.x402_version != 2 || request.payment_payload.x402_version != 2 {
         return Err(fail("invalid_x402_version", "x402Version must be 2", None));
     }
     validate_requirements(&request.payment_requirements)?;
     validate_payload_matches_requirements(&request.payment_payload, &request.payment_requirements)?;
+    validate_time_window(&request.payment_payload, &request.payment_requirements)?;
+    Ok(())
+}
+
+pub fn validate_request_signature(request: &FacilitatorRequest) -> Result<String, VerifyFailure> {
     let recovered = recover_eip3009_signer(&request.payment_payload)
         .map_err(|message| fail("invalid_exact_evm_signature", &message, None))?;
     let payer = request.payment_payload.payload.authorization.from.clone();
@@ -43,7 +55,6 @@ pub fn validate_request(request: &FacilitatorRequest) -> Result<String, VerifyFa
             Some(payer),
         ));
     }
-    validate_time_window(&request.payment_payload, &request.payment_requirements)?;
     Ok(payer)
 }
 
@@ -61,6 +72,7 @@ pub fn failed_settlement(
         amount: None,
         error_reason: Some(reason.to_string()),
         error_message: Some(message.to_string()),
+        extra: None,
     }
 }
 
@@ -73,6 +85,7 @@ pub fn successful_settlement(tx: String, payer: String, amount: String) -> Settl
         amount: Some(amount),
         error_reason: None,
         error_message: None,
+        extra: None,
     }
 }
 

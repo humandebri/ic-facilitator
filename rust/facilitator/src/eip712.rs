@@ -35,6 +35,27 @@ pub fn recover_eip3009_signer(payload: &PaymentPayload) -> Result<String, String
     Ok(address_from_key(&key))
 }
 
+pub fn recover_eip191_signer(message: &str, signature_hex: &str) -> Result<String, String> {
+    let digest = eip191_digest(message);
+    let sig = parse_hex(signature_hex, None)?;
+    if sig.len() != 65 {
+        return Err("invalid EIP-191 signature length".to_string());
+    }
+    let signature = Signature::try_from(&sig[..64]).map_err(|_| "invalid EIP-191 signature")?;
+    let recovery = recovery_id(sig[64])?;
+    let key = VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
+        .map_err(|_| "invalid EIP-191 signature")?;
+    Ok(address_from_key(&key))
+}
+
+pub fn eip191_digest(message: &str) -> [u8; 32] {
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+    let mut bytes = Vec::with_capacity(prefix.len() + message.len());
+    bytes.extend_from_slice(prefix.as_bytes());
+    bytes.extend_from_slice(message.as_bytes());
+    keccak256(&bytes)
+}
+
 fn recovery_id(value: u8) -> Result<RecoveryId, String> {
     let normalized = match value {
         0 | 1 => value,
@@ -163,6 +184,32 @@ mod tests {
                 "0xb51afb2cba39fb1e3e2b3d1df337579896fba993"
             );
         }
+    }
+
+    #[test]
+    fn recovers_eip191_signer() {
+        let key = SigningKey::from_slice(
+            &crate::hexutil::parse_hex(
+                "0x59c6995e998f97a5a0044966f094538db1f78e001b7e6f2480d4ef9f4a3a9a8e",
+                Some(32),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let message = "IC_JPYC_X402_SELLER_AUTH_V1\nseller=0x01";
+        let digest = eip191_digest(message);
+        let (signature, recovery): (Signature, RecoveryId) = key.sign_prehash(&digest).unwrap();
+        let mut bytes = Vec::with_capacity(65);
+        bytes.extend_from_slice(&signature.to_bytes());
+        bytes.push(u8::from(recovery) + 27);
+
+        let recovered =
+            recover_eip191_signer(message, &format!("0x{}", hex::encode(bytes))).unwrap();
+
+        assert_eq!(
+            recovered.to_lowercase(),
+            "0xb51afb2cba39fb1e3e2b3d1df337579896fba993"
+        );
     }
 
     #[test]
