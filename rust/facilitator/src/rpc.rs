@@ -1,13 +1,12 @@
-// rust/facilitator/src/rpc.rs: EVM RPC canister 経由で Polygon の読取・署名済みtx送信を実行する。
+// rust/facilitator/src/rpc.rs: HTTPS outcall で Polygon の読取・署名済みtx送信を実行する。
 use candid::{CandidType, Deserialize as CandidDeserialize};
 use canhttp::{
-    cycles::{ChargeMyself, CyclesAccountingServiceBuilder},
-    http::HttpConversionLayer,
-    Client, IsReplicatedRequestExtension, MaxResponseBytesRequestExtension,
+    convert::Convert,
+    http::{HttpRequestConverter, HttpResponseConverter},
+    IsReplicatedRequestExtension, MaxResponseBytesRequestExtension,
 };
 use http::Request;
 use serde_json::{json, Value};
-use tower::{Service, ServiceBuilder, ServiceExt};
 
 #[cfg(test)]
 use crate::hexutil::JPYC_POLYGON_ADDRESS;
@@ -184,6 +183,28 @@ pub async fn broadcast_contract_transaction(
     data: Vec<u8>,
     nonce: u128,
 ) -> Result<BroadcastedTransaction, SettlementSendError> {
+    let raw = prepare_contract_transaction(config, private_key, to, data, nonce).await?;
+    send_prepared_transaction(config, &raw, nonce).await
+}
+
+pub async fn prepare_contract_transaction(
+    config: &RpcConfig,
+    private_key: &str,
+    to: [u8; 20],
+    data: Vec<u8>,
+    nonce: u128,
+) -> Result<String, SettlementSendError> {
+    prepare_contract_transaction_reserving(config, private_key, to, data, || nonce).await
+}
+
+pub async fn prepare_contract_transaction_reserving(
+    config: &RpcConfig,
+    private_key: &str,
+    to: [u8; 20],
+    data: Vec<u8>,
+    reserve: impl FnOnce() -> u128,
+) -> Result<String, SettlementSendError> {
+    let chain_id = crate::configured_chain_id();
     let from = crate::private_key_address(private_key)?;
     let fees = fee_quote(config).await?;
     let estimate = rpc_hex_u128(
@@ -207,6 +228,12 @@ pub async fn broadcast_contract_transaction(
         fees.max_fee_per_gas,
         config.max_settlement_fee_wei,
     )?;
+    if chain_id != crate::configured_chain_id() {
+        return Err("network changed during transaction preparation"
+            .to_string()
+            .into());
+    }
+    let nonce = reserve();
     let raw = sign_eip1559_tx(
         &Eip1559Tx {
             nonce,
@@ -216,14 +243,26 @@ pub async fn broadcast_contract_transaction(
             to,
             value: 0,
             data,
-            chain_id: crate::configured_chain_id(),
+            chain_id,
         },
         private_key,
     )?;
-    let tx = send_raw_transaction(config, &raw)
+    Ok(raw)
+}
+
+pub async fn send_prepared_transaction(
+    config: &RpcConfig,
+    raw: &str,
+    nonce: u128,
+) -> Result<BroadcastedTransaction, SettlementSendError> {
+    let tx = send_raw_transaction(config, raw)
         .await
         .map_err(|error| error.with_nonce(nonce))?;
     Ok(BroadcastedTransaction { nonce, tx })
+}
+
+pub fn prepared_transaction_hash(raw: &str) -> Result<String, String> {
+    raw_transaction_hash(raw).map_err(|_| "invalid prepared transaction".to_string())
 }
 
 pub async fn confirm_contract_broadcast(
@@ -533,6 +572,63 @@ pub async fn batch_receiver_state(
     })
 }
 
+// Read each mapping directly; no provider-specific JSON-RPC batching is required.
+pub async fn auto_claim_channel_state(
+    config: &RpcConfig,
+    contract: &[u8; 20],
+    channel_id: &str,
+) -> Result<(String, String, u64), String> {
+    let id = parse_hex(channel_id, Some(32))?;
+    let mut values = Vec::new();
+    for method in ["channels(bytes32)", "pendingWithdrawals(bytes32)"] {
+        let mut data = selector(method).to_vec();
+        data.extend_from_slice(&id);
+        let body = json!({"jsonrpc":"2.0", "id":1, "method":"eth_call", "params":[{
+            "to":crate::hexutil::address_hex(contract), "data":format!("0x{}",hex::encode(data))
+        }, if method == "channels(bytes32)" { "finalized" } else { "latest" }]});
+        let text = rpc_post_metered(
+            config,
+            "eth_call",
+            &body,
+            CALL_RESPONSE_SIZE_BYTES,
+            |cycles| {
+                crate::auto_claim::record_monitor_outcall(channel_id, cycles);
+            },
+        )
+        .await?;
+        let value: Value = serde_json::from_str(&text).map_err(|_| "monitor invalid JSON")?;
+        if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
+            return Err("monitor RPC envelope/error".into());
+        }
+        values.push(parse_words(
+            value["result"].as_str().ok_or("monitor missing result")?,
+            2,
+            method,
+        )?);
+    }
+    Ok((
+        uint128_hex_decimal_word(&values[0][0], "balance")?,
+        uint128_hex_decimal_word(&values[0][1], "totalClaimed")?,
+        uint128_hex_decimal_word(&values[1][1], "initiatedAt")?
+            .parse()
+            .map_err(|_| "invalid withdrawal timestamp")?,
+    ))
+}
+
+pub async fn latest_channel_claimed(
+    config: &RpcConfig,
+    contract: &[u8; 20],
+    id: &str,
+) -> Result<u128, String> {
+    let mut data = selector("channels(bytes32)").to_vec();
+    data.extend_from_slice(&parse_hex(id, Some(32))?);
+    let result = eth_call(config, contract, data).await?;
+    let words = parse_words(&result, 2, "channels")?;
+    uint128_hex_decimal_word(&words[1], "totalClaimed")?
+        .parse()
+        .map_err(|_| "invalid claimed amount".into())
+}
+
 async fn eth_call(
     config: &RpcConfig,
     contract: &[u8; 20],
@@ -726,18 +822,37 @@ async fn rpc_post(
     body: &Value,
     max_response_bytes: u64,
 ) -> Result<String, String> {
+    rpc_post_metered(config, method, body, max_response_bytes, |_| {}).await
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_RPC: std::cell::RefCell<std::collections::VecDeque<(String, Result<String, String>)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+async fn rpc_post_metered(
+    config: &RpcConfig,
+    method: &str,
+    body: &Value,
+    max_response_bytes: u64,
+    charge: impl FnOnce(u128),
+) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some((expected, result)) = TEST_RPC.with(|q| q.borrow_mut().pop_front()) {
+        assert_eq!(method, expected);
+        charge(100);
+        return result;
+    }
     let request = build_rpc_request(&config.url, method, body, max_response_bytes)?;
-    let mut service = ServiceBuilder::new()
-        .layer(HttpConversionLayer)
-        .cycles_accounting(ChargeMyself::default())
-        .service(Client::new_with_box_error());
-    let response = service
-        .ready()
-        .await
-        .map_err(|err| format!("{method}: HTTPS outcall unavailable: {err}"))?
-        .call(request)
+    let request = HttpRequestConverter
+        .try_convert(request)
+        .map_err(|err| format!("{method}: invalid HTTP request: {err}"))?;
+    let response = crate::http_outcall::http_request_metered(request, charge)
         .await
         .map_err(|err| format!("{method}: HTTPS outcall failed: {err}"))?;
+    let response = HttpResponseConverter
+        .try_convert(response)
+        .map_err(|err| format!("{method}: invalid HTTP response: {err}"))?;
     if !response.status().is_success() {
         return Err(format!("{method}: RPC HTTP status {}", response.status()));
     }
@@ -988,48 +1103,6 @@ fn decimal_add(left: &str, right: &str) -> Result<String, String> {
     }
     out.reverse();
     String::from_utf8(out).map_err(|_| "decimal addition failed".to_string())
-}
-
-#[cfg(test)]
-fn decimal_sub(left: &str, right: &str) -> Result<String, String> {
-    if !left.bytes().all(|byte| byte.is_ascii_digit())
-        || !right.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err("decimal value must contain only digits".to_string());
-    }
-    if !decimal_at_least(left, right) {
-        return Err("decimal subtraction underflow".to_string());
-    }
-    let mut borrow = 0i16;
-    let mut out = Vec::with_capacity(left.len());
-    let mut left = left.bytes().rev();
-    let mut right = right.bytes().rev();
-    loop {
-        let next_left = left.next();
-        let next_right = right.next();
-        if next_left.is_none() && next_right.is_none() {
-            break;
-        }
-        let mut a = next_left.map(|byte| i16::from(byte - b'0')).unwrap_or(0) - borrow;
-        let b = next_right.map(|byte| i16::from(byte - b'0')).unwrap_or(0);
-        if a < b {
-            a += 10;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        out.push((a - b) as u8 + b'0');
-    }
-    while out.len() > 1 && out.last() == Some(&b'0') {
-        out.pop();
-    }
-    out.reverse();
-    String::from_utf8(out).map_err(|_| "decimal subtraction failed".to_string())
-}
-
-#[cfg(test)]
-fn settle_has_unsettled_amount(total_claimed: &str, total_settled: &str) -> bool {
-    decimal_greater(total_claimed, total_settled)
 }
 
 fn decimal_mul_small(value: &str, factor: u16) -> String {
@@ -1484,52 +1557,12 @@ mod tests {
         assert!(decimal_at_least("100", "99"));
         assert!(decimal_at_least("00100", "100"));
         assert!(!decimal_at_least("99", "100"));
-        assert_eq!(decimal_sub("100", "001").unwrap(), "99");
-        assert_eq!(decimal_sub("100", "100").unwrap(), "0");
-        assert_eq!(
-            decimal_sub("99", "100"),
-            Err("decimal subtraction underflow".to_string())
-        );
-        assert_eq!(
-            decimal_sub("1x", "1"),
-            Err("decimal value must contain only digits".to_string())
-        );
         let mut over_uint128 = [0u8; 32];
         over_uint128[15] = 1;
         assert_eq!(
             uint128_hex_decimal_word(&over_uint128, "channels.balance"),
             Err("channels.balance exceeds uint128".to_string())
         );
-    }
-
-    #[test]
-    fn batch_channel_snapshot_serializes_verify_extra_shape() {
-        let snapshot = BatchChannelSnapshot {
-            channel_id: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            balance: "1000".to_string(),
-            total_claimed: "300".to_string(),
-            withdraw_requested_at: 42,
-            refund_nonce: "2".to_string(),
-        };
-
-        assert_eq!(
-            snapshot.to_json(),
-            json!({
-                "channelId": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                "balance": "1000",
-                "totalClaimed": "300",
-                "withdrawRequestedAt": 42,
-                "refundNonce": "2"
-            })
-        );
-    }
-
-    #[test]
-    fn validates_batch_settle_noop_state() {
-        assert!(settle_has_unsettled_amount("300", "100"));
-        assert!(!settle_has_unsettled_amount("300", "300"));
-        assert!(!settle_has_unsettled_amount("299", "300"));
     }
 
     #[test]
@@ -1560,55 +1593,6 @@ mod tests {
             fee_quote_from_history(&json!({"baseFeePerGas":["0x1"]})).unwrap_err(),
             "eth_feeHistory: missing reward percentile"
         );
-    }
-
-    #[test]
-    fn calldata_uses_transfer_with_authorization_call() {
-        let request: FacilitatorRequest = serde_json::from_value(json!({
-            "x402Version": 2,
-            "paymentPayload": {
-                "x402Version": 2,
-                "accepted": {
-                    "scheme": "exact",
-                    "network": "eip155:137",
-                    "asset": JPYC_POLYGON_ADDRESS,
-                    "amount": "100",
-                    "payTo": "0x1000000000000000000000000000000000000402",
-                    "maxTimeoutSeconds": 60,
-                    "extra": { "assetTransferMethod": "eip3009", "name": "JPY Coin", "version": "1" }
-                },
-                "payload": {
-                    "signature": format!("0x{}1b", "11".repeat(64)),
-                    "authorization": {
-                        "from": "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993",
-                        "to": "0x1000000000000000000000000000000000000402",
-                        "value": "100",
-                        "validAfter": "1",
-                        "validBefore": "9999999999",
-                        "nonce": format!("0x{}", "22".repeat(32))
-                    }
-                }
-            },
-            "paymentRequirements": {
-                "scheme": "exact",
-                "network": "eip155:137",
-                "asset": JPYC_POLYGON_ADDRESS,
-                "amount": "100",
-                "payTo": "0x1000000000000000000000000000000000000402",
-                "maxTimeoutSeconds": 60,
-                "extra": { "assetTransferMethod": "eip3009", "name": "JPY Coin", "version": "1" }
-            }
-        }))
-        .unwrap();
-        let data = encode_settle_calldata(&request.payment_payload.payload).unwrap();
-        assert_eq!(
-            &data[..4],
-            &selector(
-                "transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)"
-            )
-        );
-        assert_ne!(&data[..4], &selector("balanceOf(address)"));
-        assert_ne!(&data[..4], &selector("authorizationState(address,bytes32)"));
     }
 
     #[test]

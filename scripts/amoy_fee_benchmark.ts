@@ -208,7 +208,7 @@ async function run(): Promise<void> {
       maxPriorityFeePerGas: amoyMaxFeePerGas
     });
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    if (!receipt.contractAddress) throw new Error("token deployment did not return a contract address");
+    if (receipt.status !== "success" || !receipt.contractAddress) throw new Error("token deployment failed");
     token = receipt.contractAddress;
     writeState({ ...state, token });
   }
@@ -230,12 +230,11 @@ async function run(): Promise<void> {
       abi: collectorArtifact.abi,
       bytecode: collectorArtifact.bytecode.object,
       args: [BATCH_ADDRESS],
-      gas: 300_000n,
       maxFeePerGas: amoyMaxFeePerGas,
       maxPriorityFeePerGas: amoyMaxFeePerGas
     });
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    if (!receipt.contractAddress) throw new Error("collector deployment did not return a contract address");
+    if (receipt.status !== "success" || !receipt.contractAddress) throw new Error("collector deployment failed");
     collector = receipt.contractAddress;
     writeState({ token, collector });
   }
@@ -508,7 +507,8 @@ async function run(): Promise<void> {
       functionName: "claimWithSignature",
       args: [claims, claimAuthorizerSignature]
     });
-    const refundCalls = await Promise.all(refundChannels.slice(offset, offset + count).map(async (channel, index) => {
+    // The facilitator combines N claims with one refund, not N refunds.
+    const refundCalls = await Promise.all(refundChannels.slice(offset, offset + 1).map(async (channel, index) => {
       const signature = await receiverAuthorizer.signTypedData({
         domain: batchDomain(),
         types: refundTypes,

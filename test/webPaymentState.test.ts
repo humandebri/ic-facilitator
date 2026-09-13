@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  confirmedCreditMessage,
   creditPaymentOutcome,
 } from "../web/src/credit_payment";
 
@@ -18,10 +17,6 @@ describe("Credit payment state", () => {
       kind: "success",
       creditAtoms: "123",
     });
-  });
-
-  it("does not turn a confirmed purchase into failure when balance refresh fails", () => {
-    expect(confirmedCreditMessage("123", true)).toContain("購入結果は確定しています");
   });
 
   it("rejects non-success terminal responses", () => {

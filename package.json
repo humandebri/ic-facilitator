@@ -45,7 +45,8 @@
     "web:dev": "vite --config web/vite.config.ts",
     "web:preview": "vite preview --config web/vite.config.ts",
     "web:deploy:preview": "npm run web:build && wrangler deploy --config web/wrangler.jsonc --env preview",
-    "web:types": "wrangler types --config web/wrangler.jsonc"
+    "web:types": "wrangler types --config web/wrangler.jsonc",
+    "measure:gas-baseline": "node --import tsx scripts/polygon_gas_baseline.ts"
   },
   "dependencies": {
     "@x402/core": "2.13.0",
@@ -64,7 +65,7 @@
     "@types/node": "24.10.1",
     "tsx": "4.22.4",
     "typescript": "5.9.3",
-    "vitest": "4.1.0",
+    "vitest": "4.1.11",
     "wrangler": "latest"
   },
   "overrides": {

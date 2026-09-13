@@ -481,10 +481,6 @@ function calldataChannelConfig(input: Hex): DecodedBatchChannelConfig {
   return readChannelConfig(input, 4n, "batch calldata");
 }
 
-function calldataChannelId(input: Hex, contract: Address): Hex {
-  return computeChannelId(calldataChannelConfig(input), contract);
-}
-
 function depositCalldataAmount(input: Hex): bigint {
   return readWord(input, 4n + 32n * 7n, "batch deposit calldata");
 }

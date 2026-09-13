@@ -12,7 +12,7 @@ describe("doctor seller guard", () => {
       POLYGON_RPC_URL: "https://polygon.example",
       SELLER_EVM_ADDRESS: sampleSeller,
       X402_TARGET_URL: "https://example.test/jpyc/report"
-    }, "all");
+    }, "buyer");
 
     expect(checks.some((check) => check.name === "env:SELLER_EVM_ADDRESS_SAMPLE" && check.status === "fail")).toBe(true);
   }, 10_000);

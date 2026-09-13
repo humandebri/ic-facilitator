@@ -1,3 +1,19 @@
+type AutoClaimStatus = record {
+  channel_id : text;
+  unclaimed_count : nat64;
+  // Attached cycles before v2 asynchronous refunds; not net execution cost.
+  monitor_cycles_reserved : nat;
+  oldest_unclaimed_at : opt nat64;
+  unclaimed_amount : text;
+  transaction : opt text;
+  draining : bool;
+  enabled : bool;
+  state : text;
+  monitor_calls : nat64;
+  withdrawal_deadline : opt nat64;
+  stop_reason : opt text;
+  monitored_at : opt nat64;
+};
 type BatchChannel = record {
   channel_id : text;
   signature : text;
@@ -89,10 +105,11 @@ type HttpResponse = record {
   upgrade : opt bool;
   status_code : nat16;
 };
-type Result = variant { Ok : BatchSeller; Err : text };
-type Result_1 = variant { Ok : BatchWriterReceiverScope; Err : text };
-type Result_2 = variant { Ok : StaleSettlementRecovery; Err : text };
-type Result_3 = variant { Ok; Err : text };
+type Result = variant { Ok; Err : text };
+type Result_1 = variant { Ok : opt AutoClaimStatus; Err : text };
+type Result_2 = variant { Ok : BatchSeller; Err : text };
+type Result_3 = variant { Ok : BatchWriterReceiverScope; Err : text };
+type Result_4 = variant { Ok : StaleSettlementRecovery; Err : text };
 type RuntimeConfigurationUpdate = record {
   token : text;
   batch_contract : text;
@@ -175,6 +192,9 @@ type StaleSettlementRecovery = record {
 };
 service : {
   active_settlement_count : () -> (nat64) query;
+  batch_auto_claim_request : (text) -> (Result);
+  batch_auto_claim_set_enabled : (text, bool) -> (Result);
+  batch_auto_claim_status : (text) -> (Result_1) query;
   batch_channel : (text) -> (opt BatchChannel) query;
   batch_channel_count : () -> (nat64) query;
   batch_channels : (opt nat64) -> (vec BatchChannel) query;
@@ -186,8 +206,8 @@ service : {
   batch_deposit_fee_amount : () -> (opt text) query;
   batch_receiver_authorizer : () -> (opt text) query;
   batch_refund_fee_amount : () -> (opt text) query;
-  batch_set_seller : (text, text) -> (Result);
-  batch_set_writer_receiver_scope : (principal, text, bool) -> (Result_1);
+  batch_set_seller : (text, text) -> (Result_2);
+  batch_set_writer_receiver_scope : (principal, text, bool) -> (Result_3);
   batch_settle_fee_amount : () -> (opt text) query;
   batch_settlement_contract : () -> (opt text) query;
   batch_settlement_fee_amount : () -> (opt text) query;
@@ -204,17 +224,17 @@ service : {
   env_names : () -> (vec text) query;
   http_request : (HttpRequest) -> (HttpResponse) query;
   http_request_update : (HttpRequest) -> (HttpResponse);
-  recover_stale_settlement : (text) -> (Result_2);
+  recover_stale_settlement : (text) -> (Result_4);
   seller_acceptance : (text) -> (opt SellerAcceptance) query;
   seller_credit : (text) -> (nat) query;
   seller_settlements : (text, opt text, opt nat64) -> (
       SellerSettlementPage,
     ) query;
-  set_batch_claim_fee_schedule : (BatchClaimFeeSchedule) -> (Result_3);
-  set_batch_fee_profile : (BatchFeeProfileUpdate) -> (Result_3);
+  set_batch_claim_fee_schedule : (BatchClaimFeeSchedule) -> (Result);
+  set_batch_fee_profile : (BatchFeeProfileUpdate) -> (Result);
   set_env : (text, text) -> ();
-  set_runtime_configuration : (RuntimeConfigurationUpdate) -> (Result_3);
-  set_runtime_profile : (RuntimeProfileUpdate) -> (Result_3);
+  set_runtime_configuration : (RuntimeConfigurationUpdate) -> (Result);
+  set_runtime_profile : (RuntimeProfileUpdate) -> (Result);
   settlement : (text) -> (opt SettlementRecord) query;
   settlement_count : () -> (nat64) query;
 }

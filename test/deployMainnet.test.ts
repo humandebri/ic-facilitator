@@ -7,13 +7,12 @@ import { describe, expect, it } from "vitest";
 
 const privateKey = `0x${"1".repeat(64)}`;
 
-function runDeploy(statusExists: boolean, approvedLegalVersions = true) {
+function runDeploy(approvedLegalVersions = true) {
   const dir = mkdtempSync(join(tmpdir(), "ic-facilitator-deploy-"));
   const logPath = join(dir, "icp.log");
   const fakeIcp = join(dir, "icp");
   writeFileSync(fakeIcp, `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$ICP_FAKE_LOG"
-if [[ "$1 $2 $3" == "canister status edge" ]]; then exit ${statusExists ? 0 : 1}; fi
 exit 0
 `);
   chmodSync(fakeIcp, 0o755);
@@ -42,7 +41,7 @@ exit 0
 
 describe("mainnet deploy", () => {
   it("rejects draft or missing legal document versions", () => {
-    const { dir, result } = runDeploy(false, false);
+    const { dir, result } = runDeploy(false);
     try {
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("must be an approved, non-draft version for production");
@@ -52,18 +51,7 @@ describe("mainnet deploy", () => {
   });
 
   it("keeps fresh mainnet deployment disabled for the MVP", () => {
-    const { dir, log, result } = runDeploy(false);
-    try {
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("mainnet deployment is intentionally disabled");
-      expect(log).not.toContain("deploy ");
-    } finally {
-      rmSync(dir, { force: true, recursive: true });
-    }
-  });
-
-  it("rejects direct upgrade of an existing canister until a transition audit is complete", () => {
-    const { dir, log, result } = runDeploy(true);
+    const { dir, log, result } = runDeploy();
     try {
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("mainnet deployment is intentionally disabled");

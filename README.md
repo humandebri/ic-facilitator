@@ -155,7 +155,8 @@ FACILITATOR_DEBUG_COST=0
 
 `FACILITATOR_EVM_PRIVATE_KEY` は repo 外の SEV / subnet / deploy 運用基盤で保護する前提。facilitator 実装は tECDSA を使わない。tECDSA 移行、外部 signer 化、鍵保管方式変更はこの repo の責務ではない。
 network、token、BatchSettlement contract、Exact/Batch action料金、claim schedule、3文書versionは`set_runtime_configuration`で原子的に設定する。`polygon` profileはchain ID 137、本番JPYC、公式BatchSettlement contractとの完全一致を要求する。`amoy` profileはchain ID 80002、Preview専用test token、公式SDKと同じcanonical BatchSettlement addressを要求する。環境同期は`eth_getCode`でcanonical contractのbytecodeを確認してから検証済みflagを設定し、確認できない場合は失敗する。CanisterもflagがないAmoy Batchを`/supported`に広告せず、verify/settleを拒否する。
-`POLYGON_RPC_URL` は canister と Node CLI で共用し、HTTPS、userinfo なし、fragment なしを必須とする。provider API key 用の path/query は許可する。canister は `canhttp` の非複製HTTPS outcall（`is_replicated=false`）で単一RPCへ直接接続し、EVM RPC canisterは使わない。単一IC replicaと単一RPCを信頼するため、gas推定、nonce、receipt判定には改ざん・provider偏りの残余リスクがある。raw tx hashはローカル計算し、gas/fee cap、receipt transaction hash・送受信者・event・confirmationを検証してfail closedにする。
+`POLYGON_RPC_URL` は canister と Node CLI で共用し、HTTPS、userinfo なし、fragment なしを必須とする。provider API key 用の path/query は許可する。canister は非複製HTTPS outcall（`is_replicated=false`、`pricing_version=2`）で単一RPCへ直接接続し、EVM RPC canisterは使わない。HTTP変換・応答検証には `canhttp` を使い、管理canisterへの呼び出しはv2フィールドを含めて直接送る。単一IC replicaと単一RPCを信頼するため、gas推定、nonce、receipt判定には改ざん・provider偏りの残余リスクがある。raw tx hashはローカル計算し、gas/fee cap、receipt transaction hash・送受信者・event・confirmationを検証してfail closedにする。
+HTTP outcall v2は実使用量に応じて課金される。`cost_http_request_v2` System APIにリクエストのbyte数、各RPCの応答上限、非複製設定、30秒の待機予算を渡して送付cyclesを計算し、未使用分はsubnetから非同期で返金される。デプロイ先はこのSystem APIとpricing v2に対応したreplicaが必要で、旧runtimeへのフォールバックはない。対応の根拠は[DFINITYの有効化PR](https://github.com/dfinity/ic/pull/11399)と[仕様PR](https://github.com/dfinity/developer-docs/pull/254)。本変更ではmainnet上の適用・実消費cyclesの計測は行っていない。
 `FACILITATOR_PUBLIC_ORIGIN` は payment resource URL の origin。Host / forwarded proto header は信用しない。
 `SETTLE_MIN_CONFIRMATIONS` は settlement receipt を success 扱いする最小 confirmation 数。既定値は `3`。
 `SELLER_CREDIT_PAY_TO` は seller credit 購入代金の受取先。top-up額はリクエストの`amount`でJPYC表示単位として指定し、料金envはJPYC atomic unit。Exact、deposit、settle、claimsなしrefundは各action feeを使う。claimとclaims付きrefundは、1 / 10 / 50 / 100件の8項目を全て設定した場合だけ件数tierを有効化し、未設定・部分設定・測定不成立時は既存のaction feeへfallbackする。件数tierは単調非減少でなければ設定できず、batch settleのno-opは無料。Amoy gasUsedとMainnet gas条件を`npm run measure:facilitator-costs:mainnet`で再計算し、判定を満たさないactionは現行feeを維持する。`FACILITATOR_MAX_SETTLEMENT_FEE_WEI` は `gas_limit * max_fee_per_gas` の送信前 cap。超過時は tx を broadcast せず `gas_too_expensive` を返す。
@@ -180,7 +181,11 @@ network、token、BatchSettlement contract、Exact/Batch action料金、claim sc
 
 `npm run measure:rpc-responses` は `POLYGON_RPC_URL` に読み取り専用RPCを送り、raw JSONのUTF-8 byte数、安全余裕込みの推奨上限、現行20KB比の削減cyclesをJSON出力する。receipt計測には `SETTLEMENT_TX` と `BATCH_DEPOSIT_TX` / `BATCH_CLAIM_TX` / `BATCH_REFUND_TX` / `BATCH_SETTLE_TX` を使い、不足時は終了コード2と `missingReceiptSamples` を返す。秘密鍵やRPC URLは出力しない。
 
-`npm run measure:facilitator-costs` は13-node非複製HTTPS outcallの機能別概算、100件claimの実測gas sample、推奨JPYC料金をJSON出力する。為替・価格・gasは`XDR_USD`、`USD_JPY`、`POL_USD`、`GAS_PRICE_GWEI`で上書きできる。`npm run measure:facilitator-costs:mainnet` の通常基準はGas Stationの`standard.maxFee`で、`fast.maxFee`は通常原価に使わない。送信価格を300 gweiとして判定する場合は`MAINNET_GAS_PRICE_GWEI=300 npm run measure:facilitator-costs:mainnet`を使い、取得した`fast.maxFee`はストレス比較用に出力する。
+`measure:rpc-responses` の削減cyclesは従来のpricing v1式に基づく。`measure:facilitator-costs` は7-node・非複製・pricing v2・各RPC応答1秒を既定にした概算で、応答上限をサイズの代用値として使う。送付cyclesの予約額ではなく成功時の消費見積もりであり、ヘッダ・Candid符号化・再試行・非同期返金は実測が必要。`facilitatorCostReport({ outcallPricing: { nodes, responseTimeMs } })` でノード数と時間を変更できる。
+
+`npm run measure:facilitator-costs` は7-node・pricing v2のHTTPS outcallの機能別概算、保存済みローカルEVMの成功gas sample、推奨JPYC料金をJSON出力する。為替・価格・gasは`XDR_USD`、`USD_JPY`、`POL_USD`、`GAS_PRICE_GWEI`で上書きできる。通常gasは過去約7日のサンプル平均334.64 gweiを切り上げた335 gweiに固定し、Gas Stationの瞬間値は通常原価に使わない。`GAS_PRICE_GWEI`またはmainnet計測時の`MAINNET_GAS_PRICE_GWEI`で明示的に上書きでき、取得した`fast.maxFee`はストレス比較用に出力する。
+
+料金候補は暫定案（`recommendationStatus=provisional`）。claimとrefund+claimは各件数で0.5 / 0.75 / 整数JPYCから原価に合う候補を選び、成功gas sampleがない場合は既存のfallback値を返す。固定料金はローカル`.env`と`.env.example`に反映済みで、この出力は設定へ自動適用しない。成功gasの既定入力は`docs/local-gas-benchmark.json`であり、`FACILITATOR_GAS_BENCHMARK_PATH`で差し替えできる。未計測費用と改定条件は[料金見直し案](docs/pricing-v2-review.md)を参照。
 
 RPC response size estimate は実測に基づき、block number / gas estimate / nonce は128 bytes、`eth_call` は192 bytes、fee history は320 bytes、raw tx送信は512 bytes、receiptは4KiBとする。receiptはPolygon実測でログ0件相当1,031 bytes、3ログ最大3,258 bytesだった。batch claimはSDK既定の100件を維持し、現行contract ABIではclaim eventをemitしないためclaim件数でreceiptは増えない。未登録のRPC methodは送信前に拒否する。
 
@@ -259,3 +264,7 @@ npm run did:check
 
 CI は `candid-extractor` `0.1.6` で DID 生成を固定する。local で DID を再生成する場合も同版を使う。
 `npm run build` は TS typecheck と Rust facilitator build を実行する。TS は canister 運用補助と smoke 用で、facilitator 本体は Rust canister のみ。
+
+### 同一チャネルの自動claim
+
+店舗ごとの明示的な有効化で100決済を1 claimに集約できます。出金監視、受付停止、手動回収、無効化時の回収を含みます。通常の時間条件はありません。[利用条件とAPI](docs/batch-auto-claim.md)を参照してください。

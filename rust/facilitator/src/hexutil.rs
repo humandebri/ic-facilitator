@@ -104,11 +104,6 @@ pub fn parse_u256_hex(value: &str, label: &str) -> Result<[u8; 32], String> {
     Ok(left_pad_32(&bytes))
 }
 
-#[cfg(test)]
-fn u256_gte(left: &[u8; 32], right: &[u8; 32]) -> bool {
-    left >= right
-}
-
 pub fn u256_word(value: u128) -> [u8; 32] {
     left_pad_32(&value.to_be_bytes())
 }
@@ -173,14 +168,5 @@ mod tests {
             parse_u128_decimal_word(too_big, "too_big"),
             Err("too_big: integer too large".to_string())
         );
-    }
-
-    #[test]
-    fn compares_u256_words() {
-        let one = parse_u256_decimal("1", "one").unwrap();
-        let two = parse_u256_decimal("2", "two").unwrap();
-        assert!(u256_gte(&two, &one));
-        assert!(u256_gte(&two, &two));
-        assert!(!u256_gte(&one, &two));
     }
 }

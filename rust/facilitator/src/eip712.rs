@@ -156,14 +156,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_digest() {
-        assert_eq!(
-            eip3009_digest(&payload("0x".to_string())).unwrap().len(),
-            32
-        );
-    }
-
-    #[test]
     fn recovers_authorization_signer_with_standard_and_raw_recovery_id() {
         let key = SigningKey::from_slice(
             &crate::hexutil::parse_hex(

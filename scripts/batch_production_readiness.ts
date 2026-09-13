@@ -657,7 +657,7 @@ function parseOptionalText(output: string): string | undefined {
   return match?.[1];
 }
 
-function parseNat64Output(output: string): bigint | undefined {
+export function parseNat64Output(output: string): bigint | undefined {
   const match = /^\s*\(\s*([0-9][0-9_]*)\s*:\s*nat64\s*,?\s*\)\s*$/.exec(output);
   return match?.[1] === undefined ? undefined : BigInt(match[1].replaceAll("_", ""));
 }
@@ -977,13 +977,13 @@ function canisterStorageApiStage(
   return ok("canister:batch-storage-api", `${canister}@${environment} batch channel storage APIs ok count=${channelCount.toString()} deleted=${deletedChannelCount.toString()}`);
 }
 
-function isOptionalBatchChannelOutput(output: string): boolean {
+export function isOptionalBatchChannelOutput(output: string): boolean {
   const value = output.trim();
   return /^\(\s*null\s*\)$/.test(value) ||
     (/^\(\s*opt\s+record\b[\s\S]*\)\s*$/.test(value) && hasBatchChannelOutputFields(value));
 }
 
-function isOptionalBatchDeletedChannelOutput(output: string): boolean {
+export function isOptionalBatchDeletedChannelOutput(output: string): boolean {
   const value = output.trim();
   return /^\(\s*null\s*\)$/.test(value) ||
     (/^\(\s*opt\s+record\b[\s\S]*\)\s*$/.test(value) && hasBatchDeletedChannelOutputFields(value));
@@ -997,7 +997,7 @@ function countBatchDeletedChannelRecords(output: string): bigint {
   return BigInt(output.match(/\brecord\s*\{[\s\S]*?\bdeleted_at\s*=/g)?.length ?? 0);
 }
 
-function isBatchChannelsListOutput(output: string): boolean {
+export function isBatchChannelsListOutput(output: string): boolean {
   const inner = batchChannelsListInner(output);
   if (inner === undefined) {
     return false;
@@ -1008,7 +1008,7 @@ function isBatchChannelsListOutput(output: string): boolean {
       hasBatchChannelOutputFields(trimmed));
 }
 
-function isBatchDeletedChannelsListOutput(output: string): boolean {
+export function isBatchDeletedChannelsListOutput(output: string): boolean {
   const inner = batchChannelsListInner(output);
   if (inner === undefined) {
     return false;
@@ -1333,7 +1333,7 @@ async function batchSupportedStage(options: BatchProductionReadinessOptions): Pr
   }
 }
 
-function nextCommands(
+export function nextCommands(
   stages: readonly BatchProductionReadinessStage[],
   requireBatchReceipt: boolean,
   env: NodeJS.ProcessEnv

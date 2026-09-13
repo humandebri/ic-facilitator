@@ -1,3 +1,4 @@
+import { claimInputFor, refundInputFor, depositInputFor, settleInputFor, multicallInputFor } from "./fixtures/batchCalldata";
 // test/batchSettlementReceipt.test.ts: batch settlement tx receipt と post-state 検証を確認する。
 import { spawnSync } from "node:child_process";
 
@@ -58,31 +59,6 @@ function padHexData(value: Hex): string {
 
 function encodeBytes(value: Hex): string {
   return `${uint256(BigInt((value.length - 2) / 2)).slice(2)}${padHexData(value)}`;
-}
-
-function encodeBytesArray(items: readonly Hex[]): string {
-  let offset = 32n * BigInt(items.length);
-  let head = uint256(BigInt(items.length)).slice(2);
-  let tail = "";
-  for (const item of items) {
-    const encoded = encodeBytes(item);
-    head += uint256(offset).slice(2);
-    offset += BigInt(encoded.length / 2);
-    tail += encoded;
-  }
-  return `${head}${tail}`;
-}
-
-function encodeDynamicArray(items: readonly string[]): string {
-  let offset = 32n * BigInt(items.length);
-  let head = uint256(BigInt(items.length)).slice(2);
-  let tail = "";
-  for (const item of items) {
-    head += uint256(offset).slice(2);
-    offset += BigInt(item.length / 2);
-    tail += item;
-  }
-  return `${head}${tail}`;
 }
 
 type FakeReaderState = {
@@ -184,22 +160,6 @@ function claimTuple(configWords: string, totalClaimed: bigint): string {
   ].join("");
 }
 
-function claimInputFor(claims: readonly { readonly configWords: string; readonly totalClaimed: bigint }[]): Hex {
-  const claimTails = claims.map((claim) => claimTuple(claim.configWords, claim.totalClaimed));
-  const claimsData = encodeDynamicArray(claimTails);
-  const authorizerSignature = hex(`0x${"22".repeat(65)}`);
-  return hex(`0xe43ce1f2${uint256(64n).slice(2)}${uint256(BigInt(64 + claimsData.length / 2)).slice(2)}${claimsData}${encodeBytes(authorizerSignature)}`);
-}
-
-function refundInputFor(configWords: string, nonce: bigint): Hex {
-  const authorizerSignature = hex(`0x${"44".repeat(65)}`);
-  return hex(`0xb77433e9${configWords}${uint256(1500n).slice(2)}${uint256(nonce).slice(2)}${uint256(320n).slice(2)}${encodeBytes(authorizerSignature)}`);
-}
-
-function depositInputFor(configWords: string, amount = 90n): Hex {
-  return hex(`0x140f1e75${configWords}${uint256(amount).slice(2)}${addressWord(sender).slice(2)}${uint256(320n).slice(2)}${encodeBytes("0x")}`);
-}
-
 const channelConfigWords = channelConfigWordsFor(receiver);
 const alternateReceiverChannelConfigWords = channelConfigWordsFor(alternateReceiver);
 const alternateTokenChannelConfigWords = channelConfigWordsFor(receiver, alternateToken);
@@ -213,21 +173,20 @@ const mixedReceiverClaimInput: Hex = claimInputFor([
   { configWords: alternateReceiverChannelConfigWords, totalClaimed: 50n }
 ]);
 const alternateTokenClaimInput: Hex = claimInputFor([{ configWords: alternateTokenChannelConfigWords, totalClaimed: 50n }]);
-const depositInput: Hex = depositInputFor(channelConfigWords);
-const alternateReceiverDepositInput: Hex = depositInputFor(alternateReceiverChannelConfigWords);
-const alternateTokenDepositInput: Hex = depositInputFor(alternateTokenChannelConfigWords);
-const alternateReceiverAuthorizerDepositInput: Hex = depositInputFor(alternateReceiverAuthorizerChannelConfigWords);
-const alternateWithdrawDelayDepositInput: Hex = depositInputFor(alternateWithdrawDelayChannelConfigWords);
+const depositInput: Hex = depositInputFor(channelConfigWords, sender, 90n);
+const alternateReceiverDepositInput: Hex = depositInputFor(alternateReceiverChannelConfigWords, sender, 90n);
+const alternateTokenDepositInput: Hex = depositInputFor(alternateTokenChannelConfigWords, sender, 90n);
+const alternateReceiverAuthorizerDepositInput: Hex = depositInputFor(alternateReceiverAuthorizerChannelConfigWords, sender, 90n);
+const alternateWithdrawDelayDepositInput: Hex = depositInputFor(alternateWithdrawDelayChannelConfigWords, sender, 90n);
 const refundInput: Hex = refundInputFor(channelConfigWords, 1n);
 const alternateReceiverRefundInput: Hex = refundInputFor(alternateReceiverChannelConfigWords, 1n);
-const settleInput: Hex = hex(`0x9db32a8f${addressWord(receiver).slice(2)}${addressWord(jpyc).slice(2)}`);
-const wrongSettleReceiverInput: Hex = hex(`0x9db32a8f${addressWord(alternateReceiver).slice(2)}${addressWord(jpyc).slice(2)}`);
+const settleInput: Hex = settleInputFor(receiver, jpyc);
+const wrongSettleReceiverInput: Hex = settleInputFor(alternateReceiver, jpyc);
 const dirtyPaddedSettleInput: Hex = hex(`0x9db32a8f${"01".repeat(12)}${receiver.slice(2)}${addressWord(jpyc).slice(2)}`);
-const refundMulticallInput: Hex = hex(`0xac9650d8${uint256(32n).slice(2)}${encodeBytesArray([refundInput])}`);
-const refundWithClaimMulticallInput: Hex = hex(`0xac9650d8${uint256(32n).slice(2)}${encodeBytesArray([claimInput, refundInput])}`);
-const refundWithMixedReceiverClaimMulticallInput: Hex = hex(`0xac9650d8${uint256(32n).slice(2)}${encodeBytesArray([mixedReceiverClaimInput, refundInput])}`);
-const refundWithUnknownCallMulticallInput: Hex = hex(`0xac9650d8${uint256(32n).slice(2)}${encodeBytesArray([refundInput, "0x12345678"])}`);
-const refundWithOtherChannelMulticallInput: Hex = hex(`0xac9650d8${uint256(32n).slice(2)}${encodeBytesArray([refundInput, alternateReceiverRefundInput])}`);
+const refundWithClaimMulticallInput: Hex = multicallInputFor([claimInput, refundInput]);
+const refundWithMixedReceiverClaimMulticallInput: Hex = multicallInputFor([mixedReceiverClaimInput, refundInput]);
+const refundWithUnknownCallMulticallInput: Hex = multicallInputFor([refundInput, "0x12345678"]);
+const refundWithOtherChannelMulticallInput: Hex = multicallInputFor([refundInput, alternateReceiverRefundInput]);
 const overlappingMulticallInput: Hex = hex(`0xac9650d8${uint256(32n).slice(2)}${uint256(1n).slice(2)}${uint256(0n).slice(2)}${encodeBytes(refundInput)}`);
 const overlappingClaimInput: Hex = hex(`0xe43ce1f2${uint256(64n).slice(2)}${uint256(320n).slice(2)}${uint256(1n).slice(2)}${uint256(0n).slice(2)}${claimTuple(channelConfigWords, 50n)}${encodeBytes(hex(`0x${"22".repeat(65)}`))}`);
 const claimHash: Hex = "0x0000000000000000000000000000000000000000000000000000000000000c11";
@@ -500,7 +459,7 @@ describe("batch settlement receipt", () => {
   });
 
   it("rejects refund multicalls when post-state is below embedded claim totalClaimed", async () => {
-    const input = hex(`0xac9650d8${uint256(32n).slice(2)}${encodeBytesArray([highClaimInput, refundInput])}`);
+    const input = multicallInputFor([highClaimInput, refundInput]);
     await expect(verifyBatchSettlementReceipt({
       action: "refund",
       channelId,

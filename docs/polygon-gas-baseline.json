@@ -1,0 +1,1696 @@
+{
+  "collectedAt": "2026-09-08T00:05:03.542Z",
+  "chainId": 137,
+  "method": "eth_feeHistory: base fee + gas-weighted median priority fee per non-empty block; equal-weight block mean across 168 approximately hourly windows of 64 blocks",
+  "startTime": "2026-09-01T01:02:58.000Z",
+  "endTime": "2026-09-08T00:04:39.000Z",
+  "secondsPerBlock": 1.5,
+  "blocks": 10752,
+  "meanGwei": 334.6413133327587,
+  "medianGwei": 331.332940701,
+  "p90Gwei": 399.936536456,
+  "minGwei": 25.00005158,
+  "maxGwei": 1012.417071334,
+  "windows": [
+    {
+      "oldestBlock": "0x59161ca",
+      "newestBlock": 93413897,
+      "blocks": 64,
+      "meanGwei": 361.5111713459843,
+      "medianGwei": 395.161283668,
+      "p90Gwei": 410.173111678,
+      "minGwei": 296.075903333,
+      "maxGwei": 426.277551976
+    },
+    {
+      "oldestBlock": "0x591586a",
+      "newestBlock": 93411497,
+      "blocks": 64,
+      "meanGwei": 318.5628671772969,
+      "medianGwei": 319.993628057,
+      "p90Gwei": 335.212658201,
+      "minGwei": 294.149157712,
+      "maxGwei": 337.536007425
+    },
+    {
+      "oldestBlock": "0x5914f0a",
+      "newestBlock": 93409097,
+      "blocks": 64,
+      "meanGwei": 342.9433284162656,
+      "medianGwei": 326.124397373,
+      "p90Gwei": 394.874801685,
+      "minGwei": 282,
+      "maxGwei": 399.772648029
+    },
+    {
+      "oldestBlock": "0x59145aa",
+      "newestBlock": 93406697,
+      "blocks": 64,
+      "meanGwei": 340.5709575276407,
+      "medianGwei": 327.057318458,
+      "p90Gwei": 392.704198632,
+      "minGwei": 321.555015122,
+      "maxGwei": 397.466143242
+    },
+    {
+      "oldestBlock": "0x5913c4a",
+      "newestBlock": 93404297,
+      "blocks": 64,
+      "meanGwei": 359.82909594909376,
+      "medianGwei": 338.052508248,
+      "p90Gwei": 406.367405703,
+      "minGwei": 319.239099639,
+      "maxGwei": 413.261505863
+    },
+    {
+      "oldestBlock": "0x59132ea",
+      "newestBlock": 93401897,
+      "blocks": 64,
+      "meanGwei": 322.9266451968592,
+      "medianGwei": 322.526309535,
+      "p90Gwei": 336.074854272,
+      "minGwei": 301.405815329,
+      "maxGwei": 337.429015111
+    },
+    {
+      "oldestBlock": "0x591298a",
+      "newestBlock": 93399497,
+      "blocks": 64,
+      "meanGwei": 335.9439226813906,
+      "medianGwei": 334.809111885,
+      "p90Gwei": 337.249425576,
+      "minGwei": 329.507514585,
+      "maxGwei": 381.751972322
+    },
+    {
+      "oldestBlock": "0x591202a",
+      "newestBlock": 93397097,
+      "blocks": 64,
+      "meanGwei": 352.65664994492187,
+      "medianGwei": 327.869087148,
+      "p90Gwei": 398.731741054,
+      "minGwei": 323.100820863,
+      "maxGwei": 404.703145574
+    },
+    {
+      "oldestBlock": "0x59116ca",
+      "newestBlock": 93394697,
+      "blocks": 64,
+      "meanGwei": 326.00081207467184,
+      "medianGwei": 322.531203829,
+      "p90Gwei": 338.693338425,
+      "minGwei": 312.340399935,
+      "maxGwei": 346.853356644
+    },
+    {
+      "oldestBlock": "0x5910d6a",
+      "newestBlock": 93392297,
+      "blocks": 64,
+      "meanGwei": 322.5490989928438,
+      "medianGwei": 324.328316825,
+      "p90Gwei": 328.608334854,
+      "minGwei": 299.412533189,
+      "maxGwei": 331.952022727
+    },
+    {
+      "oldestBlock": "0x591040a",
+      "newestBlock": 93389897,
+      "blocks": 64,
+      "meanGwei": 329.41188175007807,
+      "medianGwei": 323.788403684,
+      "p90Gwei": 340.564750527,
+      "minGwei": 318.810954805,
+      "maxGwei": 384.830175516
+    },
+    {
+      "oldestBlock": "0x590faaa",
+      "newestBlock": 93387497,
+      "blocks": 64,
+      "meanGwei": 327.67340055948455,
+      "medianGwei": 323.237294742,
+      "p90Gwei": 334.451105034,
+      "minGwei": 319.798196543,
+      "maxGwei": 372.744783654
+    },
+    {
+      "oldestBlock": "0x590f14a",
+      "newestBlock": 93385097,
+      "blocks": 64,
+      "meanGwei": 333.1025924310157,
+      "medianGwei": 333.213800764,
+      "p90Gwei": 337.233691457,
+      "minGwei": 325.540506619,
+      "maxGwei": 344.374453792
+    },
+    {
+      "oldestBlock": "0x590e7ea",
+      "newestBlock": 93382697,
+      "blocks": 64,
+      "meanGwei": 334.2951339783438,
+      "medianGwei": 331.263040198,
+      "p90Gwei": 333.609936827,
+      "minGwei": 325.331574047,
+      "maxGwei": 374.127212534
+    },
+    {
+      "oldestBlock": "0x590de8a",
+      "newestBlock": 93380297,
+      "blocks": 64,
+      "meanGwei": 328.12964728640605,
+      "medianGwei": 329.274104433,
+      "p90Gwei": 332.402133534,
+      "minGwei": 304.24163616,
+      "maxGwei": 335.109220754
+    },
+    {
+      "oldestBlock": "0x590d52a",
+      "newestBlock": 93377897,
+      "blocks": 64,
+      "meanGwei": 333.7405729324063,
+      "medianGwei": 329.875239558,
+      "p90Gwei": 343.391110808,
+      "minGwei": 320.453827077,
+      "maxGwei": 397.694942213
+    },
+    {
+      "oldestBlock": "0x590cbca",
+      "newestBlock": 93375497,
+      "blocks": 64,
+      "meanGwei": 327.9096295266406,
+      "medianGwei": 324.586398033,
+      "p90Gwei": 342.917635354,
+      "minGwei": 286.609228904,
+      "maxGwei": 376.068668441
+    },
+    {
+      "oldestBlock": "0x590c26a",
+      "newestBlock": 93373097,
+      "blocks": 64,
+      "meanGwei": 340.56731678662516,
+      "medianGwei": 333.513868135,
+      "p90Gwei": 375.910070252,
+      "minGwei": 298.730130552,
+      "maxGwei": 380.188050017
+    },
+    {
+      "oldestBlock": "0x590b90a",
+      "newestBlock": 93370697,
+      "blocks": 64,
+      "meanGwei": 349.7879514134375,
+      "medianGwei": 333.363991928,
+      "p90Gwei": 382.300615258,
+      "minGwei": 315.068918295,
+      "maxGwei": 389.564222653
+    },
+    {
+      "oldestBlock": "0x590afaa",
+      "newestBlock": 93368297,
+      "blocks": 64,
+      "meanGwei": 326.9441488286719,
+      "medianGwei": 326.036605605,
+      "p90Gwei": 331.690391961,
+      "minGwei": 302.079165149,
+      "maxGwei": 340.745297625
+    },
+    {
+      "oldestBlock": "0x590a64a",
+      "newestBlock": 93365897,
+      "blocks": 64,
+      "meanGwei": 351.2182798686563,
+      "medianGwei": 340.660084934,
+      "p90Gwei": 373.270787435,
+      "minGwei": 326.025771648,
+      "maxGwei": 377.857591161
+    },
+    {
+      "oldestBlock": "0x5909cea",
+      "newestBlock": 93363497,
+      "blocks": 64,
+      "meanGwei": 339.07787987535943,
+      "medianGwei": 328.48610201,
+      "p90Gwei": 369.855100392,
+      "minGwei": 320.091117704,
+      "maxGwei": 372.511785794
+    },
+    {
+      "oldestBlock": "0x590938a",
+      "newestBlock": 93361097,
+      "blocks": 64,
+      "meanGwei": 350.6437626505624,
+      "medianGwei": 346.188714812,
+      "p90Gwei": 372.178865792,
+      "minGwei": 323.566097283,
+      "maxGwei": 376.078014519
+    },
+    {
+      "oldestBlock": "0x5908a2a",
+      "newestBlock": 93358697,
+      "blocks": 64,
+      "meanGwei": 342.2964481383908,
+      "medianGwei": 332.78426169,
+      "p90Gwei": 376.06688547,
+      "minGwei": 299.927682055,
+      "maxGwei": 380.222900985
+    },
+    {
+      "oldestBlock": "0x59080ca",
+      "newestBlock": 93356297,
+      "blocks": 64,
+      "meanGwei": 369.2477984025001,
+      "medianGwei": 387.100066326,
+      "p90Gwei": 428.006630917,
+      "minGwei": 297.940001482,
+      "maxGwei": 441.158596707
+    },
+    {
+      "oldestBlock": "0x590776a",
+      "newestBlock": 93353897,
+      "blocks": 64,
+      "meanGwei": 334.2236078008281,
+      "medianGwei": 325.869410054,
+      "p90Gwei": 368.642826222,
+      "minGwei": 318.519297806,
+      "maxGwei": 374.877882285
+    },
+    {
+      "oldestBlock": "0x5906e0a",
+      "newestBlock": 93351497,
+      "blocks": 64,
+      "meanGwei": 317.1940739928437,
+      "medianGwei": 316.862271148,
+      "p90Gwei": 327.191552831,
+      "minGwei": 299.075925059,
+      "maxGwei": 348.922459121
+    },
+    {
+      "oldestBlock": "0x59064aa",
+      "newestBlock": 93349097,
+      "blocks": 64,
+      "meanGwei": 332.0870997554376,
+      "medianGwei": 327.85087844,
+      "p90Gwei": 370.689569418,
+      "minGwei": 308.952532643,
+      "maxGwei": 376.617476459
+    },
+    {
+      "oldestBlock": "0x5905b4a",
+      "newestBlock": 93346697,
+      "blocks": 64,
+      "meanGwei": 340.7314475814062,
+      "medianGwei": 331.793053608,
+      "p90Gwei": 377.370230376,
+      "minGwei": 326.139230861,
+      "maxGwei": 386.224207913
+    },
+    {
+      "oldestBlock": "0x59051ea",
+      "newestBlock": 93344297,
+      "blocks": 64,
+      "meanGwei": 417.0458755882031,
+      "medianGwei": 426.674156582,
+      "p90Gwei": 450.698514086,
+      "minGwei": 318.430125544,
+      "maxGwei": 468.700792916
+    },
+    {
+      "oldestBlock": "0x590488a",
+      "newestBlock": 93341897,
+      "blocks": 64,
+      "meanGwei": 331.14531286185934,
+      "medianGwei": 318.575630132,
+      "p90Gwei": 404.281353661,
+      "minGwei": 306.661049921,
+      "maxGwei": 437.782032859
+    },
+    {
+      "oldestBlock": "0x5903f2a",
+      "newestBlock": 93339497,
+      "blocks": 64,
+      "meanGwei": 338.15885758317194,
+      "medianGwei": 326.76486313,
+      "p90Gwei": 371.26130657,
+      "minGwei": 320.659382468,
+      "maxGwei": 378.864127422
+    },
+    {
+      "oldestBlock": "0x59035ca",
+      "newestBlock": 93337097,
+      "blocks": 64,
+      "meanGwei": 359.1497277407813,
+      "medianGwei": 370.607744944,
+      "p90Gwei": 381.996044739,
+      "minGwei": 329.066799707,
+      "maxGwei": 388.660143409
+    },
+    {
+      "oldestBlock": "0x5902c6a",
+      "newestBlock": 93334697,
+      "blocks": 64,
+      "meanGwei": 344.6895365412344,
+      "medianGwei": 335.691013414,
+      "p90Gwei": 373.869162903,
+      "minGwei": 326.829342819,
+      "maxGwei": 378.963837064
+    },
+    {
+      "oldestBlock": "0x590230a",
+      "newestBlock": 93332297,
+      "blocks": 64,
+      "meanGwei": 372.4549796320938,
+      "medianGwei": 375.155200062,
+      "p90Gwei": 383.082186497,
+      "minGwei": 334.199786223,
+      "maxGwei": 392.608598501
+    },
+    {
+      "oldestBlock": "0x59019aa",
+      "newestBlock": 93329897,
+      "blocks": 64,
+      "meanGwei": 335.40020367701567,
+      "medianGwei": 334.117568715,
+      "p90Gwei": 343.618673431,
+      "minGwei": 287.75958837,
+      "maxGwei": 380.578310938
+    },
+    {
+      "oldestBlock": "0x590104a",
+      "newestBlock": 93327497,
+      "blocks": 64,
+      "meanGwei": 371.31680250431236,
+      "medianGwei": 381.409451402,
+      "p90Gwei": 418.729838065,
+      "minGwei": 328.104967486,
+      "maxGwei": 429.535688848
+    },
+    {
+      "oldestBlock": "0x59006ea",
+      "newestBlock": 93325097,
+      "blocks": 64,
+      "meanGwei": 339.12083094070306,
+      "medianGwei": 331.206655125,
+      "p90Gwei": 374.242524104,
+      "minGwei": 326.817090624,
+      "maxGwei": 378.653909279
+    },
+    {
+      "oldestBlock": "0x58ffd8a",
+      "newestBlock": 93322697,
+      "blocks": 64,
+      "meanGwei": 332.4964201905625,
+      "medianGwei": 330.711396681,
+      "p90Gwei": 333.583304761,
+      "minGwei": 326.415474911,
+      "maxGwei": 372.001917798
+    },
+    {
+      "oldestBlock": "0x58ff42a",
+      "newestBlock": 93320297,
+      "blocks": 64,
+      "meanGwei": 345.88564073989056,
+      "medianGwei": 334.174865533,
+      "p90Gwei": 383.415941736,
+      "minGwei": 323.058926592,
+      "maxGwei": 387.685650584
+    },
+    {
+      "oldestBlock": "0x58feaca",
+      "newestBlock": 93317897,
+      "blocks": 64,
+      "meanGwei": 332.6427298783125,
+      "medianGwei": 332.597919409,
+      "p90Gwei": 338.172452402,
+      "minGwei": 324.758369212,
+      "maxGwei": 347.969261034
+    },
+    {
+      "oldestBlock": "0x58fe16a",
+      "newestBlock": 93315497,
+      "blocks": 64,
+      "meanGwei": 333.94654199075006,
+      "medianGwei": 331.382750726,
+      "p90Gwei": 343.420401557,
+      "minGwei": 325.6254485,
+      "maxGwei": 370.115580907
+    },
+    {
+      "oldestBlock": "0x58fd80a",
+      "newestBlock": 93313097,
+      "blocks": 64,
+      "meanGwei": 351.0097614840938,
+      "medianGwei": 332.15702058,
+      "p90Gwei": 385.964987766,
+      "minGwei": 318.263631489,
+      "maxGwei": 413.073374457
+    },
+    {
+      "oldestBlock": "0x58fceaa",
+      "newestBlock": 93310697,
+      "blocks": 64,
+      "meanGwei": 328.17586215914076,
+      "medianGwei": 327.070624415,
+      "p90Gwei": 333.099828685,
+      "minGwei": 320.98403992,
+      "maxGwei": 335.743533704
+    },
+    {
+      "oldestBlock": "0x58fc54a",
+      "newestBlock": 93308297,
+      "blocks": 64,
+      "meanGwei": 330.0606877470156,
+      "medianGwei": 329.223224214,
+      "p90Gwei": 334.415901919,
+      "minGwei": 319.517888788,
+      "maxGwei": 347.934084954
+    },
+    {
+      "oldestBlock": "0x58fbbea",
+      "newestBlock": 93305897,
+      "blocks": 64,
+      "meanGwei": 333.0513778047344,
+      "medianGwei": 331.953751609,
+      "p90Gwei": 336.807060187,
+      "minGwei": 326.164221185,
+      "maxGwei": 367.412816859
+    },
+    {
+      "oldestBlock": "0x58fb28a",
+      "newestBlock": 93303497,
+      "blocks": 64,
+      "meanGwei": 333.70042312373437,
+      "medianGwei": 332.546115995,
+      "p90Gwei": 339.565542833,
+      "minGwei": 284.799375646,
+      "maxGwei": 373.783555052
+    },
+    {
+      "oldestBlock": "0x58fa92a",
+      "newestBlock": 93301097,
+      "blocks": 64,
+      "meanGwei": 352.4772660181405,
+      "medianGwei": 331.418808912,
+      "p90Gwei": 393.675175883,
+      "minGwei": 297.543715965,
+      "maxGwei": 402.315598214
+    },
+    {
+      "oldestBlock": "0x58f9fca",
+      "newestBlock": 93298697,
+      "blocks": 64,
+      "meanGwei": 358.1670685887656,
+      "medianGwei": 374.466283842,
+      "p90Gwei": 405.511489226,
+      "minGwei": 297.991836134,
+      "maxGwei": 412.343617768
+    },
+    {
+      "oldestBlock": "0x58f966a",
+      "newestBlock": 93296297,
+      "blocks": 64,
+      "meanGwei": 355.793138438375,
+      "medianGwei": 371.819693407,
+      "p90Gwei": 382.992364997,
+      "minGwei": 323.422089668,
+      "maxGwei": 388.108021542
+    },
+    {
+      "oldestBlock": "0x58f8d0a",
+      "newestBlock": 93293897,
+      "blocks": 64,
+      "meanGwei": 373.8795380970936,
+      "medianGwei": 382.764861235,
+      "p90Gwei": 413.685182199,
+      "minGwei": 326.862176204,
+      "maxGwei": 426.750631681
+    },
+    {
+      "oldestBlock": "0x58f83aa",
+      "newestBlock": 93291497,
+      "blocks": 64,
+      "meanGwei": 422.0390359054531,
+      "medianGwei": 398.170288928,
+      "p90Gwei": 508.039499304,
+      "minGwei": 290.453301901,
+      "maxGwei": 542.286920496
+    },
+    {
+      "oldestBlock": "0x58f7a4a",
+      "newestBlock": 93289097,
+      "blocks": 64,
+      "meanGwei": 345.3730722955626,
+      "medianGwei": 328.087181226,
+      "p90Gwei": 383.798433928,
+      "minGwei": 322.907059612,
+      "maxGwei": 397.180999385
+    },
+    {
+      "oldestBlock": "0x58f70ea",
+      "newestBlock": 93286697,
+      "blocks": 64,
+      "meanGwei": 326.75574060095306,
+      "medianGwei": 327.921030087,
+      "p90Gwei": 331.693713532,
+      "minGwei": 314.439544898,
+      "maxGwei": 335.408335997
+    },
+    {
+      "oldestBlock": "0x58f678a",
+      "newestBlock": 93284297,
+      "blocks": 64,
+      "meanGwei": 366.83566959053115,
+      "medianGwei": 373.867136724,
+      "p90Gwei": 395.600353329,
+      "minGwei": 321.696486572,
+      "maxGwei": 405.906062483
+    },
+    {
+      "oldestBlock": "0x58f5e2a",
+      "newestBlock": 93281897,
+      "blocks": 64,
+      "meanGwei": 375.3331217956095,
+      "medianGwei": 379.096131818,
+      "p90Gwei": 394.306592153,
+      "minGwei": 330.201463341,
+      "maxGwei": 408.540134555
+    },
+    {
+      "oldestBlock": "0x58f54ca",
+      "newestBlock": 93279497,
+      "blocks": 64,
+      "meanGwei": 348.5206132047344,
+      "medianGwei": 334.887217069,
+      "p90Gwei": 377.579248097,
+      "minGwei": 307.204436026,
+      "maxGwei": 382.648249875
+    },
+    {
+      "oldestBlock": "0x58f4b6a",
+      "newestBlock": 93277097,
+      "blocks": 64,
+      "meanGwei": 328.4490626110626,
+      "medianGwei": 326.662698878,
+      "p90Gwei": 336.010596541,
+      "minGwei": 321.94304857,
+      "maxGwei": 339.578014699
+    },
+    {
+      "oldestBlock": "0x58f420a",
+      "newestBlock": 93274697,
+      "blocks": 64,
+      "meanGwei": 397.27753865921875,
+      "medianGwei": 395.438504233,
+      "p90Gwei": 410.079316966,
+      "minGwei": 377.291989936,
+      "maxGwei": 429.318014967
+    },
+    {
+      "oldestBlock": "0x58f38aa",
+      "newestBlock": 93272297,
+      "blocks": 64,
+      "meanGwei": 362.72039003303126,
+      "medianGwei": 372.364624672,
+      "p90Gwei": 389.951984428,
+      "minGwei": 322.852773444,
+      "maxGwei": 400.99491513
+    },
+    {
+      "oldestBlock": "0x58f2f4a",
+      "newestBlock": 93269897,
+      "blocks": 64,
+      "meanGwei": 326.5056466648438,
+      "medianGwei": 324.616237706,
+      "p90Gwei": 328.289189841,
+      "minGwei": 320.298898589,
+      "maxGwei": 367.597189164
+    },
+    {
+      "oldestBlock": "0x58f25ea",
+      "newestBlock": 93267497,
+      "blocks": 64,
+      "meanGwei": 323.4860647417813,
+      "medianGwei": 323.411955912,
+      "p90Gwei": 325.763754823,
+      "minGwei": 319.446178565,
+      "maxGwei": 327.226193397
+    },
+    {
+      "oldestBlock": "0x58f1c8a",
+      "newestBlock": 93265097,
+      "blocks": 64,
+      "meanGwei": 332.6789808775312,
+      "medianGwei": 332.2686624,
+      "p90Gwei": 335.373431201,
+      "minGwei": 303.420550895,
+      "maxGwei": 373.157915378
+    },
+    {
+      "oldestBlock": "0x58f132a",
+      "newestBlock": 93262697,
+      "blocks": 64,
+      "meanGwei": 328.75356729725,
+      "medianGwei": 328.629951286,
+      "p90Gwei": 331.395826736,
+      "minGwei": 318.065448105,
+      "maxGwei": 371.099157601
+    },
+    {
+      "oldestBlock": "0x58f09ca",
+      "newestBlock": 93260297,
+      "blocks": 64,
+      "meanGwei": 332.4470148009844,
+      "medianGwei": 328.015598501,
+      "p90Gwei": 357.529925175,
+      "minGwei": 318.577105361,
+      "maxGwei": 375.381046949
+    },
+    {
+      "oldestBlock": "0x58f006a",
+      "newestBlock": 93257897,
+      "blocks": 64,
+      "meanGwei": 341.7772912679844,
+      "medianGwei": 330.83506504,
+      "p90Gwei": 381.424948455,
+      "minGwei": 323.547122109,
+      "maxGwei": 384.996593428
+    },
+    {
+      "oldestBlock": "0x58ef70a",
+      "newestBlock": 93255497,
+      "blocks": 64,
+      "meanGwei": 321.1826014141406,
+      "medianGwei": 319.770308602,
+      "p90Gwei": 329.226189379,
+      "minGwei": 309.71626172,
+      "maxGwei": 362.9494122
+    },
+    {
+      "oldestBlock": "0x58eedaa",
+      "newestBlock": 93253097,
+      "blocks": 64,
+      "meanGwei": 327.82618040871876,
+      "medianGwei": 327.010278153,
+      "p90Gwei": 331.741457142,
+      "minGwei": 321.641638013,
+      "maxGwei": 369.988333617
+    },
+    {
+      "oldestBlock": "0x58ee44a",
+      "newestBlock": 93250697,
+      "blocks": 64,
+      "meanGwei": 302.1736149947969,
+      "medianGwei": 297.43177038,
+      "p90Gwei": 317.218316634,
+      "minGwei": 285.614064051,
+      "maxGwei": 334.486664601
+    },
+    {
+      "oldestBlock": "0x58edaea",
+      "newestBlock": 93248297,
+      "blocks": 64,
+      "meanGwei": 333.45337402078127,
+      "medianGwei": 331.325603187,
+      "p90Gwei": 336.165797308,
+      "minGwei": 325.998312302,
+      "maxGwei": 377.559294431
+    },
+    {
+      "oldestBlock": "0x58ed18a",
+      "newestBlock": 93245897,
+      "blocks": 64,
+      "meanGwei": 341.5432634857811,
+      "medianGwei": 330.264150841,
+      "p90Gwei": 372.483298379,
+      "minGwei": 318.914478393,
+      "maxGwei": 388.302948481
+    },
+    {
+      "oldestBlock": "0x58ec82a",
+      "newestBlock": 93243497,
+      "blocks": 64,
+      "meanGwei": 372.54423296300007,
+      "medianGwei": 388.580995064,
+      "p90Gwei": 408.629499196,
+      "minGwei": 320.285434669,
+      "maxGwei": 697.377505174
+    },
+    {
+      "oldestBlock": "0x58ebeca",
+      "newestBlock": 93241097,
+      "blocks": 64,
+      "meanGwei": 347.06194301171877,
+      "medianGwei": 316.677416719,
+      "p90Gwei": 404.822700453,
+      "minGwei": 277.384239011,
+      "maxGwei": 414.865555873
+    },
+    {
+      "oldestBlock": "0x58eb56a",
+      "newestBlock": 93238697,
+      "blocks": 64,
+      "meanGwei": 364.7520239341561,
+      "medianGwei": 336.607914313,
+      "p90Gwei": 428.280533968,
+      "minGwei": 322.147269493,
+      "maxGwei": 434.35113696
+    },
+    {
+      "oldestBlock": "0x58eac0a",
+      "newestBlock": 93236297,
+      "blocks": 64,
+      "meanGwei": 348.1924457457189,
+      "medianGwei": 327.067478655,
+      "p90Gwei": 394.674459901,
+      "minGwei": 319.2018873,
+      "maxGwei": 402.929938518
+    },
+    {
+      "oldestBlock": "0x58ea2aa",
+      "newestBlock": 93233897,
+      "blocks": 64,
+      "meanGwei": 347.2779872231562,
+      "medianGwei": 325.723397932,
+      "p90Gwei": 388.872147937,
+      "minGwei": 319.568679007,
+      "maxGwei": 403.998779457
+    },
+    {
+      "oldestBlock": "0x58e994a",
+      "newestBlock": 93231497,
+      "blocks": 64,
+      "meanGwei": 323.4604705130938,
+      "medianGwei": 323.955639327,
+      "p90Gwei": 326.651084919,
+      "minGwei": 305.182851242,
+      "maxGwei": 330.400614047
+    },
+    {
+      "oldestBlock": "0x58e8fea",
+      "newestBlock": 93229097,
+      "blocks": 64,
+      "meanGwei": 328.1123944432968,
+      "medianGwei": 329.065942842,
+      "p90Gwei": 332.060514237,
+      "minGwei": 274.938538501,
+      "maxGwei": 335.428356747
+    },
+    {
+      "oldestBlock": "0x58e868a",
+      "newestBlock": 93226697,
+      "blocks": 64,
+      "meanGwei": 347.60377478289064,
+      "medianGwei": 328.912450159,
+      "p90Gwei": 390.980131977,
+      "minGwei": 313.529650533,
+      "maxGwei": 400.839995858
+    },
+    {
+      "oldestBlock": "0x58e7d2a",
+      "newestBlock": 93224297,
+      "blocks": 64,
+      "meanGwei": 340.6984282281875,
+      "medianGwei": 335.006575732,
+      "p90Gwei": 348.150027092,
+      "minGwei": 326.791691519,
+      "maxGwei": 405.229053369
+    },
+    {
+      "oldestBlock": "0x58e73ca",
+      "newestBlock": 93221897,
+      "blocks": 64,
+      "meanGwei": 370.2973080809063,
+      "medianGwei": 377.496809239,
+      "p90Gwei": 411.12123519,
+      "minGwei": 329.987594641,
+      "maxGwei": 428.215252671
+    },
+    {
+      "oldestBlock": "0x58e6a6a",
+      "newestBlock": 93219497,
+      "blocks": 64,
+      "meanGwei": 399.7702201054688,
+      "medianGwei": 407.55138995,
+      "p90Gwei": 422.202238485,
+      "minGwei": 308.963561866,
+      "maxGwei": 429.184466861
+    },
+    {
+      "oldestBlock": "0x58e610a",
+      "newestBlock": 93217097,
+      "blocks": 64,
+      "meanGwei": 382.81473810170297,
+      "medianGwei": 389.449536756,
+      "p90Gwei": 405.536504452,
+      "minGwei": 323.39477858,
+      "maxGwei": 476.479509229
+    },
+    {
+      "oldestBlock": "0x58e57aa",
+      "newestBlock": 93214697,
+      "blocks": 64,
+      "meanGwei": 396.20462289559373,
+      "medianGwei": 394.520766703,
+      "p90Gwei": 412.329573538,
+      "minGwei": 374.89922288,
+      "maxGwei": 416.161375645
+    },
+    {
+      "oldestBlock": "0x58e4e4a",
+      "newestBlock": 93212297,
+      "blocks": 64,
+      "meanGwei": 389.49119109207817,
+      "medianGwei": 397.747608295,
+      "p90Gwei": 417.535989456,
+      "minGwei": 325.968114848,
+      "maxGwei": 421.665848106
+    },
+    {
+      "oldestBlock": "0x58e44ea",
+      "newestBlock": 93209897,
+      "blocks": 64,
+      "meanGwei": 334.1530013299375,
+      "medianGwei": 330.179647295,
+      "p90Gwei": 349.939014385,
+      "minGwei": 324.918299872,
+      "maxGwei": 378.095945189
+    },
+    {
+      "oldestBlock": "0x58e3b8a",
+      "newestBlock": 93207497,
+      "blocks": 64,
+      "meanGwei": 358.42177253692176,
+      "medianGwei": 334.580803148,
+      "p90Gwei": 396.305634977,
+      "minGwei": 326.804843071,
+      "maxGwei": 411.817290532
+    },
+    {
+      "oldestBlock": "0x58e322a",
+      "newestBlock": 93205097,
+      "blocks": 64,
+      "meanGwei": 406.0024435994687,
+      "medianGwei": 398.472258861,
+      "p90Gwei": 442.465640641,
+      "minGwei": 376.364941638,
+      "maxGwei": 454.613743511
+    },
+    {
+      "oldestBlock": "0x58e28ca",
+      "newestBlock": 93202697,
+      "blocks": 64,
+      "meanGwei": 384.2560026871405,
+      "medianGwei": 381.212342999,
+      "p90Gwei": 435.777330616,
+      "minGwei": 333.880656248,
+      "maxGwei": 446.228124808
+    },
+    {
+      "oldestBlock": "0x58e1f6a",
+      "newestBlock": 93200297,
+      "blocks": 64,
+      "meanGwei": 330.22614514553135,
+      "medianGwei": 328.984046769,
+      "p90Gwei": 345.90894474,
+      "minGwei": 315.193480389,
+      "maxGwei": 373.331488786
+    },
+    {
+      "oldestBlock": "0x58e160a",
+      "newestBlock": 93197897,
+      "blocks": 64,
+      "meanGwei": 365.733082366125,
+      "medianGwei": 378.566423657,
+      "p90Gwei": 399.052654448,
+      "minGwei": 327.141210172,
+      "maxGwei": 408.626971987
+    },
+    {
+      "oldestBlock": "0x58e0caa",
+      "newestBlock": 93195497,
+      "blocks": 64,
+      "meanGwei": 322.3968306383594,
+      "medianGwei": 321.221150158,
+      "p90Gwei": 324.192982813,
+      "minGwei": 316.302769856,
+      "maxGwei": 389.538741712
+    },
+    {
+      "oldestBlock": "0x58e034a",
+      "newestBlock": 93193097,
+      "blocks": 64,
+      "meanGwei": 321.88612289293764,
+      "medianGwei": 322.350210223,
+      "p90Gwei": 324.441575912,
+      "minGwei": 311.710089175,
+      "maxGwei": 339.125207706
+    },
+    {
+      "oldestBlock": "0x58df9ea",
+      "newestBlock": 93190697,
+      "blocks": 64,
+      "meanGwei": 336.71836179123426,
+      "medianGwei": 330.85597968,
+      "p90Gwei": 381.212816309,
+      "minGwei": 287.941035991,
+      "maxGwei": 388.066523207
+    },
+    {
+      "oldestBlock": "0x58df08a",
+      "newestBlock": 93188297,
+      "blocks": 64,
+      "meanGwei": 318.727705430328,
+      "medianGwei": 320.955106184,
+      "p90Gwei": 326.778731885,
+      "minGwei": 286.402855674,
+      "maxGwei": 339.318144199
+    },
+    {
+      "oldestBlock": "0x58de72a",
+      "newestBlock": 93185897,
+      "blocks": 64,
+      "meanGwei": 379.06030967414046,
+      "medianGwei": 381.04619562,
+      "p90Gwei": 390.639400603,
+      "minGwei": 306.916439459,
+      "maxGwei": 394.430592107
+    },
+    {
+      "oldestBlock": "0x58dddca",
+      "newestBlock": 93183497,
+      "blocks": 64,
+      "meanGwei": 346.50630259398434,
+      "medianGwei": 327.239070162,
+      "p90Gwei": 393.511183987,
+      "minGwei": 295.660114216,
+      "maxGwei": 401.501571758
+    },
+    {
+      "oldestBlock": "0x58dd46a",
+      "newestBlock": 93181097,
+      "blocks": 64,
+      "meanGwei": 337.529100191,
+      "medianGwei": 333.921977237,
+      "p90Gwei": 340.719508669,
+      "minGwei": 329.567020269,
+      "maxGwei": 382.39884609
+    },
+    {
+      "oldestBlock": "0x58dcb0a",
+      "newestBlock": 93178697,
+      "blocks": 64,
+      "meanGwei": 344.7020994571095,
+      "medianGwei": 326.991154322,
+      "p90Gwei": 382.837584794,
+      "minGwei": 315.924910645,
+      "maxGwei": 386.858992353
+    },
+    {
+      "oldestBlock": "0x58dc1aa",
+      "newestBlock": 93176297,
+      "blocks": 64,
+      "meanGwei": 86.96526828460935,
+      "medianGwei": 87.451727603,
+      "p90Gwei": 88.635246872,
+      "minGwei": 39,
+      "maxGwei": 89.27425294
+    },
+    {
+      "oldestBlock": "0x58db84a",
+      "newestBlock": 93173897,
+      "blocks": 64,
+      "meanGwei": 58.12492694209375,
+      "medianGwei": 55.400051667,
+      "p90Gwei": 76.200137978,
+      "minGwei": 30.000019446,
+      "maxGwei": 100
+    },
+    {
+      "oldestBlock": "0x58daeea",
+      "newestBlock": 93171497,
+      "blocks": 64,
+      "meanGwei": 58.61933679657809,
+      "medianGwei": 75.000000094,
+      "p90Gwei": 75.000000291,
+      "minGwei": 27.500000094,
+      "maxGwei": 82.500000321
+    },
+    {
+      "oldestBlock": "0x58da58a",
+      "newestBlock": 93169097,
+      "blocks": 64,
+      "meanGwei": 43.87664277232811,
+      "medianGwei": 37.500070908,
+      "p90Gwei": 75.000052776,
+      "minGwei": 25.00005158,
+      "maxGwei": 126.316067577
+    },
+    {
+      "oldestBlock": "0x58d9c2a",
+      "newestBlock": 93166697,
+      "blocks": 64,
+      "meanGwei": 353.21038435168754,
+      "medianGwei": 334.216989256,
+      "p90Gwei": 399.428183616,
+      "minGwei": 322.514962316,
+      "maxGwei": 419.003499999
+    },
+    {
+      "oldestBlock": "0x58d92ca",
+      "newestBlock": 93164297,
+      "blocks": 64,
+      "meanGwei": 331.40264621037505,
+      "medianGwei": 331.552372893,
+      "p90Gwei": 334.573360195,
+      "minGwei": 325.493805852,
+      "maxGwei": 337.281898798
+    },
+    {
+      "oldestBlock": "0x58d896a",
+      "newestBlock": 93161897,
+      "blocks": 64,
+      "meanGwei": 347.8201860889999,
+      "medianGwei": 336.249509802,
+      "p90Gwei": 380.530498171,
+      "minGwei": 322.98561368,
+      "maxGwei": 386.296240809
+    },
+    {
+      "oldestBlock": "0x58d800a",
+      "newestBlock": 93159497,
+      "blocks": 64,
+      "meanGwei": 396.8078008870001,
+      "medianGwei": 395.767602645,
+      "p90Gwei": 418.168572823,
+      "minGwei": 371.633482516,
+      "maxGwei": 424.379570775
+    },
+    {
+      "oldestBlock": "0x58d76aa",
+      "newestBlock": 93157097,
+      "blocks": 64,
+      "meanGwei": 408.83022411960945,
+      "medianGwei": 410.751218199,
+      "p90Gwei": 449.586465201,
+      "minGwei": 314.67029387,
+      "maxGwei": 501.12693988
+    },
+    {
+      "oldestBlock": "0x58d6d4a",
+      "newestBlock": 93154697,
+      "blocks": 64,
+      "meanGwei": 327.4231053671718,
+      "medianGwei": 325.848600391,
+      "p90Gwei": 334.533506531,
+      "minGwei": 278.356420968,
+      "maxGwei": 371.362950833
+    },
+    {
+      "oldestBlock": "0x58d63ea",
+      "newestBlock": 93152297,
+      "blocks": 64,
+      "meanGwei": 394.8146014646876,
+      "medianGwei": 398.573829356,
+      "p90Gwei": 458.793904506,
+      "minGwei": 323.88615387,
+      "maxGwei": 491.990311953
+    },
+    {
+      "oldestBlock": "0x58d5a8a",
+      "newestBlock": 93149897,
+      "blocks": 64,
+      "meanGwei": 384.7296430281719,
+      "medianGwei": 387.083643102,
+      "p90Gwei": 414.055555317,
+      "minGwei": 325.669484061,
+      "maxGwei": 420.189223085
+    },
+    {
+      "oldestBlock": "0x58d512a",
+      "newestBlock": 93147497,
+      "blocks": 64,
+      "meanGwei": 355.312150792625,
+      "medianGwei": 341.469019137,
+      "p90Gwei": 409.009599786,
+      "minGwei": 320.86336432,
+      "maxGwei": 412.916236065
+    },
+    {
+      "oldestBlock": "0x58d47ca",
+      "newestBlock": 93145097,
+      "blocks": 64,
+      "meanGwei": 337.3147408014374,
+      "medianGwei": 330.319181943,
+      "p90Gwei": 371.639163874,
+      "minGwei": 321.801172489,
+      "maxGwei": 389.428151187
+    },
+    {
+      "oldestBlock": "0x58d3e6a",
+      "newestBlock": 93142697,
+      "blocks": 64,
+      "meanGwei": 377.5256466639843,
+      "medianGwei": 377.706445247,
+      "p90Gwei": 426.003016808,
+      "minGwei": 321.38385177,
+      "maxGwei": 444.388535321
+    },
+    {
+      "oldestBlock": "0x58d350a",
+      "newestBlock": 93140297,
+      "blocks": 64,
+      "meanGwei": 320.23061150578116,
+      "medianGwei": 318.864786826,
+      "p90Gwei": 323.565859321,
+      "minGwei": 306.004864001,
+      "maxGwei": 388.481721807
+    },
+    {
+      "oldestBlock": "0x58d2baa",
+      "newestBlock": 93137897,
+      "blocks": 64,
+      "meanGwei": 361.56716553770315,
+      "medianGwei": 376.383425121,
+      "p90Gwei": 404.463700028,
+      "minGwei": 318.858397771,
+      "maxGwei": 407.865718847
+    },
+    {
+      "oldestBlock": "0x58d224a",
+      "newestBlock": 93135497,
+      "blocks": 64,
+      "meanGwei": 352.07448081107816,
+      "medianGwei": 339.461710811,
+      "p90Gwei": 378.346579729,
+      "minGwei": 323.468391897,
+      "maxGwei": 381.933542155
+    },
+    {
+      "oldestBlock": "0x58d18ea",
+      "newestBlock": 93133097,
+      "blocks": 64,
+      "meanGwei": 320.4657050986563,
+      "medianGwei": 320.408482018,
+      "p90Gwei": 330.101928477,
+      "minGwei": 275.528859883,
+      "maxGwei": 344.875546546
+    },
+    {
+      "oldestBlock": "0x58d0f8a",
+      "newestBlock": 93130697,
+      "blocks": 64,
+      "meanGwei": 322.8943204598907,
+      "medianGwei": 322.513665164,
+      "p90Gwei": 325.579650866,
+      "minGwei": 314.891043078,
+      "maxGwei": 338.004346889
+    },
+    {
+      "oldestBlock": "0x58d062a",
+      "newestBlock": 93128297,
+      "blocks": 64,
+      "meanGwei": 403.23124301325015,
+      "medianGwei": 409.490652706,
+      "p90Gwei": 443.35233811,
+      "minGwei": 305.854619737,
+      "maxGwei": 456.068106931
+    },
+    {
+      "oldestBlock": "0x58cfcca",
+      "newestBlock": 93125897,
+      "blocks": 64,
+      "meanGwei": 371.2783816869375,
+      "medianGwei": 398.991810318,
+      "p90Gwei": 431.341790833,
+      "minGwei": 300.63727369,
+      "maxGwei": 441.022134496
+    },
+    {
+      "oldestBlock": "0x58cf36a",
+      "newestBlock": 93123497,
+      "blocks": 64,
+      "meanGwei": 353.27312470668755,
+      "medianGwei": 332.050220249,
+      "p90Gwei": 399.666842565,
+      "minGwei": 318.842077988,
+      "maxGwei": 411.736135702
+    },
+    {
+      "oldestBlock": "0x58cea0a",
+      "newestBlock": 93121097,
+      "blocks": 64,
+      "meanGwei": 312.54880034170327,
+      "medianGwei": 312.11391539,
+      "p90Gwei": 322.784602716,
+      "minGwei": 299.037119383,
+      "maxGwei": 324.613098969
+    },
+    {
+      "oldestBlock": "0x58ce0aa",
+      "newestBlock": 93118697,
+      "blocks": 64,
+      "meanGwei": 315.0417573117187,
+      "medianGwei": 315.881028781,
+      "p90Gwei": 321.34413985,
+      "minGwei": 300.928626115,
+      "maxGwei": 325.04033923
+    },
+    {
+      "oldestBlock": "0x58cd74a",
+      "newestBlock": 93116297,
+      "blocks": 64,
+      "meanGwei": 314.4316955020469,
+      "medianGwei": 311.038209821,
+      "p90Gwei": 323.6913496,
+      "minGwei": 295.8932776,
+      "maxGwei": 372.935485903
+    },
+    {
+      "oldestBlock": "0x58ccdea",
+      "newestBlock": 93113897,
+      "blocks": 64,
+      "meanGwei": 356.4204769431094,
+      "medianGwei": 326.08057288,
+      "p90Gwei": 418.479929763,
+      "minGwei": 319.732326034,
+      "maxGwei": 426.141961883
+    },
+    {
+      "oldestBlock": "0x58cc48a",
+      "newestBlock": 93111497,
+      "blocks": 64,
+      "meanGwei": 378.733367474203,
+      "medianGwei": 382.746078051,
+      "p90Gwei": 421.07640089,
+      "minGwei": 276.351169161,
+      "maxGwei": 429.388669093
+    },
+    {
+      "oldestBlock": "0x58cbb2a",
+      "newestBlock": 93109097,
+      "blocks": 64,
+      "meanGwei": 361.29168586340626,
+      "medianGwei": 380.466679857,
+      "p90Gwei": 394.535046026,
+      "minGwei": 261.156630882,
+      "maxGwei": 400.609109255
+    },
+    {
+      "oldestBlock": "0x58cb1ca",
+      "newestBlock": 93106697,
+      "blocks": 64,
+      "meanGwei": 335.0951148909219,
+      "medianGwei": 333.45030514,
+      "p90Gwei": 344.630940463,
+      "minGwei": 322.420345978,
+      "maxGwei": 378.814762237
+    },
+    {
+      "oldestBlock": "0x58ca86a",
+      "newestBlock": 93104297,
+      "blocks": 64,
+      "meanGwei": 378.3259385451407,
+      "medianGwei": 380.393357243,
+      "p90Gwei": 389.034037127,
+      "minGwei": 338.136121489,
+      "maxGwei": 392.717528685
+    },
+    {
+      "oldestBlock": "0x58c9f0a",
+      "newestBlock": 93101897,
+      "blocks": 64,
+      "meanGwei": 403.5581484491093,
+      "medianGwei": 402.77220927,
+      "p90Gwei": 432.625691088,
+      "minGwei": 378.419381095,
+      "maxGwei": 440.835521629
+    },
+    {
+      "oldestBlock": "0x58c95aa",
+      "newestBlock": 93099497,
+      "blocks": 64,
+      "meanGwei": 329.99222763259365,
+      "medianGwei": 323.211175693,
+      "p90Gwei": 368.228005936,
+      "minGwei": 278.248159427,
+      "maxGwei": 380.000592177
+    },
+    {
+      "oldestBlock": "0x58c8c4a",
+      "newestBlock": 93097097,
+      "blocks": 64,
+      "meanGwei": 408.32566936584374,
+      "medianGwei": 402.756730609,
+      "p90Gwei": 441.764130186,
+      "minGwei": 327.932917947,
+      "maxGwei": 455.270339012
+    },
+    {
+      "oldestBlock": "0x58c82ea",
+      "newestBlock": 93094697,
+      "blocks": 64,
+      "meanGwei": 371.05937777978113,
+      "medianGwei": 383.953459136,
+      "p90Gwei": 399.547562799,
+      "minGwei": 284.654530481,
+      "maxGwei": 407.757885523
+    },
+    {
+      "oldestBlock": "0x58c798a",
+      "newestBlock": 93092297,
+      "blocks": 64,
+      "meanGwei": 366.4408227119062,
+      "medianGwei": 376.62586365,
+      "p90Gwei": 395.562800523,
+      "minGwei": 298.1753777,
+      "maxGwei": 397.677468131
+    },
+    {
+      "oldestBlock": "0x58c702a",
+      "newestBlock": 93089897,
+      "blocks": 64,
+      "meanGwei": 329.54253172318744,
+      "medianGwei": 323.094597349,
+      "p90Gwei": 353.002819314,
+      "minGwei": 318.508376865,
+      "maxGwei": 388.73592546
+    },
+    {
+      "oldestBlock": "0x58c66ca",
+      "newestBlock": 93087497,
+      "blocks": 64,
+      "meanGwei": 386.38843702318746,
+      "medianGwei": 397.090372607,
+      "p90Gwei": 408.978171406,
+      "minGwei": 277.714657014,
+      "maxGwei": 412.300648101
+    },
+    {
+      "oldestBlock": "0x58c5d6a",
+      "newestBlock": 93085097,
+      "blocks": 64,
+      "meanGwei": 352.72643136832824,
+      "medianGwei": 335.676801188,
+      "p90Gwei": 386.22704494,
+      "minGwei": 315.243561809,
+      "maxGwei": 442.426879711
+    },
+    {
+      "oldestBlock": "0x58c540a",
+      "newestBlock": 93082697,
+      "blocks": 64,
+      "meanGwei": 385.1744268117969,
+      "medianGwei": 387.253996232,
+      "p90Gwei": 399.0654411,
+      "minGwei": 329.804147562,
+      "maxGwei": 406.249199231
+    },
+    {
+      "oldestBlock": "0x58c4aaa",
+      "newestBlock": 93080297,
+      "blocks": 64,
+      "meanGwei": 78.3383545773125,
+      "medianGwei": 78.750005337,
+      "p90Gwei": 83.927815977,
+      "minGwei": 30.000006614,
+      "maxGwei": 83.927830548
+    },
+    {
+      "oldestBlock": "0x58c414a",
+      "newestBlock": 93077897,
+      "blocks": 64,
+      "meanGwei": 35.38556478401562,
+      "medianGwei": 34.164775647,
+      "p90Gwei": 40.00000981,
+      "minGwei": 30.000009261,
+      "maxGwei": 50.296707938
+    },
+    {
+      "oldestBlock": "0x58c37ea",
+      "newestBlock": 93075497,
+      "blocks": 64,
+      "meanGwei": 38.21201319626563,
+      "medianGwei": 38.083503096,
+      "p90Gwei": 40.352456031,
+      "minGwei": 30.01659467,
+      "maxGwei": 56.259140045
+    },
+    {
+      "oldestBlock": "0x58c2e8a",
+      "newestBlock": 93073097,
+      "blocks": 64,
+      "meanGwei": 61.53933639818749,
+      "medianGwei": 62.76223635,
+      "p90Gwei": 71.264996828,
+      "minGwei": 40.189662569,
+      "maxGwei": 87.410335752
+    },
+    {
+      "oldestBlock": "0x58c252a",
+      "newestBlock": 93070697,
+      "blocks": 64,
+      "meanGwei": 430.74010370667185,
+      "medianGwei": 406.726572415,
+      "p90Gwei": 495.078878718,
+      "minGwei": 324.397396672,
+      "maxGwei": 535.480288108
+    },
+    {
+      "oldestBlock": "0x58c1bca",
+      "newestBlock": 93068297,
+      "blocks": 64,
+      "meanGwei": 340.4520179355782,
+      "medianGwei": 360.600187909,
+      "p90Gwei": 400.803855914,
+      "minGwei": 205.947429308,
+      "maxGwei": 410.41756079
+    },
+    {
+      "oldestBlock": "0x58c126a",
+      "newestBlock": 93065897,
+      "blocks": 64,
+      "meanGwei": 76.42319533964064,
+      "medianGwei": 80.576661863,
+      "p90Gwei": 93.94404785,
+      "minGwei": 45.699505209,
+      "maxGwei": 94.335944148
+    },
+    {
+      "oldestBlock": "0x58c090a",
+      "newestBlock": 93063497,
+      "blocks": 64,
+      "meanGwei": 346.4127100852032,
+      "medianGwei": 328.617565621,
+      "p90Gwei": 398.636084494,
+      "minGwei": 270.950462995,
+      "maxGwei": 405.039638239
+    },
+    {
+      "oldestBlock": "0x58bffaa",
+      "newestBlock": 93061097,
+      "blocks": 64,
+      "meanGwei": 328.40802790775,
+      "medianGwei": 324.717744057,
+      "p90Gwei": 340.723942805,
+      "minGwei": 270.53915548,
+      "maxGwei": 373.994573774
+    },
+    {
+      "oldestBlock": "0x58bf64a",
+      "newestBlock": 93058697,
+      "blocks": 64,
+      "meanGwei": 338.03003678128124,
+      "medianGwei": 323.652969148,
+      "p90Gwei": 401.412139338,
+      "minGwei": 315.579469012,
+      "maxGwei": 406.834085885
+    },
+    {
+      "oldestBlock": "0x58becea",
+      "newestBlock": 93056297,
+      "blocks": 64,
+      "meanGwei": 346.27293246887507,
+      "medianGwei": 334.871245335,
+      "p90Gwei": 382.182697309,
+      "minGwei": 315.747585359,
+      "maxGwei": 392.037063395
+    },
+    {
+      "oldestBlock": "0x58be38a",
+      "newestBlock": 93053897,
+      "blocks": 64,
+      "meanGwei": 454.5900740037187,
+      "medianGwei": 420.577466618,
+      "p90Gwei": 568.546447983,
+      "minGwei": 327.280995856,
+      "maxGwei": 645.435438289
+    },
+    {
+      "oldestBlock": "0x58bda2a",
+      "newestBlock": 93051497,
+      "blocks": 64,
+      "meanGwei": 348.8798065494375,
+      "medianGwei": 325.943963257,
+      "p90Gwei": 393.746523685,
+      "minGwei": 316.995102295,
+      "maxGwei": 412.536217298
+    },
+    {
+      "oldestBlock": "0x58bd0ca",
+      "newestBlock": 93049097,
+      "blocks": 64,
+      "meanGwei": 336.32153867910944,
+      "medianGwei": 330.690155446,
+      "p90Gwei": 371.499446385,
+      "minGwei": 308.398148858,
+      "maxGwei": 374.252837742
+    },
+    {
+      "oldestBlock": "0x58bc76a",
+      "newestBlock": 93046697,
+      "blocks": 64,
+      "meanGwei": 322.4098530957657,
+      "medianGwei": 322.155999262,
+      "p90Gwei": 326.657865179,
+      "minGwei": 295.434652246,
+      "maxGwei": 360.557447928
+    },
+    {
+      "oldestBlock": "0x58bbe0a",
+      "newestBlock": 93044297,
+      "blocks": 64,
+      "meanGwei": 362.2078777340312,
+      "medianGwei": 335.322880783,
+      "p90Gwei": 425.403690789,
+      "minGwei": 319.521455173,
+      "maxGwei": 443.737651746
+    },
+    {
+      "oldestBlock": "0x58bb4aa",
+      "newestBlock": 93041897,
+      "blocks": 64,
+      "meanGwei": 360.38342387776567,
+      "medianGwei": 374.04557833,
+      "p90Gwei": 381.470436449,
+      "minGwei": 321.053928634,
+      "maxGwei": 390.513187646
+    },
+    {
+      "oldestBlock": "0x58bab4a",
+      "newestBlock": 93039497,
+      "blocks": 64,
+      "meanGwei": 342.08297453153136,
+      "medianGwei": 326.042488031,
+      "p90Gwei": 379.855015852,
+      "minGwei": 320.110006269,
+      "maxGwei": 388.8798415
+    },
+    {
+      "oldestBlock": "0x58ba1ea",
+      "newestBlock": 93037097,
+      "blocks": 64,
+      "meanGwei": 362.7245107389843,
+      "medianGwei": 374.8499857,
+      "p90Gwei": 413.604210133,
+      "minGwei": 321.719419126,
+      "maxGwei": 421.76305636
+    },
+    {
+      "oldestBlock": "0x58b988a",
+      "newestBlock": 93034697,
+      "blocks": 64,
+      "meanGwei": 337.09857036565626,
+      "medianGwei": 324.732838947,
+      "p90Gwei": 377.146923481,
+      "minGwei": 319.531484064,
+      "maxGwei": 383.139193627
+    },
+    {
+      "oldestBlock": "0x58b8f2a",
+      "newestBlock": 93032297,
+      "blocks": 64,
+      "meanGwei": 327.47049223303134,
+      "medianGwei": 323.528549384,
+      "p90Gwei": 338.25790332,
+      "minGwei": 318.065000338,
+      "maxGwei": 372.512780508
+    },
+    {
+      "oldestBlock": "0x58b85ca",
+      "newestBlock": 93029897,
+      "blocks": 64,
+      "meanGwei": 351.1462836748594,
+      "medianGwei": 334.087374655,
+      "p90Gwei": 383.000053355,
+      "minGwei": 320.076681581,
+      "maxGwei": 398.050293285
+    },
+    {
+      "oldestBlock": "0x58b7c6a",
+      "newestBlock": 93027497,
+      "blocks": 64,
+      "meanGwei": 376.9704665346875,
+      "medianGwei": 377.635467924,
+      "p90Gwei": 434.879932639,
+      "minGwei": 328.190170014,
+      "maxGwei": 448.628739089
+    },
+    {
+      "oldestBlock": "0x58b730a",
+      "newestBlock": 93025097,
+      "blocks": 64,
+      "meanGwei": 344.53692817662494,
+      "medianGwei": 327.842554833,
+      "p90Gwei": 380.460324966,
+      "minGwei": 314.160339546,
+      "maxGwei": 394.621542103
+    },
+    {
+      "oldestBlock": "0x58b69aa",
+      "newestBlock": 93022697,
+      "blocks": 64,
+      "meanGwei": 325.80497873709373,
+      "medianGwei": 316.669454852,
+      "p90Gwei": 379.086531557,
+      "minGwei": 303.34627145,
+      "maxGwei": 492.11562267
+    },
+    {
+      "oldestBlock": "0x58b604a",
+      "newestBlock": 93020297,
+      "blocks": 64,
+      "meanGwei": 471.96577102821885,
+      "medianGwei": 390.920188385,
+      "p90Gwei": 709.187120106,
+      "minGwei": 331.527531214,
+      "maxGwei": 1012.417071334
+    },
+    {
+      "oldestBlock": "0x58b56ea",
+      "newestBlock": 93017897,
+      "blocks": 64,
+      "meanGwei": 337.8049603607031,
+      "medianGwei": 324.040299572,
+      "p90Gwei": 379.806662834,
+      "minGwei": 319.058427703,
+      "maxGwei": 394.883432233
+    },
+    {
+      "oldestBlock": "0x58b4d8a",
+      "newestBlock": 93015497,
+      "blocks": 64,
+      "meanGwei": 326.45258427387506,
+      "medianGwei": 322.71593932,
+      "p90Gwei": 334.050330549,
+      "minGwei": 315.952153675,
+      "maxGwei": 392.431414929
+    },
+    {
+      "oldestBlock": "0x58b442a",
+      "newestBlock": 93013097,
+      "blocks": 64,
+      "meanGwei": 266.50729267639065,
+      "medianGwei": 259.260882498,
+      "p90Gwei": 315.6284106,
+      "minGwei": 188.100385774,
+      "maxGwei": 357.235332961
+    }
+  ]
+}

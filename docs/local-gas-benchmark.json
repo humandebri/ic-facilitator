@@ -1,0 +1,107 @@
+{
+  "network": "local-anvil",
+  "chainId": 80002,
+  "generatedAt": "2026-09-08T00:26:08.873Z",
+  "batchContract": "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
+  "method": "Mainnet BatchSettlement runtime copied to isolated Anvil; fresh local state and TestEip3009Token; scripts/amoy_fee_benchmark.ts; no public-chain transactions; refundWithClaimN contains N claims and one refund, matching facilitator calldata",
+  "limitations": [
+    "Test token, not the production JPYC token",
+    "Local EVM gas schedule and fresh-state samples; not mainnet receipts"
+  ],
+  "actions": {
+    "exact": [
+      {
+        "action": "exact",
+        "gasUsed": "63360",
+        "status": "success",
+        "calldataBytes": 292
+      },
+      {
+        "action": "exactNonceReplay",
+        "gasUsed": "27550",
+        "status": "reverted",
+        "calldataBytes": 292
+      }
+    ],
+    "batch": [
+      {
+        "action": "batchDeposit",
+        "gasUsed": "132724",
+        "status": "success",
+        "calldataBytes": 612
+      },
+      {
+        "action": "batchClaim1",
+        "gasUsed": "78450",
+        "status": "success",
+        "calldataBytes": 708
+      },
+      {
+        "action": "batchClaim10",
+        "gasUsed": "280899",
+        "status": "success",
+        "calldataBytes": 5028
+      },
+      {
+        "action": "batchClaim50",
+        "gasUsed": "1265679",
+        "status": "success",
+        "calldataBytes": 24228
+      },
+      {
+        "action": "batchClaim100",
+        "gasUsed": "2517000",
+        "status": "success",
+        "calldataBytes": 48228
+      },
+      {
+        "action": "batchSettle",
+        "gasUsed": "63344",
+        "status": "success",
+        "calldataBytes": 68
+      },
+      {
+        "action": "batchSettleNoop",
+        "gasUsed": "25228",
+        "status": "success",
+        "calldataBytes": 68
+      },
+      {
+        "action": "batchRefund",
+        "gasUsed": "101618",
+        "status": "success",
+        "calldataBytes": 452
+      },
+      {
+        "action": "batchRefundWithClaim1",
+        "gasUsed": "123442",
+        "status": "success",
+        "calldataBytes": 1412
+      },
+      {
+        "action": "batchRefundWithClaim10",
+        "gasUsed": "343914",
+        "status": "success",
+        "calldataBytes": 5732
+      },
+      {
+        "action": "batchRefundWithClaim50",
+        "gasUsed": "1333433",
+        "status": "success",
+        "calldataBytes": 24932
+      },
+      {
+        "action": "batchRefundWithClaim100",
+        "gasUsed": "2592598",
+        "status": "success",
+        "calldataBytes": 48932
+      },
+      {
+        "action": "batchRefundWithClaim",
+        "gasUsed": "123442",
+        "status": "success",
+        "calldataBytes": 1412
+      }
+    ]
+  }
+}

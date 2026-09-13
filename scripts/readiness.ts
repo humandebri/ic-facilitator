@@ -110,7 +110,7 @@ function softenDeployOnlyCanisterFailures(stages: readonly ReadinessStage[]): re
   });
 }
 
-function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv): readonly string[] {
+export function nextCommands(stages: readonly ReadinessStage[], env: NodeJS.ProcessEnv): readonly string[] {
   const commands: string[] = [];
   const settlementFailures = stages.filter((item) => item.name === "settlement-receipt" && item.status === "fail").flatMap((item) => item.failures);
   const canPay = stages.filter((item) => item.name !== "settlement-receipt").every((item) => item.status === "ok");

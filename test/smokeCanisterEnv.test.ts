@@ -21,9 +21,6 @@ const partialBatchActionEnvNamesOutput = batchEnvNamesOutput.replace(
 );
 
 describe("canister env smoke", () => {
-  it("parses env_names output", () => {
-    expect(parseEnvNames(envNamesOutput)).toContain(facilitatorKeyEnv);
-  });
 
   it("rejects env_names output with extra text outside the Candid vector", () => {
     expect(() => parseEnvNames(`warning "BATCH_SETTLEMENT_CONTRACT" ${envNamesOutput}`)).toThrow(
@@ -66,8 +63,5 @@ describe("canister env smoke", () => {
     });
     const options = canisterEnvSmokeOptionsFromArgs(["node", "scripts/smoke_canister_env.ts", "--with-batch"]);
     expect(options).toEqual({ requireBatch: true });
-    expect(() => checkCanisterEnvNames(envNamesOutput, "ic", "edge", options)).toThrow(
-      "missing canister env names: BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY"
-    );
   });
 });

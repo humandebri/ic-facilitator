@@ -10,6 +10,15 @@ const privateKey = `0x${"1".repeat(64)}`;
 const sellerCreditPayTo = "0x2000000000000000000000000000000000000402";
 const batchSettlementContract = "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003";
 
+function isolatedEnv(dir: string): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH ?? "",
+    HOME: process.env.HOME ?? "",
+    TMPDIR: process.env.TMPDIR ?? tmpdir(),
+    DOTENV_PATH: join(dir, "missing.env"),
+  };
+}
+
 function fakeIcpDir(): { readonly dir: string; readonly logPath: string } {
   const dir = mkdtempSync(join(tmpdir(), "ic-facilitator-env-"));
   const logPath = join(dir, "icp.log");
@@ -27,7 +36,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: "0x1",
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
@@ -58,7 +67,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           DOTENV_PATH: join(dir, "missing.env"),
@@ -84,7 +93,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
@@ -116,7 +125,7 @@ describe("set_canister_env facilitator validation", () => {
           cwd: process.cwd(),
           encoding: "utf8",
           env: {
-            ...process.env,
+            ...isolatedEnv(dir),
             FACILITATOR_EVM_PRIVATE_KEY: privateKey,
             FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
             ICP_FAKE_LOG: logPath,
@@ -145,7 +154,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://trusted.example@evil.example",
           ICP_FAKE_LOG: logPath,
@@ -173,7 +182,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -205,7 +214,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
@@ -235,7 +244,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_CONTRACT: "0x0000000000000000000000000000000000000001",
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -266,7 +275,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: `0x${"2".repeat(64)}`,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "340282366920938463463374607431768211456",
@@ -297,7 +306,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: privateKey,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "100",
@@ -328,7 +337,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
@@ -377,7 +386,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
@@ -407,7 +416,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
           ICP_FAKE_LOG: logPath,
@@ -439,7 +448,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: batchReceiverAuthorizerKey,
           BATCH_SETTLEMENT_CONTRACT: batchSettlementContract,
           BATCH_SETTLEMENT_FEE_AMOUNT: "10000000000000000000",
@@ -491,7 +500,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           DOTENV_PATH: dotenvPath,
           ICP_FAKE_LOG: logPath,
           PATH: `${dir}:${process.env.PATH ?? ""}`
@@ -533,7 +542,7 @@ describe("set_canister_env facilitator validation", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {
-          ...process.env,
+          ...isolatedEnv(dir),
           DOTENV_PATH: dotenvPath,
           FACILITATOR_EVM_PRIVATE_KEY: privateKey,
           FACILITATOR_PUBLIC_ORIGIN: "https://canister.example.test",
