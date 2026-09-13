@@ -13,8 +13,7 @@ import {
   http,
   parseAbi,
   publicActions,
-  toHex,
-  zeroAddress
+  toHex
 } from "viem";
 import type { Address, Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -41,7 +40,6 @@ const tokenAbi = parseAbi([
   "function mint(address to,uint256 amount)",
   "function balanceOf(address account) view returns (uint256)"
 ]);
-const collectorAbi = parseAbi(["constructor(address token,uint256 amount)"]);
 const channelTypes = {
   ChannelConfig: [
     { name: "payer", type: "address" },

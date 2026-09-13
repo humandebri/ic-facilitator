@@ -149,7 +149,7 @@ function readExpectedResourceUrl(options: PayJpycOptions): string {
   return value;
 }
 
-function shouldRetryPaidRequest(options: PayJpycOptions): boolean {
+export function shouldRetryPaidRequest(options: PayJpycOptions): boolean {
   return options.withPaidRetry === true || readEnv("X402_PAID_RETRY") === "1";
 }
 
@@ -228,10 +228,6 @@ async function validatePaidResponse(
     readExpectedAmount(options)
   );
   return { body, settlement, status: response.status };
-}
-
-export function hasPaidJpycReportBody(value: unknown): boolean {
-  return hasExpectedPaidJpycReportBody(value, DEFAULT_JPYC_POLYGON_ADDRESS);
 }
 
 export function hasExpectedPaidJpycReportBody(value: unknown, expectedAsset: string): boolean {

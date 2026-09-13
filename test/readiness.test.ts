@@ -1,13 +1,19 @@
+import { depositInputFor } from "./fixtures/batchCalldata";
 // test/readiness.test.ts: canister-only readiness が不足条件だけを公開することを確認する。
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { encodePaymentRequiredHeader } from "@x402/core/http";
 import type { PaymentRequired } from "@x402/core/types";
 import type { Hex, TransactionReceipt } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { buildReadinessReport, buildReadinessReportWithSmoke, shouldFailReadiness } from "../scripts/readiness";
+import { buildReadinessReport, buildReadinessReportWithSmoke, shouldFailReadiness, nextCommands } from "../scripts/readiness";
 import type { BatchMainnetPreflightReader } from "../scripts/batch_mainnet_preflight";
 import type { BatchSettlementReceiptReader } from "../scripts/batch_settlement_receipt";
+
+vi.mock("../scripts/doctor", async (importOriginal) => {
+  const doctor = await importOriginal<typeof import("../scripts/doctor")>();
+  return { ...doctor, collectChecks: (_cwd: string, env: NodeJS.ProcessEnv, mode: Parameters<typeof doctor.envChecks>[0]) => doctor.envChecks(mode, env) };
+});
 
 const seller = "0x1000000000000000000000000000000000000402";
 const privateKey: Hex = `0x${"1".repeat(64)}`;
@@ -60,7 +66,7 @@ const batchChannelConfigWords = [
   uint256(900n),
   `0x${"33".repeat(32)}` as Hex
 ].map((word) => word.slice(2)).join("");
-const batchDepositInput: Hex = `0x140f1e75${batchChannelConfigWords}${uint256(100n).slice(2)}${topicAddress(batchPayer).slice(2)}${uint256(320n).slice(2)}${uint256(0n).slice(2)}` as Hex;
+const batchDepositInput = depositInputFor(batchChannelConfigWords, batchPayer, 100n);
 
 function paidNegativeFetch(calls?: { value: number }): typeof fetch {
   return async (_input, init) => {
@@ -155,9 +161,11 @@ describe("jpyc readiness", () => {
       SELLER_EVM_ADDRESS: seller,
       X402_BASE_URL: baseUrl,
       X402_TARGET_URL: resourceUrl
-    }, { fetchFn, includeCanisterSmoke: true });
+    }, { fetchFn, includeCanisterSmoke: true, canisterEnvNamesOutput: envNamesOutput, includeCanisterEnvSmoke: true, includeWallet: true, walletCheck: async () => undefined });
 
     expect(report.stages.find((stage) => stage.name === "canister-http")?.status).toBe("ok");
+    expect(report.stages.find((stage) => stage.name === "canister-env")?.status).toBe("ok");
+    expect(report.stages.find((stage) => stage.name === "wallet")?.status).toBe("ok");
     expect(report.nextCommands).not.toContain("npm run readiness:jpyc -- --with-canister-smoke");
   }, 10_000);
 
@@ -203,20 +211,6 @@ describe("jpyc readiness", () => {
     expect(report.nextCommands).not.toContain("npm run smoke:canister");
   }, 10_000);
 
-  it("can include canister env names smoke", async () => {
-    const report = await buildReadinessReportWithSmoke(".", {
-      BUYER_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
-      JPYC_EIP712_VERSION: "1",
-      POLYGON_RPC_URL: "https://polygon.example",
-      SELLER_EVM_ADDRESS: seller,
-      X402_TARGET_URL: resourceUrl
-    }, { canisterEnvNamesOutput: envNamesOutput, includeCanisterEnvSmoke: true });
-
-    expect(report.stages.find((stage) => stage.name === "canister-env")?.status).toBe("ok");
-  });
-
   it("requires batch canister env names when batch readiness stages are enabled", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
       BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
@@ -258,20 +252,6 @@ describe("jpyc readiness", () => {
 
     expect(calls.value).toBe(2);
     expect(report.stages.find((stage) => stage.name === "paid-negative-http")?.status).toBe("ok");
-  });
-
-  it("can include wallet stage", async () => {
-    const report = await buildReadinessReportWithSmoke(".", {
-      BUYER_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
-      JPYC_EIP712_VERSION: "1",
-      POLYGON_RPC_URL: "https://polygon.example",
-      SELLER_EVM_ADDRESS: seller,
-      X402_TARGET_URL: resourceUrl
-    }, { includeWallet: true, walletCheck: async () => undefined });
-
-    expect(report.stages.find((stage) => stage.name === "wallet")?.status).toBe("ok");
   });
 
   it("can include settlement receipt verification after payment", async () => {
@@ -524,87 +504,6 @@ describe("jpyc readiness", () => {
     expect(report.nextCommands).toContain("npm run receipt:batch");
   });
 
-  it("returns a concrete command when batch receipt amount is missing", async () => {
-    const report = await buildReadinessReportWithSmoke(".", {
-      BATCH_CHANNEL_ID: batchChannelId,
-      BATCH_EXPECTED_MIN_BALANCE: "100",
-      BATCH_SETTLE_RECEIVER: seller,
-      BATCH_SETTLEMENT_ACTION: "deposit",
-      BATCH_SETTLEMENT_CONTRACT: batchContract,
-      BATCH_SETTLEMENT_TX: hash,
-      BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
-      BATCH_WITHDRAW_DELAY_SECONDS: "900",
-      BUYER_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
-      JPYC_EIP712_VERSION: "1",
-      POLYGON_RPC_URL: "https://polygon.example",
-      SELLER_EVM_ADDRESS: seller,
-      X402_TARGET_URL: resourceUrl
-    }, {
-      batchSettlementReceiptReader,
-      includeBatchSettlementReceipt: true
-    });
-
-    const stage = report.stages.find((stage) => stage.name === "batch-settlement-receipt");
-    expect(stage?.status).toBe("fail");
-    expect(stage?.failures).toContain("batch-settlement-receipt:missing required env: BATCH_DEPOSIT_AMOUNT");
-    expect(report.nextCommands).toContain("set BATCH_DEPOSIT_AMOUNT to the deposited amount");
-    expect(report.nextCommands).toContain("npm run receipt:batch");
-  });
-
-  it("returns concrete commands when batch receipt authorization evidence is missing", async () => {
-    const missingAuthorizer = await buildReadinessReportWithSmoke(".", {
-      BATCH_CHANNEL_ID: batchChannelId,
-      BATCH_DEPOSIT_AMOUNT: "100",
-      BATCH_EXPECTED_MIN_BALANCE: "100",
-      BATCH_SETTLEMENT_ACTION: "deposit",
-      BATCH_SETTLEMENT_CONTRACT: batchContract,
-      BATCH_SETTLEMENT_TX: hash,
-      BATCH_SETTLE_RECEIVER: seller,
-      BATCH_WITHDRAW_DELAY_SECONDS: "900",
-      BUYER_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
-      JPYC_EIP712_VERSION: "1",
-      POLYGON_RPC_URL: "https://polygon.example",
-      SELLER_EVM_ADDRESS: seller,
-      X402_TARGET_URL: resourceUrl
-    }, {
-      batchSettlementReceiptReader,
-      includeBatchSettlementReceipt: true
-    });
-
-    expect(missingAuthorizer.stages.find((stage) => stage.name === "batch-settlement-receipt")?.failures)
-      .toContain("batch-settlement-receipt:missing required env: BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY");
-    expect(missingAuthorizer.nextCommands).toContain("set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key");
-
-    const missingWithdrawDelay = await buildReadinessReportWithSmoke(".", {
-      BATCH_CHANNEL_ID: batchChannelId,
-      BATCH_DEPOSIT_AMOUNT: "100",
-      BATCH_EXPECTED_MIN_BALANCE: "100",
-      BATCH_SETTLEMENT_ACTION: "deposit",
-      BATCH_SETTLEMENT_CONTRACT: batchContract,
-      BATCH_SETTLEMENT_TX: hash,
-      BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY: receiverAuthorizerPrivateKey,
-      BATCH_SETTLE_RECEIVER: seller,
-      BUYER_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_EVM_PRIVATE_KEY: privateKey,
-      FACILITATOR_PUBLIC_ORIGIN: baseUrl,
-      JPYC_EIP712_VERSION: "1",
-      POLYGON_RPC_URL: "https://polygon.example",
-      SELLER_EVM_ADDRESS: seller,
-      X402_TARGET_URL: resourceUrl
-    }, {
-      batchSettlementReceiptReader,
-      includeBatchSettlementReceipt: true
-    });
-
-    expect(missingWithdrawDelay.stages.find((stage) => stage.name === "batch-settlement-receipt")?.failures)
-      .toContain("batch-settlement-receipt:missing required env: BATCH_WITHDRAW_DELAY_SECONDS");
-    expect(missingWithdrawDelay.nextCommands).toContain("set BATCH_WITHDRAW_DELAY_SECONDS to the deployed batch withdraw delay in seconds");
-  });
-
   it("does not mark settlement verified without the buyer key", async () => {
     const report = await buildReadinessReportWithSmoke(".", {
       FACILITATOR_EVM_PRIVATE_KEY: privateKey,
@@ -640,4 +539,17 @@ describe("jpyc readiness", () => {
     expect(report.nextCommands).toContain("npm run receipt:settlement");
     expect(shouldFailReadiness(report, true)).toBe(true);
   });
+});
+
+
+it("maps receipt failures to actionable commands", () => {
+  for (const [name, command] of [
+    ["BATCH_DEPOSIT_AMOUNT", "set BATCH_DEPOSIT_AMOUNT to the deposited amount"],
+    ["BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY", "set BATCH_RECEIVER_AUTHORIZER_PRIVATE_KEY to the receiver authorizer private key"],
+    ["BATCH_WITHDRAW_DELAY_SECONDS", "set BATCH_WITHDRAW_DELAY_SECONDS to the deployed batch withdraw delay in seconds"],
+  ]) {
+    const commands = nextCommands([{ name: "batch-settlement-receipt", status: "fail", failures: [`batch-settlement-receipt:missing required env: ${name}`], warnings: [] }], {});
+    expect(commands).toContain(command);
+    expect(commands).toContain("npm run receipt:batch");
+  }
 });

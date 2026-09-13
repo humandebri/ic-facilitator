@@ -134,11 +134,6 @@ impl SettlementRecord {
         .filter(|settlement| !settlement.tx.trim().is_empty())
     }
 
-    #[cfg(test)]
-    pub fn is_expired(&self, now: u64) -> bool {
-        self.expires_at <= now
-    }
-
     pub fn with_metadata(
         mut self,
         settlement_kind: &str,
@@ -254,19 +249,6 @@ mod tests {
         assert_eq!(broadcast.status_code(), 202);
         assert_eq!(settled.status_code(), 200);
         assert_eq!(failed.status_code(), 502);
-    }
-
-    #[test]
-    fn detects_expired_records() {
-        let record = SettlementRecord::checking(
-            "0xabc".to_string(),
-            "0xdef".to_string(),
-            "100".to_string(),
-            10,
-            60,
-        );
-        assert!(!record.is_expired(69));
-        assert!(record.is_expired(70));
     }
 
     #[test]

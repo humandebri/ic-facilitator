@@ -10,8 +10,9 @@ import type { Hex } from "viem";
 
 import {
   hasExpectedPaidJpycReportBody,
-  hasPaidJpycReportBody,
   payJpyc,
+  validateJpycPaymentRequired,
+  shouldRetryPaidRequest,
   validatePaidRetrySettlements,
 } from "../scripts/pay_jpyc";
 
@@ -74,15 +75,13 @@ describe("payJpyc", () => {
     vi.unstubAllEnvs();
   });
 
-  it("recognizes the paid JPYC report body", () => {
+  it("rejects a paid report for another asset", () => {
     const body = {
       asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
       network: "eip155:137",
       report: "paid JPYC access granted"
     };
-    expect(hasPaidJpycReportBody(body)).toBe(true);
     expect(hasExpectedPaidJpycReportBody({ ...body, asset: "0x0000000000000000000000000000000000000001" }, body.asset)).toBe(false);
-    expect(hasPaidJpycReportBody({ ...body, report: "other" })).toBe(false);
   });
 
   it("creates a payment signature and reads settlement response", async () => {
@@ -111,7 +110,14 @@ describe("payJpyc", () => {
       const payload = decodePaymentSignatureHeader(paymentSignature);
       expect(payload.accepted).toEqual(paymentRequired.accepts[0]);
       expect(payload.accepted.extra?.sellerAuthorization).toEqual(sellerAuthorization);
-      expect(payload.payload).toHaveProperty("authorization");
+      expect(payload.payload).toMatchObject({ authorization: {
+        from: "0xb51aFB2CbA39fB1e3e2B3d1dF337579896FBA993",
+        to: sellerAuthorization.seller,
+        value: "1000000000000000000",
+        validAfter: expect.stringMatching(/^\d+$/),
+        validBefore: expect.stringMatching(/^\d+$/),
+        nonce: expect.stringMatching(/^0x[0-9a-fA-F]{64}$/),
+      }, signature: expect.stringMatching(/^0x[0-9a-fA-F]+$/) });
       expect(payload.payload).not.toHaveProperty("permit2Authorization");
 
       return new Response(JSON.stringify({
@@ -155,6 +161,7 @@ describe("payJpyc", () => {
   });
 
   it("can retry a paid request with the same payment signature", async () => {
+    vi.stubEnv("X402_PAID_RETRY", "1");
     let callCount = 0;
     let firstPaymentSignature = "";
     const retrySettlement: SettleResponse = {
@@ -206,8 +213,7 @@ describe("payJpyc", () => {
       expectedPayTo: "0x1000000000000000000000000000000000000402",
       fetchFn,
       privateKey: buyerPrivateKey,
-      targetUrl,
-      withPaidRetry: true
+      targetUrl
     });
 
     expect(callCount).toBe(3);
@@ -228,47 +234,6 @@ describe("payJpyc", () => {
       settlement,
       { ...settlement, transaction: `0x${"ef".repeat(32)}` },
     )).toThrow("transaction hash mismatch");
-  });
-
-  it("can enable paid retry from the environment", async () => {
-    vi.stubEnv("X402_PAID_RETRY", "1");
-    let callCount = 0;
-    const fetchFn: typeof fetch = async () => {
-      callCount += 1;
-      if (callCount === 1) {
-        return new Response(JSON.stringify({ error: "payment_required" }), {
-          status: 402,
-          headers: {
-            "content-type": "application/json",
-            "payment-required": encodePaymentRequiredHeader(paymentRequired)
-          }
-        });
-      }
-      return new Response(JSON.stringify({
-        asset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
-        network: "eip155:137",
-        report: "paid JPYC access granted"
-      }), {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          "payment-response": encodePaymentResponseHeader(settlement)
-        }
-      });
-    };
-
-    const result = await payJpyc({
-      expectedAmount: "1000000000000000000",
-      expectedAsset: "0x431D5dfF03120AFA4bDf332c61A6e1766eF37BDB",
-      expectedEip712Version: "1",
-      expectedPayTo: "0x1000000000000000000000000000000000000402",
-      fetchFn,
-      privateKey: buyerPrivateKey,
-      targetUrl
-    });
-
-    expect(callCount).toBe(3);
-    expect(result.paidRetryStatus).toBe(200);
   });
 
   it("rejects unexpected payment requirements before signing", async () => {
@@ -441,4 +406,31 @@ describe("payJpyc", () => {
     ).rejects.toThrow("unexpected paid response body");
   });
 
+});
+
+
+describe("payment configuration guards", () => {
+  afterEach(() => vi.unstubAllEnvs());
+  const options = { privateKey: buyerPrivateKey, targetUrl, expectedPayTo: sellerAuthorization.seller, expectedEip712Version: "1" };
+
+  it("requires a real receiver and an HTTPS resource", () => {
+    vi.stubEnv("SELLER_EVM_ADDRESS", "");
+    vi.stubEnv("X402_RESOURCE_URL", undefined);
+    expect(() => validateJpycPaymentRequired(paymentRequired, { ...options, expectedPayTo: "" })).toThrow("missing required env: SELLER_EVM_ADDRESS");
+    const sample = "0x0000000000000000000000000000000000000402";
+    expect(() => validateJpycPaymentRequired(paymentRequired, { ...options, expectedPayTo: sample })).toThrow("SELLER_EVM_ADDRESS must be a real seller address");
+    vi.stubEnv("SELLER_EVM_ADDRESS", sample);
+    const { expectedPayTo: _payTo, ...withoutReceiver } = options;
+    expect(() => validateJpycPaymentRequired(paymentRequired, withoutReceiver)).toThrow("SELLER_EVM_ADDRESS must be a real seller address");
+    expect(() => validateJpycPaymentRequired(paymentRequired, { ...options, targetUrl: "http://localhost/report" })).toThrow("missing required env: X402_RESOURCE_URL");
+    expect(() => validateJpycPaymentRequired(paymentRequired, { ...options, expectedResourceUrl: "http://localhost/report" })).toThrow("X402_RESOURCE_URL must be an https URL");
+  });
+
+  it("enables paid retry from either explicit options or environment", () => {
+    vi.stubEnv("X402_PAID_RETRY", "");
+    expect(shouldRetryPaidRequest(options)).toBe(false);
+    expect(shouldRetryPaidRequest({ ...options, withPaidRetry: true })).toBe(true);
+    vi.stubEnv("X402_PAID_RETRY", "1");
+    expect(shouldRetryPaidRequest({ ...options, withPaidRetry: false })).toBe(true);
+  });
 });

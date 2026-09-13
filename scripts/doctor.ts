@@ -227,7 +227,7 @@ function buyerEnvChecks(env: NodeJS.ProcessEnv): DoctorCheck[] {
   return checks;
 }
 
-function envChecks(mode: DoctorMode, env: NodeJS.ProcessEnv): DoctorCheck[] {
+export function envChecks(mode: DoctorMode, env: NodeJS.ProcessEnv): DoctorCheck[] {
   if (mode === "buyer") {
     return buyerEnvChecks(env);
   }

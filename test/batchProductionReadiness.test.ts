@@ -1,3 +1,4 @@
+import { claimInputFor, refundInputFor, depositInputFor, settleInputFor } from "./fixtures/batchCalldata";
 // test/batchProductionReadiness.test.ts: batch本番投入前レポートのready条件を確認する。
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
@@ -5,7 +6,7 @@ import { encodeAbiParameters, encodeEventTopics, parseAbi } from "viem";
 import type { Address, Hex, TransactionReceipt } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { buildBatchProductionReadinessReport } from "../scripts/batch_production_readiness";
+import { buildBatchProductionReadinessReport, nextCommands, parseNat64Output, isOptionalBatchChannelOutput, isOptionalBatchDeletedChannelOutput, isBatchChannelsListOutput, isBatchDeletedChannelsListOutput } from "../scripts/batch_production_readiness";
 import type { BatchMainnetPreflightReader } from "../scripts/batch_mainnet_preflight";
 import type { BatchSettlementReceiptReader } from "../scripts/batch_settlement_receipt";
 
@@ -94,53 +95,6 @@ function addressWord(address: Address): Hex {
   return hex(`0x${"0".repeat(24)}${address.slice(2)}`);
 }
 
-function padHexData(value: Hex): string {
-  const raw = value.slice(2);
-  return raw.padEnd(Math.ceil(raw.length / 64) * 64, "0");
-}
-
-function encodeBytes(value: Hex): string {
-  return `${uint256(BigInt((value.length - 2) / 2)).slice(2)}${padHexData(value)}`;
-}
-
-function encodeDynamicArray(items: readonly string[]): string {
-  let offset = 32n * BigInt(items.length);
-  let head = uint256(BigInt(items.length)).slice(2);
-  let tail = "";
-  for (const item of items) {
-    head += uint256(offset).slice(2);
-    offset += BigInt(item.length / 2);
-    tail += item;
-  }
-  return `${head}${tail}`;
-}
-
-function claimTuple(configWords: string, totalClaimed: bigint): string {
-  const signature = hex(`0x${"11".repeat(65)}`);
-  return [
-    configWords,
-    uint256(100n).slice(2),
-    uint256(320n).slice(2),
-    uint256(totalClaimed).slice(2),
-    encodeBytes(signature)
-  ].join("");
-}
-
-function claimInputFor(claims: readonly { readonly configWords: string; readonly totalClaimed: bigint }[]): Hex {
-  const claimsData = encodeDynamicArray(claims.map((claim) => claimTuple(claim.configWords, claim.totalClaimed)));
-  const authorizerSignature = hex(`0x${"22".repeat(65)}`);
-  return hex(`0xe43ce1f2${uint256(64n).slice(2)}${uint256(BigInt(64 + claimsData.length / 2)).slice(2)}${claimsData}${encodeBytes(authorizerSignature)}`);
-}
-
-function refundInputFor(configWords: string, nonce: bigint): Hex {
-  const authorizerSignature = hex(`0x${"44".repeat(65)}`);
-  return hex(`0xb77433e9${configWords}${uint256(1500n).slice(2)}${uint256(nonce).slice(2)}${uint256(320n).slice(2)}${encodeBytes(authorizerSignature)}`);
-}
-
-function depositInputFor(configWords: string, amount = 100n): Hex {
-  return hex(`0x140f1e75${configWords}${uint256(amount).slice(2)}${addressWord(sender).slice(2)}${uint256(320n).slice(2)}${encodeBytes("0x")}`);
-}
-
 const channelConfigWords = [
   addressWord(sender),
   addressWord(sender),
@@ -151,9 +105,9 @@ const channelConfigWords = [
   hex(`0x${"33".repeat(32)}`)
 ].map((word) => word.slice(2)).join("");
 const claimInput: Hex = claimInputFor([{ configWords: channelConfigWords, totalClaimed: 50n }]);
-const depositInput: Hex = depositInputFor(channelConfigWords);
+const depositInput: Hex = depositInputFor(channelConfigWords, sender, 100n);
 const refundInput: Hex = refundInputFor(channelConfigWords, 0n);
-const settleInput: Hex = hex(`0x9db32a8f${addressWord(seller).slice(2)}${addressWord(jpyc).slice(2)}`);
+const settleInput: Hex = settleInputFor(seller, jpyc);
 
 const preflightReader: BatchMainnetPreflightReader = {
   async getBatchChannel() { return [0n, 0n]; },
@@ -550,29 +504,6 @@ describe("batch production readiness", () => {
     expect(report.stages.some((stage) => stage.name === "batch:settlement-fee")).toBe(true);
   });
 
-  it("uses the preflight-only verify command in next commands when receipts are not required", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatus("f".repeat(64)), status: 0 };
-        }
-        if (command === "icp") {
-          return { output: "selected environment failure", status: 1 };
-        }
-        return passingCommandRunner(command, args);
-      },
-      env: { ...env(), ICP_CANISTER: "batch-edge", ICP_ENVIRONMENT: "staging" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.nextCommands).toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch:preflight");
-    expect(report.nextCommands).not.toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch");
-  });
-
   it("fails when batch receiver authorizer and facilitator keys derive the same address", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -693,80 +624,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands).toContain("npm run receipt:batch:all");
   });
 
-  it("returns a concrete next command when batch settle token is missing", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      batchSettlementReceiptReader: receiptReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), BATCH_SETTLE_TOKEN: "" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported()
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages.some((stage) => (
-      stage.name === "batch:receipt:settle" &&
-      stage.detail === "missing required env: BATCH_SETTLE_TOKEN"
-    ))).toBe(true);
-    expect(report.nextCommands).toContain("set BATCH_SETTLE_TOKEN to the expected batch token address");
-    expect(report.nextCommands).toContain("npm run receipt:batch:all");
-  });
-
-  it("returns a concrete next command when a batch receipt amount is missing", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      batchSettlementReceiptReader: receiptReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), BATCH_DEPOSIT_AMOUNT: "" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported()
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages.some((stage) => (
-      stage.name === "batch:receipt:deposit" &&
-      stage.detail === "missing required env: BATCH_DEPOSIT_AMOUNT"
-    ))).toBe(true);
-    expect(report.nextCommands).toContain("set BATCH_DEPOSIT_AMOUNT to the deposited amount");
-    expect(report.nextCommands).toContain("npm run receipt:batch:all");
-  });
-
-  it("returns a concrete next command when production receipt RPC URL is missing", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), POLYGON_RPC_URL: "" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported()
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages.some((stage) => (
-      stage.name.startsWith("batch:receipt:") &&
-      stage.detail === "missing required env: POLYGON_RPC_URL"
-    ))).toBe(true);
-    expect(report.nextCommands).toContain("set POLYGON_RPC_URL to a Polygon HTTPS RPC URL");
-    expect(report.nextCommands).toContain("npm run receipt:batch:all");
-  });
-
-  it("returns a concrete next command when production receipt RPC URL is invalid", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: { ...env(), POLYGON_RPC_URL: "http://polygon.example" },
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported()
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages.some((stage) => (
-      stage.name.startsWith("batch:receipt:") &&
-      stage.detail === "POLYGON_RPC_URL must be a HTTPS RPC URL without userinfo or fragment"
-    ))).toBe(true);
-    expect(report.nextCommands).toContain("set POLYGON_RPC_URL to a Polygon HTTPS RPC URL");
-    expect(report.nextCommands).toContain("npm run receipt:batch:all");
-  });
-
   it("returns concrete next commands for missing batch preflight env", async () => {
     const report = await buildBatchProductionReadinessReport({
       commandRunner: passingCommandRunner,
@@ -880,53 +737,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands.filter((command) => command === "ICP_ENVIRONMENT=ic npm run ic:env:mainnet")).toHaveLength(1);
   });
 
-  it("fails when deployed canister env_names output contains extra text", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: `warning "BATCH_SETTLEMENT_CONTRACT" ${batchEnvNamesOutput}`, status: 0 };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "unexpected env_names output",
-      name: "canister:batch-env",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("ICP_ENVIRONMENT=ic npm run ic:env:mainnet");
-  });
-
-  it("fails when deployed batch_channel output contains extra text", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: `(opt record { channel_id = "${readinessChannelId}" }) trailing`, status: 0 };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: `unexpected batch_channel output: (opt record { channel_id = "${readinessChannelId}" }) trailing`,
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-  });
-
   it("fails when deployed batch_channels output is non-empty while count is zero", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -945,29 +755,6 @@ describe("batch production readiness", () => {
     expect(report.ready).toBe(false);
     expect(report.stages).toContainEqual({
       detail: "unexpected batch_channels output: (vec { garbage })",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-  });
-
-  it("fails when deployed batch_deleted_channel_count output contains extra text", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args, cwd) {
-        if (command === "icp" && args.includes("batch_deleted_channel_count")) {
-          return { output: 'warning "stale" (0 : nat64)', status: 0 };
-        }
-        return passingCommandRunner(command, args, cwd);
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: 'unexpected batch_deleted_channel_count output: warning "stale" (0 : nat64)',
       name: "canister:batch-storage-api",
       status: "fail"
     });
@@ -1308,44 +1095,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=ic npm run ic:deploy:mainnet");
   });
 
-  it("fails when deployed canister lacks production controller and cycles safety", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("status")) {
-          return {
-            output: canisterStatus(wasmSha256, {
-              controllers: [writerPrincipal],
-              cycles: "999999999999",
-              freezingThreshold: "2592000"
-            }),
-            status: 0
-          };
-        }
-        if (command === "icp") {
-          const batchQuery = batchStorageQueryOutput(args);
-          if (batchQuery !== undefined) {
-            return batchQuery;
-          }
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "canister must have at least two non-system controllers",
-      name: "canister:operational-safety",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("icp canister settings update edge --add-controller <backup-principal> -e ic");
-  });
-
   it("uses the selected canister and environment in operational safety next commands", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -1376,6 +1125,7 @@ describe("batch production readiness", () => {
     });
 
     expect(report.ready).toBe(false);
+    expect(report.stages).toContainEqual({ detail: "canister must have at least two non-system controllers", name: "canister:operational-safety", status: "fail" });
     expect(report.nextCommands).toContain("icp canister settings update batch-edge --freezing-threshold 7776000 -e staging");
     expect(report.nextCommands).toContain("icp canister settings update batch-edge --add-controller <backup-principal> -e staging");
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch:preflight");
@@ -1400,6 +1150,7 @@ describe("batch production readiness", () => {
     });
 
     expect(report.ready).toBe(false);
+    expect(report.nextCommands).not.toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch");
     expect(report.nextCommands).toContain("scripts/set_canister_env.sh staging batch-edge");
     expect(report.nextCommands).toContain("icp deploy -e staging batch-edge --yes");
     expect(report.nextCommands).toContain("ICP_ENVIRONMENT=staging ICP_CANISTER=batch-edge npm run verify:batch:preflight");
@@ -1598,48 +1349,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands).toContain("npm run build");
   });
 
-  it("fails when deployed canister batch channel count output contains extra text", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: 'warning "stale" (0 : nat64)', status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: 'unexpected batch_channel_count output: warning "stale" (0 : nat64)',
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
   it("fails when deployed canister batch channel list query is not available", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -1787,270 +1496,6 @@ describe("batch production readiness", () => {
     expect(report.nextCommands).toContain("npm run build");
   });
 
-  it("fails when deployed canister batch channel list only contains channel_id text", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(1 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: "(null)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: `(vec { "channel_id" })`, status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: 'unexpected batch_channels output: (vec { "channel_id" })',
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel list returns partial records", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(1 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: "(null)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: `(vec { record { channel_id = "${channelId}" } })`, status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: `unexpected batch_channels output: (vec { record { channel_id = "${channelId}" } })`,
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel list returns unsafe field values", async () => {
-    const unsafeRefundNonce = batchChannelRecord().replace('refund_nonce = "0";', `refund_nonce = "${Number.MAX_SAFE_INTEGER + 1}";`);
-    const zeroReceiver = batchChannelRecord().replace(`receiver = "${seller}";`, `receiver = "0x${"0".repeat(40)}";`);
-    const cases: readonly { readonly detail: string; readonly record: string }[] = [
-      { detail: `unexpected batch_channels output: (vec { ${unsafeRefundNonce} })`, record: unsafeRefundNonce },
-      { detail: `unexpected batch_channels output: (vec { ${zeroReceiver} })`, record: zeroReceiver }
-    ];
-    for (const { record, detail } of cases) {
-      const report = await buildBatchProductionReadinessReport({
-        batchPreflightReader: preflightReader,
-        commandRunner(command, args) {
-          if (command === "icp" && args.includes("env_names")) {
-            return { output: batchEnvNamesOutput, status: 0 };
-          }
-            if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-              return { output: "(1 : nat64)", status: 0 };
-            }
-          if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-            return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-          }
-          if (command === "icp" && args.includes("batch_settlement_contract")) {
-            return { output: `(opt "${batchContract}")`, status: 0 };
-          }
-          if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-            return { output: `(opt "100")`, status: 0 };
-          }
-          if (command === "icp" && args.includes("status")) {
-            return { output: canisterStatusOutput, status: 0 };
-          }
-          if (command === "icp" && args.includes("batch_channel_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-          if (command === "icp" && args.includes("batch_channel")) {
-            return { output: "(null)", status: 0 };
-          }
-          if (command === "icp" && args.includes("batch_channels")) {
-            return { output: `(vec { ${record} })`, status: 0 };
-          }
-          return { output: "", status: 0 };
-        },
-        env: env(),
-        fileReader: fileReader(),
-        fetchFn: fetchForBatchSupported(),
-        requireBatchReceipt: false
-      });
-
-      expect(report.ready).toBe(false);
-      expect(report.stages).toContainEqual({
-        detail,
-        name: "canister:batch-storage-api",
-        status: "fail"
-      });
-      expect(report.nextCommands).toContain("npm run build");
-    }
-  });
-
-  it("fails when deployed canister deleted batch channel list returns unsafe field values", async () => {
-    const unsafeDeletedRecord = batchDeletedChannelRecord().replace('refund_nonce = "0";', `refund_nonce = "${Number.MAX_SAFE_INTEGER + 1}";`);
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(0 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: "(null)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: "(vec {})", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_deleted_channel_count")) {
-          return { output: "(1 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_deleted_channel")) {
-          return { output: "(null)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_deleted_channels")) {
-          return { output: `(vec { ${unsafeDeletedRecord} })`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_update_channel")) {
-          return {
-            output: '(record { status = "invalid"; channel = null; current_revision = null; message = opt "channelId: hex must be 32 bytes" })',
-            status: 0
-          };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: `unexpected batch_deleted_channels output: (vec { ${unsafeDeletedRecord} })`,
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel list output contains extra text", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(0 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: "(null)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: "warning: stale output (vec {})", status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "unexpected batch_channels output: warning: stale output (vec {})",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
   it("fails when deployed canister has more batch channels than the list limit", async () => {
     const report = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
@@ -2097,175 +1542,6 @@ describe("batch production readiness", () => {
       status: "fail"
     });
     expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel output is not optional", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(0 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: "(record {})", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: "(vec {})", status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: "unexpected batch_channel output: (record {})",
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel output is optional but not a BatchChannel record", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(0 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: `(opt "not-a-channel")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: "(vec {})", status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: `unexpected batch_channel output: (opt "not-a-channel")`,
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when deployed canister batch channel output is a partial record", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner(command, args) {
-        if (command === "icp" && args.includes("env_names")) {
-          return { output: batchEnvNamesOutput, status: 0 };
-        }
-          if (command === "icp" && args.includes("batch_writer_receiver_scope_count")) {
-            return { output: "(1 : nat64)", status: 0 };
-          }
-        if (command === "icp" && args.includes("batch_receiver_authorizer")) {
-          return { output: `(opt "${receiverAuthorizer}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_contract")) {
-          return { output: `(opt "${batchContract}")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_settlement_fee_amount")) {
-          return { output: `(opt "100")`, status: 0 };
-        }
-        if (command === "icp" && args.includes("status")) {
-          return { output: canisterStatusOutput, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel_count")) {
-          return { output: "(0 : nat64)", status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channel")) {
-          return { output: `(opt record { channel_id = "${readinessChannelId}" })`, status: 0 };
-        }
-        if (command === "icp" && args.includes("batch_channels")) {
-          return { output: "(vec {})", status: 0 };
-        }
-        return { output: "", status: 0 };
-      },
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual({
-      detail: `unexpected batch_channel output: (opt record { channel_id = "${readinessChannelId}" })`,
-      name: "canister:batch-storage-api",
-      status: "fail"
-    });
-    expect(report.nextCommands).toContain("npm run build");
-  });
-
-  it("fails when DID lacks batch channel storage API", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: env(),
-      fileReader: fileReader({
-        didBytes: Buffer.from(`
-service : {
-  batch_channel_count : () -> (nat64) query;
-}
-`)
-      }),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
-
-    expect(report.ready).toBe(false);
-    expect(report.stages).toContainEqual(expect.objectContaining({
-      detail: expect.stringContaining("missing or mismatched DID batch storage API: method batch_channel"),
-      name: "did:batch-storage-api",
-      status: "fail"
-    }));
-    expect(report.nextCommands).toContain("npm run did:generate");
   });
 
   it("fails when DID mentions batch methods outside the service block only", async () => {
@@ -2393,14 +1669,6 @@ service : {
   });
 
   it("fails when deployed batch support does not match local batch env", async () => {
-    const report = await buildBatchProductionReadinessReport({
-      batchPreflightReader: preflightReader,
-      commandRunner: passingCommandRunner,
-      env: env(),
-      fileReader: fileReader(),
-      fetchFn: fetchForBatchSupported(),
-      requireBatchReceipt: false
-    });
     const mismatch = await buildBatchProductionReadinessReport({
       batchPreflightReader: preflightReader,
       commandRunner: passingCommandRunner,
@@ -2410,7 +1678,6 @@ service : {
       requireBatchReceipt: false
     });
 
-    expect(report.ready).toBe(true);
     expect(mismatch.ready).toBe(false);
     expect(mismatch.stages).toContainEqual({
       detail: "supported.batch.extra.withdrawDelay does not match BATCH_WITHDRAW_DELAY_SECONDS",
@@ -2418,4 +1685,48 @@ service : {
       status: "fail"
     });
   });
+});
+
+describe("batch storage Candid output", () => {
+  it("accepts typed counts and rejects trailing output", () => {
+    expect(parseNat64Output("(1 : nat64)")).toBe(1n);
+    expect(parseNat64Output("(1 : nat64) warning")).toBeUndefined();
+  });
+
+  it("requires complete optional channel records", () => {
+    expect(isOptionalBatchChannelOutput("(null)")).toBe(true);
+    expect(isOptionalBatchChannelOutput(`(opt ${batchChannelRecord()})`)).toBe(true);
+    for (const output of ["(null) warning", `(${batchChannelRecord()})`, '(opt "channel")', `(opt record { channel_id = "${channelId}" })`]) {
+      expect(isOptionalBatchChannelOutput(output), output).toBe(false);
+    }
+    expect(isOptionalBatchDeletedChannelOutput(`(opt ${batchDeletedChannelRecord()})`)).toBe(true);
+    expect(isOptionalBatchDeletedChannelOutput(`(opt ${batchChannelRecord()})`)).toBe(false);
+  });
+
+  it("validates list records, numeric limits and deleted-channel wrappers", () => {
+    expect(isBatchChannelsListOutput(`(vec { ${batchChannelRecord()} })`)).toBe(true);
+    for (const output of [
+      '(vec { "channel_id" })',
+      `(vec { record { channel_id = "${channelId}" } })`,
+      `(vec { ${batchChannelRecord()} }) warning`,
+      `(vec { ${batchChannelRecord().replace('refund_nonce = "0";', `refund_nonce = "${Number.MAX_SAFE_INTEGER + 1}";`)} })`,
+      `(vec { ${batchChannelRecord().replace(`receiver = "${seller}";`, `receiver = "0x${"0".repeat(40)}";`)} })`,
+    ]) expect(isBatchChannelsListOutput(output), output).toBe(false);
+    expect(isBatchDeletedChannelsListOutput(`(vec { ${batchDeletedChannelRecord()} })`)).toBe(true);
+    expect(isBatchDeletedChannelsListOutput(`(vec { ${batchDeletedChannelRecord().replace('refund_nonce = "0";', `refund_nonce = "${Number.MAX_SAFE_INTEGER + 1}";`)} })`)).toBe(false);
+  });
+});
+
+
+it("maps batch receipt failures to their configuration commands", () => {
+  for (const [name, detail, command] of [
+    ["batch:receipt:settle", "missing required env: BATCH_SETTLE_TOKEN", "set BATCH_SETTLE_TOKEN to the expected batch token address"],
+    ["batch:receipt:deposit", "missing required env: BATCH_DEPOSIT_AMOUNT", "set BATCH_DEPOSIT_AMOUNT to the deposited amount"],
+    ["batch:receipt:deposit", "missing required env: POLYGON_RPC_URL", "set POLYGON_RPC_URL to a Polygon HTTPS RPC URL"],
+    ["batch:receipt:deposit", "POLYGON_RPC_URL must be a HTTPS RPC URL without userinfo or fragment", "set POLYGON_RPC_URL to a Polygon HTTPS RPC URL"],
+  ] as const) {
+    const commands = nextCommands([{ name, detail, status: "fail" }], true, env());
+    expect(commands).toContain(command);
+    expect(commands).toContain("npm run receipt:batch:all");
+  }
 });

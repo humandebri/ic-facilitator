@@ -58,14 +58,6 @@ function readAmount(name: string, defaultValue: string): bigint {
   return BigInt(positiveDecimalToAtomicUnits(readEnv(name) ?? defaultValue, JPYC_DECIMALS, name));
 }
 
-export function hasRequiredAmount(value: bigint, requiredAmount: bigint): boolean {
-  return value >= requiredAmount;
-}
-
-export function walletRequirementFailure(hasRequiredBalance: boolean): string | null {
-  return hasRequiredBalance ? null : "buyer wallet is missing required JPYC balance";
-}
-
 export function fundingNextActions(
   buyer: Address,
   hasRequiredBalance: boolean,
@@ -80,12 +72,12 @@ export function walletRequirementSummary(balance: bigint, nativeBalance: bigint,
   readonly nativeGasRequired: false;
   readonly requirementFailure: string | null;
 } {
-  const hasRequiredBalance = hasRequiredAmount(balance, requiredAmount);
+  const hasRequiredBalance = balance >= requiredAmount;
   return {
     hasNativeGasBalance: nativeBalance > 0n,
     hasRequiredBalance,
     nativeGasRequired: false,
-    requirementFailure: walletRequirementFailure(hasRequiredBalance)
+    requirementFailure: hasRequiredBalance ? null : "buyer wallet is missing required JPYC balance"
   };
 }
 
