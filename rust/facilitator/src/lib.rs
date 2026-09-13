@@ -849,7 +849,9 @@ fn batch_auto_claim_request(channel_id: String) -> Result<(), String> {
 }
 
 #[query]
-fn batch_auto_claim_status(channel_id: String) -> Result<Option<auto_claim::AutoClaimStatus>, String> {
+fn batch_auto_claim_status(
+    channel_id: String,
+) -> Result<Option<auto_claim::AutoClaimStatus>, String> {
     auto_claim::status(channel_id)
 }
 
@@ -5944,7 +5946,6 @@ fn insert_batch_settlement(
     if let Some(fee) = fee {
         extra.insert("settlementFee".to_string(), fee.to_string());
         record.charged_fee = Some(fee.to_string());
-
     }
     record.settlement_kind = Some("batch".to_string());
     insert_settlement(key, record)

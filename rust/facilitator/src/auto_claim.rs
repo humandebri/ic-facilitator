@@ -72,7 +72,7 @@ thread_local! {
     static POLICIES: RefCell<StableBTreeMap<String, u8, Memory>> = RefCell::new(StableBTreeMap::init(stable_memory(MemoryId::new(11))));
     static COLLECTIONS: RefCell<StableBTreeMap<String, Vec<u8>, Memory>> = RefCell::new(StableBTreeMap::init(stable_memory(MemoryId::new(12))));
     static DUE: RefCell<StableBTreeMap<String, u8, Memory>> = RefCell::new(StableBTreeMap::init(stable_memory(MemoryId::new(13))));
-    static BUSY: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
+    static BUSY: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     #[cfg(target_arch = "wasm32")]
     static TIMER: RefCell<Option<(ic_cdk_timers::TimerId, u64)>> = const { RefCell::new(None) };
 }
